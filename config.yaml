@@ -26,8 +26,10 @@ risk_rules:
     - ^docker\s+compose\s+(build|pull|down)\b
     - ^(iptables|nft)\b
   R3:
-    - ^rm\s+(-\S+\s+)*-[a-zA-Z]*r[a-zA-Z]*\b
-    - ^rm\s+(-\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\b
+    - ^rm\s+(-{1,2}\S+\s+)*-[a-zA-Z]*r[a-zA-Z]*\b
+    - ^rm\s+(-{1,2}\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\b
+    - ^rm\s+(-{1,2}\S+\s+)*--[a-zA-Z-]*r[a-zA-Z-]*\b
+    - ^rm\s+(-{1,2}\S+\s+)*--[a-zA-Z-]*R[a-zA-Z-]*\b
     - ^systemctl\s+(stop|disable|mask)\b
     - \bmkfs(\.\w+)?\b
     - ^kubectl\s+delete\b

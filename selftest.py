@@ -122,6 +122,23 @@ def test_hook_empty_command():
     assert r.returncode == 2
 
 
+def test_rm_longopts_and_guarded_flags():
+    assert core.classify("rm --recursive /tmp/x")[0] == "R3"
+    assert core.classify("rm --recursive -f /tmp/x")[0] == "R3"
+    assert core.classify("rm -I /tmp/x")[0] == "R2"  # 交互式提示，留 R2
+    assert core.classify("rm -d /tmp/empty")[0] == "R2"  # 仅空目录，留 R2
+
+
+def test_audit_rotation():
+    core.AUDIT_ROTATE_BYTES = 10
+    core.audit("big", payload="x" * 100)
+    core.audit("after-rotate")
+    assert (Path(core.STATE_DIR) / "audit.jsonl.1").exists()
+    last = Path(core.STATE_DIR, "audit.jsonl").read_text().strip().splitlines()[-1]
+    assert json.loads(last)["event"] == "after-rotate"
+    core.AUDIT_ROTATE_BYTES = 10 * 1024 * 1024
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

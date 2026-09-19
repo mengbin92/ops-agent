@@ -86,10 +86,16 @@ def _classify_single(seg: str, config: dict) -> str:
     return "R2"  # 未知命令安全方向默认
 
 
+AUDIT_ROTATE_BYTES = 10 * 1024 * 1024  # ponytail: 单备份轮转 audit.jsonl.1，需要多代次再加
+
+
 def audit(event: str, **fields) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "audit.jsonl"
+    if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
+        os.replace(path, STATE_DIR / "audit.jsonl.1")
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
-    with open(STATE_DIR / "audit.jsonl", "a", encoding="utf-8") as f:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
