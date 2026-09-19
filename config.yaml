@@ -1,0 +1,35 @@
+# 只读白名单：命中即 R0 直接放行（按顺序匹配）
+readonly_patterns:
+  - ^kubectl\s+(get|describe|logs|top|api-resources|config\s+view)\b
+  - ^systemctl\s+(status|list-units|list-timers|show|is-active|is-enabled|list-dependencies)\b
+  - ^journalctl\b
+  - ^docker\s+(ps|images|logs|inspect|stats|port|top|version|info)\b
+  - ^docker\s+compose\s+(ps|logs|config|top)\b
+  - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|env|which|whoami|id)\b
+  - ^ssh\s+\S+\s+"(systemctl\s+status|journalctl|docker\s+ps|kubectl\s+get|cat|tail|grep)
+  - ^(brew\s+(list|info|services|outdated)|launchctl\s+list)\b
+
+risk_rules:
+  R1:
+    - ^systemctl\s+(restart|reload)\b
+    - ^docker\s+(restart|stop|start)\b
+    - ^docker\s+compose\s+(restart|up|stop|start)\b
+    - ^brew\s+(install|upgrade|services\s+start)\b
+    - ^launchctl\s+(load|unload|kickstart)\b
+  R2:
+    - ^kubectl\s+(apply|rollout|scale|set|patch|create|replace|edit|taint|cordon|uncordon)\b
+    - ^systemctl\s+(stop|disable|enable|mask)\b
+    - ^apt(-get)?\s+(install|remove|upgrade)\b
+    - ^yum\s+(install|remove|update)\b
+    - ^brew\s+(uninstall|services\s+(stop|restart))\b
+    - ^docker\s+(build|push|pull|run)\b
+    - ^docker\s+compose\s+(build|pull|down)\b
+    - ^(iptables|nft)\b
+  R3:
+    - ^rm\s+(-\S+\s+)*-rf\b
+    - ^rm\s+(-\S+\s+)*-r\b
+    - \bmkfs(\.\w+)?\b
+    - ^kubectl\s+delete\b
+    - ^docker\s+(rm|rmi|system\s+prune|volume\s+rm)\b
+    - \bDROP\s+(TABLE|DATABASE)\b
+    - ^dd\s+.*of=/dev/
