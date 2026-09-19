@@ -34,6 +34,37 @@
 已知边界：审批戳由 Agent 侧在获得用户确认后创建，防"误执行"不防"恶意 Agent"；
 命令分类为线性正则匹配，不解析 shell AST（复合命令按 `;` `&&` `||` `|` 分段取最高级）。
 
+## MCP server 形态
+
+`mcp_server.py` 把同一组能力以 MCP server 暴露（stdio JSON-RPC，纯 stdlib，与 CLI 共享 core.py 与状态目录）。客户端注册：
+
+```json
+{
+  "mcpServers": {
+    "ops-guard": {
+      "command": "python3",
+      "args": ["/Users/neo/vscode/mengbin/ops-agent/mcp_server.py"]
+    }
+  }
+}
+```
+
+只读工具（`ops_check` / `ops_list` / `ops_audit`）建议 allowlist 免弹窗；写工具（`ops_approve` / `ops_exec` / `ops_rollback` / `ops_snapshot_*`）保持每次弹窗（双保险），审批戳仍是硬闸门。Claude Code 的权限配置片段：
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__ops-guard__ops_check",
+      "mcp__ops-guard__ops_list",
+      "mcp__ops-guard__ops_audit"
+    ]
+  }
+}
+```
+
+确认流与 CLI 形态一致：变更单 → `ops_approve`（弹窗=授权，建戳）→ `ops_exec`（再弹窗=双保险，校验戳）→ 报告 snapshot_id 与回滚。R3 仍需 `force=true` + 会话内显式确认。
+
 ## 演进
 
 core.py 为纯函数库；演进 MCP server 时直接包装同一组函数，状态目录布局即对外契约。
