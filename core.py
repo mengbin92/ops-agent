@@ -226,3 +226,35 @@ def prune_snapshots(keep: int = 200) -> None:
     for p in ids[:-keep]:
         shutil.rmtree(p)
         audit("prune", snapshot_id=p.name)
+
+
+def exec_change(
+    cmd: str,
+    snapshot_files: list[str] | None = None,
+    snapshot_cmds: list[tuple[str, str]] | None = None,
+) -> int:
+    snapshot_files = snapshot_files or []
+    snapshot_cmds = snapshot_cmds or []
+    code, msg = check(cmd)
+    if code != 0:
+        print(msg, file=sys.stderr)
+        return code
+    sid = None
+    if snapshot_files or snapshot_cmds:
+        sid, d = _begin_snapshot()
+        items: list = []
+        try:
+            for f in snapshot_files:
+                _snapshot_file_into(d, f, items)
+            for c, name in snapshot_cmds:
+                _snapshot_cmd_into(d, c, name, items)
+        except OpsxError as e:
+            shutil.rmtree(d, ignore_errors=True)
+            print(f"[opsx] 快照失败，已中止执行: {e}", file=sys.stderr)
+            audit("exec-abort", cmd=cmd, reason=str(e))
+            return 3
+        _write_meta(d, sid, items)
+    r = subprocess.run(cmd, shell=True)
+    audit("exec", cmd=cmd, snapshot_id=sid, exit_code=r.returncode)
+    prune_snapshots()
+    return r.returncode

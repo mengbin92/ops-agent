@@ -81,7 +81,7 @@ def test_exec_happy():
         cmd = f"echo after > {f}"
         core.approve(cmd, ttl_seconds=60)
         code = core.exec_change(cmd, snapshot_files=[str(f)])
-        assert code == 0 and f.read_text() == "after"
+        assert code == 0 and f.read_text() == "after\n"  # echo 输出带尾换行
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
