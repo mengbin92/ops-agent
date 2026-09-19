@@ -140,3 +140,89 @@ def check(cmd: str) -> tuple[int, str]:
         f"[opsx] 拒绝执行：该命令判定为 {level}{hit}。"
         "请先向用户提交变更单（风险说明+回滚计划），经确认后使用 opsx exec 执行。"
     )
+
+
+def _new_snapshot_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+
+def _begin_snapshot() -> tuple[str, Path]:
+    sid = _new_snapshot_id()
+    d = STATE_DIR / "snapshots" / sid
+    d.mkdir(parents=True, exist_ok=True)
+    return sid, d
+
+
+def _snapshot_file_into(d: Path, path_str: str, items: list) -> None:
+    src = Path(path_str)
+    if not src.is_file():
+        raise OpsxError(f"快照源不是文件: {path_str}")
+    dest = d / "files" / str(src.resolve()).lstrip("/")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    items.append({
+        "type": "file",
+        "src": str(src.resolve()),
+        "dest": str(dest.relative_to(d)),
+        "mode": stat.S_IMODE(src.stat().st_mode),
+    })
+
+
+def _snapshot_cmd_into(d: Path, cmd: str, name: str, items: list) -> None:
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise OpsxError(f"状态抓取命令失败({r.returncode}): {cmd}\n{r.stderr[:500]}")
+    fname = f"cmd-{(name or 'output').replace('/', '_')}.txt"
+    (d / fname).write_text(r.stdout, encoding="utf-8")
+    items.append({"type": "cmd", "cmd": cmd, "name": name, "output": fname})
+
+
+def _write_meta(d: Path, sid: str, items: list) -> None:
+    meta = {"id": sid, "created": datetime.now(timezone.utc).isoformat(), "items": items}
+    (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def snapshot_file(path_str: str) -> str:
+    sid, d = _begin_snapshot()
+    items: list = []
+    _snapshot_file_into(d, path_str, items)
+    _write_meta(d, sid, items)
+    audit("snapshot", id=sid, kind="file", src=path_str)
+    return sid
+
+
+def snapshot_cmd(cmd: str, name: str = "") -> str:
+    sid, d = _begin_snapshot()
+    items: list = []
+    _snapshot_cmd_into(d, cmd, name, items)
+    _write_meta(d, sid, items)
+    audit("snapshot", id=sid, kind="cmd", cmd=cmd)
+    return sid
+
+
+def rollback(snapshot_id: str) -> str:
+    d = STATE_DIR / "snapshots" / snapshot_id
+    if not d.exists():
+        raise OpsxError(f"快照不存在: {snapshot_id}")
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    report = []
+    for item in meta["items"]:
+        if item["type"] == "file":
+            shutil.copy2(d / item["dest"], item["src"])
+            os.chmod(item["src"], item["mode"])
+            report.append(f"已恢复文件: {item['src']}")
+        else:
+            out = (d / item["output"]).read_text(encoding="utf-8")
+            report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
+    audit("rollback", snapshot_id=snapshot_id)
+    return "\n".join(report)
+
+
+def prune_snapshots(keep: int = 200) -> None:
+    d = STATE_DIR / "snapshots"
+    if not d.exists():
+        return
+    ids = sorted(p for p in d.iterdir() if p.is_dir())
+    for p in ids[:-keep]:
+        shutil.rmtree(p)
+        audit("prune", snapshot_id=p.name)
