@@ -139,6 +139,24 @@ def test_audit_rotation():
     core.AUDIT_ROTATE_BYTES = 10 * 1024 * 1024
 
 
+def test_git_readonly_whitelist():
+    assert core.classify("git status")[0] == "R0"
+    assert core.classify("git log --oneline -5")[0] == "R0"
+    assert core.classify("git diff HEAD~1")[0] == "R0"
+    assert core.classify("git branch")[0] == "R0"
+    assert core.classify("git branch -a")[0] == "R0"
+    assert core.classify("git remote -v")[0] == "R0"
+    assert core.classify("git stash list")[0] == "R0"
+    assert core.classify("vm_stat")[0] == "R0"
+
+
+def test_git_mutations_not_whitelisted():
+    assert core.classify("git branch -d feature-x")[0] == "R2"
+    assert core.classify("git tag v1.0")[0] == "R2"
+    assert core.classify("git push origin main")[0] == "R2"
+    assert core.classify("git commit -m x")[0] == "R2"
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

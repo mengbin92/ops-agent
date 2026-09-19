@@ -7,6 +7,13 @@ readonly_patterns:
   - ^docker\s+compose\s+(ps|logs|config|top)\b
   - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|env|which|whoami|id)\b
   - ^ssh\s+\S+\s+"(systemctl\s+status|journalctl|docker\s+ps|kubectl\s+get|cat|tail|grep)"
+  - ^git\s+(status|log|diff|show|blame|rev-parse|ls-files|ls-remote|rev-list|cat-file|for-each-ref|shortlog|describe|reflog|grep|count-objects)\b
+  - ^git\s+branch\s*$
+  - ^git\s+branch\s+(-[avr]+|--all|--list)\s*$
+  - ^git\s+(remote|stash)\s+(-v|--verbose|list|show)\b
+  - ^git\s+tag\s+(-l|--list)\b
+  - ^git\s+config\s+--get\b
+  - ^vm_stat\b
   - ^(brew\s+(list|info|services|outdated)|launchctl\s+list)\b
 
 risk_rules:
