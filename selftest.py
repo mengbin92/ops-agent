@@ -157,6 +157,83 @@ def test_git_mutations_not_whitelisted():
     assert core.classify("git commit -m x")[0] == "R2"
 
 
+class McpClient:
+    """std.io JSON-RPC 测试客户端：子进程拉起 mcp_server.py。"""
+
+    def __init__(self):
+        import subprocess as sp
+        import sys
+        self.proc = sp.Popen(
+            [sys.executable, str(core.REPO_DIR / "mcp_server.py")],
+            stdin=sp.PIPE, stdout=sp.PIPE, text=True,
+        )
+        self._id = 0
+
+    def request(self, method, params=None):
+        self._id += 1
+        msg = {"jsonrpc": "2.0", "id": self._id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        return json.loads(self.proc.stdout.readline())
+
+    def notify(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def send_raw(self, line):
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+
+    def call_tool(self, name, arguments=None):
+        resp = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+        assert "result" in resp, f"tools/call 无 result: {resp}"
+        result = resp["result"]
+        assert result["content"][0]["type"] == "text"
+        return result, json.loads(result["content"][0]["text"])
+
+    def close(self):
+        self.proc.terminate()
+
+
+def test_mcp_handshake():
+    c = McpClient()
+    try:
+        resp = c.request("initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "selftest", "version": "0"},
+        })
+        r = resp["result"]
+        assert r["serverInfo"]["name"] == "ops-guard"
+        assert r["protocolVersion"] == "2025-03-26"
+        assert r["capabilities"] == {"tools": {"listChanged": False}}
+        c.notify("notifications/initialized")
+        resp = c.request("ping")
+        assert resp["result"] == {}
+    finally:
+        c.close()
+
+
+def test_mcp_protocol_errors():
+    c = McpClient()
+    try:
+        c.send_raw("not-json{")
+        resp = json.loads(c.proc.stdout.readline())
+        assert resp["error"]["code"] == -32700
+        assert resp["id"] is None
+        resp = c.request("no/such_method")
+        assert resp["error"]["code"] == -32601
+        resp = c.request("ping")  # 服务循环存活
+        assert resp["result"] == {}
+    finally:
+        c.close()
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
