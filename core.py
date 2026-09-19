@@ -87,3 +87,40 @@ def audit(event: str, **fields) -> None:
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
     with open(STATE_DIR / "audit.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def normalize(cmd: str) -> str:
+    return " ".join(cmd.split())
+
+
+def cmd_hash(cmd: str) -> str:
+    return hashlib.sha256(normalize(cmd).encode()).hexdigest()
+
+
+def approve(cmd: str, ttl_seconds: int = 900, force: bool = False) -> Path:
+    level, _ = classify(cmd)
+    if level == "R0":
+        raise OpsxError("只读命令无需审批戳")
+    if level == "R3" and not force:
+        raise OpsxError("R3 命令需 --force 显式确认（不可逆操作）")
+    stamp = {
+        "cmd_hash": cmd_hash(cmd),
+        "cmd": cmd,
+        "created": time.time(),
+        "ttl": ttl_seconds,
+        "force": force,
+        "level": level,
+    }
+    p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
+    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force)
+    return p
+
+
+def check_stamp(cmd: str) -> bool:
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd) + ".json")
+    if not p.exists():
+        return False
+    s = json.loads(p.read_text(encoding="utf-8"))
+    return time.time() < s["created"] + s["ttl"]
