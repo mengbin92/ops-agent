@@ -25,9 +25,11 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
 
 1. 输出**变更单**，包含：目标环境、完整命令、风险说明（为何此级别、影响面）、回滚计划、快照计划。
 2. 用 AskUserQuestion 请用户确认。用户拒绝则终止并解释。
-3. 用户批准后执行（快照参数随命令一次传入，保证原子性）：
+3. 用户批准后，Agent 先创建审批戳：
+   `opsx approve '<命令>'`
+4. 再原子执行（快照参数随命令一次传入，保证原子性）：
    `opsx exec '<命令>' --snapshot-file <路径> --snapshot-cmd 'name::<抓取当前状态的命令>'`
-4. 执行后报告：结果、snapshot_id、`opsx rollback <snapshot_id>` 回滚命令。
+5. 执行后报告：结果、snapshot_id、`opsx rollback <snapshot_id>` 回滚命令。
    服务/部署类回滚：先 `opsx rollback <id>` 取回执行前状态，再按回滚计划执行逆操作。
 
 ## R3 流程

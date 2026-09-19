@@ -58,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 data = json.load(sys.stdin)
                 command = data.get("tool_input", {}).get("command", "")
+                if not command.strip():
+                    print("[opsx] hook: 空命令，拒绝执行", file=sys.stderr)
+                    return 2
                 code, msg = core.check(command)
                 if code != 0:
                     print(msg, file=sys.stderr)
@@ -73,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.sub == "approve":
             path = core.approve(_join(args.command), ttl_seconds=args.ttl, force=args.force)
-            print(f"已授权（{path.name}，TTL {args.ttl}s）")
+            stamp = json.loads(path.read_text(encoding="utf-8"))
+            print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s）")
             return 0
 
         if args.sub == "exec":

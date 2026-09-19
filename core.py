@@ -67,8 +67,12 @@ def classify(cmd: str) -> tuple[str, str | None]:
 
 
 def _classify_single(seg: str, config: dict) -> str:
+    # 白名单形状但带写标记（重定向/tee/-exec/-delete）不按只读放行；fd 重定向（2>/dev/null）豁免。
+    write_marker = re.search(r"(?:^|[^0-9])>{1,2}|\btee\b|-exec\b|-delete\b", seg)
     for pat in config["readonly_patterns"]:
         if re.search(pat, seg):
+            if write_marker:
+                break  # 带写标记：跳过只读放行，落入风险规则
             return "R0"
     for pat in config["risk_rules"]["R3"]:
         if re.search(pat, seg):
@@ -110,6 +114,7 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False) -> Path:
         "ttl": ttl_seconds,
         "force": force,
         "level": level,
+        "method": "manual",
     }
     p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +253,7 @@ def exec_change(
                 _snapshot_file_into(d, f, items)
             for c, name in snapshot_cmds:
                 _snapshot_cmd_into(d, c, name, items)
-        except OpsxError as e:
+        except (OpsxError, subprocess.SubprocessError, OSError) as e:
             shutil.rmtree(d, ignore_errors=True)
             print(f"[opsx] 快照失败，已中止执行: {e}", file=sys.stderr)
             audit("exec-abort", cmd=cmd, reason=str(e))

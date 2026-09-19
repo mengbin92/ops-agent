@@ -6,7 +6,7 @@ readonly_patterns:
   - ^docker\s+(ps|images|logs|inspect|stats|port|top|version|info)\b
   - ^docker\s+compose\s+(ps|logs|config|top)\b
   - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|env|which|whoami|id)\b
-  - ^ssh\s+\S+\s+"(systemctl\s+status|journalctl|docker\s+ps|kubectl\s+get|cat|tail|grep)
+  - ^ssh\s+\S+\s+"(systemctl\s+status|journalctl|docker\s+ps|kubectl\s+get|cat|tail|grep)"
   - ^(brew\s+(list|info|services|outdated)|launchctl\s+list)\b
 
 risk_rules:
@@ -18,7 +18,7 @@ risk_rules:
     - ^launchctl\s+(load|unload|kickstart)\b
   R2:
     - ^kubectl\s+(apply|rollout|scale|set|patch|create|replace|edit|taint|cordon|uncordon)\b
-    - ^systemctl\s+(stop|disable|enable|mask)\b
+    - ^systemctl\s+enable\b
     - ^apt(-get)?\s+(install|remove|upgrade)\b
     - ^yum\s+(install|remove|update)\b
     - ^brew\s+(uninstall|services\s+(stop|restart))\b
@@ -26,8 +26,9 @@ risk_rules:
     - ^docker\s+compose\s+(build|pull|down)\b
     - ^(iptables|nft)\b
   R3:
-    - ^rm\s+(-\S+\s+)*-rf\b
-    - ^rm\s+(-\S+\s+)*-r\b
+    - ^rm\s+(-\S+\s+)*-[a-zA-Z]*r[a-zA-Z]*\b
+    - ^rm\s+(-\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\b
+    - ^systemctl\s+(stop|disable|mask)\b
     - \bmkfs(\.\w+)?\b
     - ^kubectl\s+delete\b
     - ^docker\s+(rm|rmi|system\s+prune|volume\s+rm)\b

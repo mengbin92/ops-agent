@@ -84,6 +84,44 @@ def test_exec_happy():
         assert code == 0 and f.read_text() == "after\n"  # echo 输出带尾换行
 
 
+def test_rm_combined_flags_r3():
+    assert core.classify("rm -fr /tmp/x")[0] == "R3"
+    assert core.classify("rm -Rf /tmp/x")[0] == "R3"
+
+
+def test_redirect_not_readonly():
+    assert core.classify("cat /a > /b")[0] == "R2"
+    assert core.classify("systemctl status x 2>/dev/null")[0] == "R0"
+
+
+def test_find_mutation_not_readonly():
+    assert core.classify("find /tmp -name x -delete")[0] == "R2"
+    assert core.classify("find /tmp -name x -exec rm {} \\;")[0] == "R2"
+    assert core.classify("find /tmp -name '*.log'")[0] == "R0"
+
+
+def test_systemctl_stop_is_r3():
+    assert core.classify("systemctl stop nginx")[0] == "R3"
+    assert core.classify("systemctl disable nginx")[0] == "R3"
+    assert core.classify("systemctl enable nginx")[0] == "R2"
+
+
+def test_hook_malformed_json():
+    import subprocess as sp
+    import sys
+    r = sp.run([sys.executable, str(core.REPO_DIR / "opsx"), "hook"],
+               input="not-json{", capture_output=True, text=True)
+    assert r.returncode == 2
+
+
+def test_hook_empty_command():
+    import subprocess as sp
+    import sys
+    r = sp.run([sys.executable, str(core.REPO_DIR / "opsx"), "hook"],
+               input="{}", capture_output=True, text=True)
+    assert r.returncode == 2
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

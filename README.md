@@ -5,7 +5,7 @@
 ## 组成
 
 - `.claude/agents/ops.md` — Agent 定义（R0-R3 风险分级与流程纪律）
-- `.claude/settings.json` — PreToolUse hook，对所有 Bash 命令执行 `opsx check`
+- `.claude/settings.json` — PreToolUse hook，对所有 Bash 命令执行 `opsx hook`
 - `opsx` / `core.py` — 纯标准库 CLI/核心库（分类、审批戳、快照、回滚、审计）
 - `config.yaml` — 只读白名单与风险规则；`~/.ops-agent/config.override.yaml` 追加覆盖
 
@@ -18,7 +18,7 @@
 ./opsx selftest
 
 # 手动预授权（AskUserQuestion 不可用时的降级路径）
-./opsx approve 'systemctl restart nginx' --ttl 900
+./opsx approve 'systemctl restart nginx' --ttl 900  # （`!` 前缀 = 你本人直接执行，即授权动作本身）
 
 # 查看审计 / 快照 / 审批戳
 ./opsx audit --tail 20
