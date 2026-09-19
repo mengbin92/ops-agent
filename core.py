@@ -124,3 +124,19 @@ def check_stamp(cmd: str) -> bool:
         return False
     s = json.loads(p.read_text(encoding="utf-8"))
     return time.time() < s["created"] + s["ttl"]
+
+
+def check(cmd: str) -> tuple[int, str]:
+    level, matched = classify(cmd)
+    if level == "R0":
+        audit("check", cmd=cmd, level=level, result="allow")
+        return 0, "只读命令，放行"
+    if check_stamp(cmd):
+        audit("check", cmd=cmd, level=level, result="allow-stamp")
+        return 0, "有效审批戳，放行"
+    audit("check", cmd=cmd, level=level, result="deny")
+    hit = f"（命中分段：{matched}）" if matched else ""
+    return 2, (
+        f"[opsx] 拒绝执行：该命令判定为 {level}{hit}。"
+        "请先向用户提交变更单（风险说明+回滚计划），经确认后使用 opsx exec 执行。"
+    )
