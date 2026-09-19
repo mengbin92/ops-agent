@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#111a33"/>
+    </linearGradient>
+    <linearGradient id="term" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151d36"/>
+      <stop offset="1" stop-color="#101728"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3fb68b"/>
+      <stop offset="1" stop-color="#1f7a5c"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1b2542" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#grid)" opacity="0.55"/>
+
+  <!-- 顶部装饰线 -->
+  <rect x="0" y="0" width="1280" height="6" fill="#3fb68b"/>
+
+  <!-- 左侧：盾牌闸门图形 -->
+  <g transform="translate(150,180)">
+    <path d="M140 0 L280 46 V160 C280 244 222 296 140 320 C58 296 0 244 0 160 V46 Z"
+          fill="url(#shield)" opacity="0.92"/>
+    <path d="M140 26 L254 64 V158 C254 226 207 270 140 292 C73 270 26 226 26 158 V64 Z"
+          fill="#0b1020" opacity="0.85"/>
+    <!-- 闸门横条：R0-R3 -->
+    <g font-family="Menlo, monospace" font-size="17" font-weight="bold" text-anchor="middle">
+      <rect x="50" y="88"  width="180" height="34" rx="6" fill="#2ea87e"/>
+      <text x="140" y="111" fill="#06251a">R0  只读 · 直接放行</text>
+      <rect x="50" y="132" width="180" height="34" rx="6" fill="#4f8ef7"/>
+      <text x="140" y="155" fill="#0a1a3d">R1/R2  变更单审批</text>
+      <rect x="50" y="176" width="180" height="34" rx="6" fill="#e5534b"/>
+      <text x="140" y="199" fill="#2d0805">R3  默认拒绝</text>
+    </g>
+    <text x="140" y="262" text-anchor="middle" fill="#9fe8c8" font-size="16" font-family="Menlo, monospace">ops-guard</text>
+  </g>
+
+  <!-- 右侧：终端窗口 -->
+  <g transform="translate(520,170)">
+    <rect x="0" y="0" width="620" height="300" rx="12" fill="url(#term)" stroke="#263456" stroke-width="1.5"/>
+    <rect x="0" y="0" width="620" height="40" rx="12" fill="#1a2440"/>
+    <circle cx="26" cy="20" r="6" fill="#e5534b"/>
+    <circle cx="48" cy="20" r="6" fill="#e8b93e"/>
+    <circle cx="70" cy="20" r="6" fill="#3fb68b"/>
+    <text x="310" y="25" text-anchor="middle" fill="#5b6b94" font-size="14" font-family="Menlo, monospace">opsx — 变更守门</text>
+    <g font-family="Menlo, monospace" font-size="15">
+      <text x="24" y="78"  fill="#7ee0b8">$ opsx check 'kubectl get pods'</text>
+      <text x="24" y="106" fill="#8b98b8">只读命令，放行</text>
+      <text x="24" y="146" fill="#7ee0b8">$ opsx check 'kubectl delete pod x'</text>
+      <text x="24" y="174" fill="#ff9d94">[opsx] 拒绝执行：该命令判定为 R3。</text>
+      <text x="24" y="202" fill="#8b98b8">  请先提交变更单，经确认后使用 opsx exec。</text>
+      <text x="24" y="242" fill="#7ee0b8">$ opsx exec 'kubectl delete pod x'</text>
+      <text x="24" y="270" fill="#8b98b8">snapshot_id: 20260919-120055 · audit ✓</text>
+    </g>
+  </g>
+
+  <!-- 标题区 -->
+  <text x="150" y="116" fill="#f2f5fb" font-size="42" font-weight="bold">从零创建一个带权限闸门的 Claude Code Agent</text>
+  <text x="152" y="158" fill="#8b98b8" font-size="20">默认只读 · 变更单授权 · 快照回滚 · 全链路审计 —— ops-agent 实战教程</text>
+
+  <!-- 底部：两层防线说明 -->
+  <g transform="translate(150,540)" font-size="17">
+    <rect x="0"   y="0" width="330" height="56" rx="8" fill="#141d38" stroke="#263456"/>
+    <text x="20" y="24" fill="#c9d4ec" font-weight="bold">第一层 · Agent 纪律</text>
+    <text x="20" y="46" fill="#8b98b8" font-family="Menlo, monospace">.claude/agents/ops.md</text>
+    <rect x="350" y="0" width="330" height="56" rx="8" fill="#141d38" stroke="#263456"/>
+    <text x="370" y="24" fill="#c9d4ec" font-weight="bold">第二层 · Hook 硬拦截</text>
+    <text x="370" y="46" fill="#8b98b8" font-family="Menlo, monospace">PreToolUse → opsx hook</text>
+    <rect x="700" y="0" width="330" height="56" rx="8" fill="#141d38" stroke="#263456"/>
+    <text x="720" y="24" fill="#c9d4ec" font-weight="bold">演进 · MCP server</text>
+    <text x="720" y="46" fill="#8b98b8" font-family="Menlo, monospace">mcp_server.py · stdio JSON-RPC</text>
+  </g>
+</svg>
