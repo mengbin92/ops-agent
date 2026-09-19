@@ -194,7 +194,12 @@ class McpClient:
         assert "result" in resp, f"tools/call 无 result: {resp}"
         result = resp["result"]
         assert result["content"][0]["type"] == "text"
-        return result, json.loads(result["content"][0]["text"])
+        text = result["content"][0]["text"]
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:  # isError 内容为纯文本，非 JSON
+            payload = text
+        return result, payload
 
     def close(self):
         self.proc.terminate()
@@ -230,6 +235,67 @@ def test_mcp_protocol_errors():
         assert resp["error"]["code"] == -32601
         resp = c.request("ping")  # 服务循环存活
         assert resp["result"] == {}
+    finally:
+        c.close()
+
+
+def test_mcp_tools_list():
+    c = McpClient()
+    try:
+        tools = c.request("tools/list")["result"]["tools"]
+        assert len(tools) == 8
+        by_name = {t["name"]: t for t in tools}
+        assert set(by_name) == {
+            "ops_check", "ops_snapshot_file", "ops_snapshot_cmd", "ops_approve",
+            "ops_exec", "ops_rollback", "ops_list", "ops_audit",
+        }
+        assert by_name["ops_check"]["annotations"]["readOnlyHint"] is True
+        assert by_name["ops_list"]["annotations"]["readOnlyHint"] is True
+        assert by_name["ops_audit"]["annotations"]["readOnlyHint"] is True
+        assert "annotations" not in by_name["ops_exec"]
+        assert by_name["ops_exec"]["inputSchema"]["required"] == ["command"]
+    finally:
+        c.close()
+
+
+def test_mcp_readonly_tools():
+    c = McpClient()
+    try:
+        _, payload = c.call_tool("ops_check", {"command": "docker ps"})
+        assert payload["allowed"] is True and payload["level"] == "R0"
+        _, payload = c.call_tool("ops_check", {"command": "rm -rf /tmp/x"})
+        assert payload["allowed"] is False and payload["level"] == "R3"
+        result, _ = c.call_tool("ops_approve", {"command": "rm -rf /tmp/x"})  # R3 无 force
+        assert result["isError"] is True
+        result, _ = c.call_tool("ops_check", {})  # 缺参
+        assert result["isError"] is True
+        _, payload = c.call_tool("ops_audit", {"tail": 3})
+        assert isinstance(payload["events"], list)
+    finally:
+        c.close()
+
+
+def test_mcp_write_cycle():
+    import tempfile as tf
+    c = McpClient()
+    try:
+        with tf.TemporaryDirectory() as td:
+            f = Path(td) / "mcp-demo.conf"
+            f.write_text("v1")
+            cmd = f"echo v2 > {f}"
+            _, payload = c.call_tool("ops_approve", {"command": cmd, "ttl_seconds": 60})
+            assert payload["level"] == "R2"
+            _, payload = c.call_tool("ops_exec", {"command": cmd, "snapshot_files": [str(f)]})
+            assert payload["exit_code"] == 0 and payload["snapshot_id"]
+            assert f.read_text() == "v2\n"
+            _, payload = c.call_tool("ops_rollback", {"snapshot_id": payload["snapshot_id"]})
+            assert "已恢复文件" in payload["report"]
+            assert f.read_text() == "v1"
+            _, payload = c.call_tool("ops_list")
+            assert payload["snapshots"] and payload["approvals"]
+            cmd2 = f"echo v3 > {f}"
+            _, payload = c.call_tool("ops_exec", {"command": cmd2})  # 无戳 → exit 2
+            assert payload["exit_code"] == 2
     finally:
         c.close()
 
