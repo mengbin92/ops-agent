@@ -36,14 +36,14 @@
 
 ## MCP server 形态
 
-`mcp_server.py` 把同一组能力以 MCP server 暴露（stdio JSON-RPC，纯 stdlib，与 CLI 共享 core.py 与状态目录）。客户端注册：
+`mcp_server.py` 把同一组能力以 MCP server 暴露（stdio JSON-RPC，纯 stdlib，与 CLI 共享 core.py 与状态目录）。客户端注册（把 `<本仓库路径>` 替换为本仓库绝对路径）：
 
 ```json
 {
   "mcpServers": {
     "ops-guard": {
       "command": "python3",
-      "args": ["/Users/neo/vscode/mengbin/ops-agent/mcp_server.py"]
+      "args": ["<本仓库路径>/mcp_server.py"]
     }
   }
 }

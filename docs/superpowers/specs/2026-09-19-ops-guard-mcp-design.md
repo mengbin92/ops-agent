@@ -88,7 +88,7 @@ MCP server 注册（stdio）：
   "mcpServers": {
     "ops-guard": {
       "command": "python3",
-      "args": ["/Users/neo/vscode/mengbin/ops-agent/mcp_server.py"]
+      "args": ["<本仓库路径>/mcp_server.py"]
     }
   }
 }
@@ -126,7 +126,7 @@ MCP server 注册（stdio）：
 
 ## 7. 交付物
 
-- `mcp_server.py`（新建，约 150 行，目标 < 200）
+- `mcp_server.py`（新建，235 行）
 - `selftest.py`（+1 个 e2e 测试函数，总测试数 18 → 19）
 - `README.md`（MCP 注册配置、确认流说明、与 CLI 的关系）
 - 本文档

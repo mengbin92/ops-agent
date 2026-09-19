@@ -90,7 +90,7 @@ Agent 收到 R3 类请求时的默认行为是拒绝并解释风险。仅当用�
 - 内容：规范化命令的 SHA-256、原始命令、创建时间、TTL（默认 15 分钟）、force 标记、审批方式（interactive / manual）。
 - 存储：`~/.ops-agent/approvals/<sha256>.json`。
 - 有效期：创建时间 + TTL；过期即失效，需重新走流程。
-- `opsx exec` 内部自动创建审批戳（经 AskUserQuestion 批准后），`opsx approve '<命令>' --ttl 30m` 供用户手动预授权（降级路径用）。
+- 执行由 `opsx exec` 完成；Agent 在获得用户确认后先 `opsx approve '<命令>'` 创建审批戳，再 `opsx exec` 执行（该流程在 ops.md 中固化）。`opsx approve --ttl 1800`（单位秒）供用户手动预授权（降级路径用）。
 
 ### 4.5 快照与回滚
 
@@ -109,7 +109,7 @@ Agent 收到 R3 类请求时的默认行为是拒绝并解释风险。仅当用�
 |--------|------|----------|
 | `opsx check <cmd>` | hook 入口 | 白名单/审批戳 → exit 0；否则 exit 2 + 原因。只写审计，不执行 |
 | `opsx exec <cmd> [--snapshot-file ...] [--snapshot-cmd ...]` | 原子执行变更 | 校验 → 快照（按传入参数）→ 执行 → 审计；任何一步失败即中止并写审计 |
-| `opsx approve <cmd> [--ttl Nm] [--force]` | 手动预授权 | 创建审批戳，打印风险级与有效期 |
+| `opsx approve <cmd> [--ttl 秒] [--force]` | 手动预授权 | 创建审批戳，打印风险级与有效期 |
 | `opsx snapshot --file <p>` / `--cmd '<c>' [--name n]` | 创建快照 | 返回 snapshot_id，写审计 |
 | `opsx rollback <snapshot_id>` | 回滚 | 恢复文件 / 输出捕获状态，写审计 |
 | `opsx list [--snapshots\|--approvals]` | 列出状态 | 只读 |
