@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""opsx CLI——core.py 的薄壳。"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import core  # noqa: E402
+
+
+def _join(parts: list[str]) -> str:
+    return " ".join(parts)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="opsx", description="运维变更守门：分类/审批戳/快照/回滚/审计")
+    sub = p.add_subparsers(dest="sub", required=True)
+
+    c = sub.add_parser("check", help="hook 入口：判定命令并输出放行/拒绝")
+    c.add_argument("command", nargs="+")
+
+    a = sub.add_parser("approve", help="手动预授权（降级路径）")
+    a.add_argument("command", nargs="+")
+    a.add_argument("--ttl", type=int, default=900, help="有效期秒数")
+    a.add_argument("--force", action="store_true", help="R3 不可逆操作必须显式加此 flag")
+
+    e = sub.add_parser("exec", help="原子执行：校验→快照→执行→审计")
+    e.add_argument("command", nargs="+")
+    e.add_argument("--snapshot-file", action="append", default=[])
+    e.add_argument("--snapshot-cmd", action="append", default=[],
+                   help="'name::command' 形式，可多次")
+
+    s = sub.add_parser("snapshot", help="独立快照")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--file")
+    g.add_argument("--cmd")
+    s.add_argument("--name", default="")
+
+    r = sub.add_parser("rollback")
+    r.add_argument("snapshot_id")
+
+    sub.add_parser("list", help="列出快照与审批戳")
+
+    at = sub.add_parser("audit")
+    at.add_argument("--tail", type=int, default=20)
+
+    sub.add_parser("selftest", help="运行内置自检")
+
+    sub.add_parser("hook", help="Claude Code PreToolUse hook 入口（stdin 读 JSON）")
+
+    args = p.parse_args(argv)
+
+    try:
+        if args.sub == "hook":
+            try:
+                data = json.load(sys.stdin)
+                command = data.get("tool_input", {}).get("command", "")
+                code, msg = core.check(command)
+                if code != 0:
+                    print(msg, file=sys.stderr)
+                return code
+            except Exception as e:  # noqa: BLE001 —— hook 异常一律拒绝方向
+                print(f"[opsx] hook 异常，拒绝执行: {e}", file=sys.stderr)
+                return 2
+
+        if args.sub == "check":
+            code, msg = core.check(_join(args.command))
+            print(msg, file=sys.stderr if code else sys.stdout)
+            return code
+
+        if args.sub == "approve":
+            path = core.approve(_join(args.command), ttl_seconds=args.ttl, force=args.force)
+            print(f"已授权（{path.name}，TTL {args.ttl}s）")
+            return 0
+
+        if args.sub == "exec":
+            snap_cmds = []
+            for spec in args.snapshot_cmd:
+                name, _, cmd = spec.partition("::")
+                snap_cmds.append((cmd, name))
+            return core.exec_change(_join(args.command), args.snapshot_file, snap_cmds)
+
+        if args.sub == "snapshot":
+            sid = core.snapshot_file(args.file) if args.file else core.snapshot_cmd(args.cmd, args.name)
+            print(sid)
+            return 0
+
+        if args.sub == "rollback":
+            print(core.rollback(args.snapshot_id))
+            return 0
+
+        if args.sub == "list":
+            lines = []
+            sdir = core.STATE_DIR / "snapshots"
+            if sdir.exists():
+                lines.append("== snapshots ==")
+                lines += [x.name for x in sorted(sdir.iterdir()) if x.is_dir()]
+            adir = core.STATE_DIR / "approvals"
+            if adir.exists():
+                lines.append("== approvals ==")
+                for x in sorted(adir.glob("*.json")):
+                    st = json.loads(x.read_text(encoding="utf-8"))
+                    lines.append(f"{st['cmd'][:80]}  (level={st['level']}, ttl={st['ttl']}s)")
+            print("\n".join(lines) or "(空)")
+            return 0
+
+        if args.sub == "audit":
+            f = core.STATE_DIR / "audit.jsonl"
+            if not f.exists():
+                print("(无审计日志)")
+                return 0
+            lines = f.read_text(encoding="utf-8").strip().splitlines()
+            for line in lines[-args.tail:]:
+                print(line)
+            return 0
+
+        if args.sub == "selftest":
+            import selftest
+            return selftest.main()
+
+    except core.OpsxError as e:
+        print(f"[opsx] 错误: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
