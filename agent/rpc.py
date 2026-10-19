@@ -113,7 +113,8 @@ def serve(model: str | None = None) -> None:
                     else:
                         events.append({"kind": kind, "payload": payload})
 
-                ctx = tools.ToolContext(ask_user=ask_user, model=model)
+                ctx = tools.ToolContext(ask_user=ask_user, model=model,
+                                        session_id=session.id)
                 text = loop.run_turn(params.get("text", ""), session, ctx, on_event=push,
                                      on_delta=(lambda delta: push("delta", delta)) if stream else None,
                                      model=model)

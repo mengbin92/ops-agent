@@ -1353,6 +1353,8 @@ def test_skill_catalog_and_load():
         assert name in catalog, catalog
     body = agent_tools.dispatch("skill", {"name": "nginx-5xx"}, ctx)
     assert "systemctl status nginx" in body and "变更单" in body
+    assert "systemctl status nginx" in agent_tools.dispatch(
+        "skill", {"name": "nginx-5xx.md"}, ctx)  # 允许带扩展名
     # 用户目录同名覆盖仓库
     user_dir = Path(core.STATE_DIR, "skills")
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -1415,7 +1417,7 @@ def test_subagent_parallel_and_readonly():
     assert all(model == "m-test" for _, _, _, _, model in seen)
     # 子代理上下文：写工具被拒、工具列表只剩只读
     sub_ctx = agent_tools.ToolContext(allowed=agent_tools.SUBAGENT_TOOLS)
-    assert "只读子代理" in agent_tools.dispatch(
+    assert "只读上下文" in agent_tools.dispatch(
         "ops_exec", {"command": "systemctl restart x"}, sub_ctx)
     names = {s["function"]["name"] for s in agent_tools.tool_schemas(sub_ctx)}
     assert names == {"bash", "read", "skill", "ops_list"}
@@ -1437,6 +1439,263 @@ def test_run_turn_max_turns_bounded():
         assert len([m for m in s.messages if m.get("role") == "tool"]) == 2
     finally:
         restore()
+
+
+
+
+def test_schedule_store_and_due():
+    import time
+    from agent import loop, schedule
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+    entry = schedule.add("检查磁盘", every_seconds=60)
+    assert entry["id"].startswith("sch-")
+    assert 0 < entry["next_run"] - time.time() <= 60
+    daily = schedule.add("每日巡检", daily="09:00")
+    lt = time.localtime(daily["next_run"])
+    assert (lt.tm_hour, lt.tm_min) == (9, 0) and daily["next_run"] > time.time()
+    assert "检查磁盘" in schedule.format_list()
+    # 手动把 next_run 拨到过去 → run_due 执行两条
+    items = schedule.list_entries()
+    for it in items:
+        it["next_run"] = time.time() - 1
+    schedule._save(items)
+    calls = []
+    orig = loop.run_turn
+
+    def fake(task, session, ctx, **kwargs):
+        calls.append((task, ctx, kwargs))
+        return f"报告:{task}"
+
+    loop.run_turn = fake
+    try:
+        results = schedule.run_due()
+    finally:
+        loop.run_turn = orig
+    assert len(results) == 2
+    assert {result for _, result in results} == {"报告:检查磁盘", "报告:每日巡检"}
+    assert all(ctx.ask_user is None for _, ctx, _ in calls)
+    assert all(kw["system"] == schedule.SCHEDULE_PROMPT for _, _, kw in calls)
+    assert all(kw["max_turns"] == schedule.SCHEDULE_MAX_TURNS for _, _, kw in calls)
+    # 执行前已推进 next_run → 立即再跑不会重复触发
+    assert all(it["next_run"] > time.time() for it in schedule.list_entries())
+    assert schedule.run_due() == []
+    events = [json.loads(l)["event"] for l in
+              (core.STATE_DIR / "audit.jsonl").read_text().strip().splitlines()[-4:]]
+    assert events.count("schedule-run") == 2
+    # remove 支持唯一前缀
+    assert schedule.remove(entry["id"][:7])["id"] == entry["id"]
+    assert schedule.remove(daily["id"])["id"] == daily["id"]
+    assert schedule.list_entries() == []
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+
+
+def test_schedule_validation_and_cli():
+    import subprocess as sp
+    import sys as _sys
+    from agent import schedule
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+    for bad in ({"every_seconds": 10}, {"daily": "25:00"}, {"daily": "9点"},
+                {"every_seconds": 60, "daily": "09:00"}):
+        try:
+            schedule.add("x", **bad)
+            raise AssertionError(f"应拒绝: {bad}")
+        except schedule.ScheduleError:
+            pass
+    script = str(Path(__file__).resolve().parent / "opsagent")
+    r = sp.run([_sys.executable, script, "schedule", "add", "--every", "3600", "CLI 巡检"],
+               capture_output=True, text=True)
+    assert r.returncode == 0 and "已添加" in r.stdout, r.stderr
+    r = sp.run([_sys.executable, script, "schedule", "list"], capture_output=True, text=True)
+    assert "CLI 巡检" in r.stdout, r.stderr
+    entry = schedule.list_entries()[0]
+    r = sp.run([_sys.executable, script, "schedule", "remove", entry["id"]],
+               capture_output=True, text=True)
+    assert r.returncode == 0 and "已删除" in r.stdout, r.stderr
+    assert schedule.list_entries() == []
+    r = sp.run([_sys.executable, script, "schedule", "remove", "nope"],
+               capture_output=True, text=True)
+    assert r.returncode == 1 and "没有匹配" in r.stderr, r.stderr
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+
+
+def test_schedule_corrupt_entry_disabled():
+    import time as _t
+    from agent import schedule
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+    good = schedule.add("正常巡检", every_seconds=60)
+    items = schedule.list_entries()
+    items[0]["next_run"] = 0
+    items.append({"id": "sch-bad", "prompt": "坏任务", "enabled": True,
+                  "every_seconds": None, "daily": None, "next_run": 0})
+    schedule._save(items)
+    orig = schedule._run_entry
+    schedule._run_entry = lambda entry, model: f"报告:{entry['id']}"
+    try:
+        results = schedule.run_due()
+    finally:
+        schedule._run_entry = orig
+    assert [entry["id"] for entry, _ in results] == [good["id"]]
+    bad = [it for it in schedule.list_entries() if it["id"] == "sch-bad"][0]
+    assert bad["enabled"] is False
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+
+
+def test_schedule_tool_and_lock():
+    from agent import schedule, tools as agent_tools
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+    ctx = agent_tools.ToolContext()
+    out = agent_tools.dispatch("schedule", {"action": "add", "prompt": "每日磁盘巡检",
+                                            "every_seconds": 3600}, ctx)
+    assert "已添加" in out and "sch-" in out
+    assert "每日磁盘巡检" in agent_tools.dispatch("schedule", {"action": "list"}, ctx)
+    entry = schedule.list_entries()[0]
+    assert "已删除" in agent_tools.dispatch("schedule", {"action": "remove", "id": entry["id"]}, ctx)
+    assert agent_tools.dispatch("schedule", {"action": "list"}, ctx).startswith("(无定时任务")
+    assert "二选一" in agent_tools.dispatch("schedule", {"action": "add", "prompt": "x"}, ctx)
+    if schedule.fcntl is not None:  # 同一文件第二个锁拿不到（双守护/双 cron 不会并发）
+        with schedule._locked("schedules.lock", block=False) as first:
+            assert first is True
+            with schedule._locked("schedules.lock", block=False) as second:
+                assert second is False
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+
+
+def test_ops_approve_requires_interactive_channel():
+    from agent import tools as agent_tools
+    cmd = "systemctl restart approve-gate"
+    out = agent_tools.dispatch("ops_approve", {"command": cmd, "ttl_seconds": 60},
+                               agent_tools.ToolContext())
+    assert "没有可确认的用户通道" in out
+    assert core.check_stamp(cmd) is False
+    out = agent_tools.dispatch("ops_approve", {"command": cmd, "ttl_seconds": 60},
+                               agent_tools.ToolContext(ask_user=lambda q: "确认"))
+    assert "审批戳已创建" in out and core.check_stamp(cmd) is True
+    core.revoke(cmd)
+
+
+def test_goal_lifecycle():
+    from agent import goal, session as agent_session
+    (core.STATE_DIR / "goals.json").unlink(missing_ok=True)
+    sid = "goal-test-0001"
+    agent_session.Session(sid).append({"role": "user", "content": "开始"})
+    st = goal.create(sid, "把 nginx 升级到稳定版并验证", max_rounds=2)
+    assert st["status"] == "active" and st["max_rounds"] == 2
+    try:
+        goal.create(sid, "另一个目标")
+        raise AssertionError("已有活跃目标应拒绝")
+    except goal.GoalError:
+        pass
+    msg = goal.continuation(sid)
+    assert msg and "目标自动续跑 1/2" in msg and "nginx" in msg
+    assert "2/2" in (goal.continuation(sid) or "")
+    assert goal.continuation(sid) is None
+    paused = goal.get(sid)
+    assert paused["status"] == "paused" and "上限" in paused["reason"]
+    goal.update(sid, "resume")
+    assert goal.get(sid)["status"] == "active" and goal.get(sid)["rounds_used"] == 0
+    try:
+        goal.update(sid, "blocked")
+        raise AssertionError("blocked 缺 reason 应拒绝")
+    except goal.GoalError:
+        pass
+    goal.update(sid, "blocked", reason="等待维护窗口")
+    assert goal.get(sid)["status"] == "blocked"
+    goal.update(sid, "complete")
+    assert goal.get(sid)["status"] == "completed"
+    assert goal.continuation(sid) is None
+    try:
+        goal.update(sid, "resume")
+        raise AssertionError("已完成目标不能 resume")
+    except goal.GoalError:
+        pass
+    try:
+        goal.update("no-such-session", "complete")
+        raise AssertionError("没有目标应报错")
+    except goal.GoalError:
+        pass
+    try:
+        goal.create(sid + "-x", "   ")
+        raise AssertionError("空 objective 应拒绝")
+    except goal.GoalError:
+        pass
+    assert "目标" in goal.format_one(goal.get(sid))
+    (core.STATE_DIR / "goals.json").unlink(missing_ok=True)
+
+
+def test_goal_tool_and_repl_continuation():
+    from agent import goal, loop, repl, tools as agent_tools
+    (core.STATE_DIR / "goals.json").unlink(missing_ok=True)
+    state = repl.ReplState(None)
+    state.session.append({"role": "user", "content": "开始"})
+    ctx = agent_tools.ToolContext(session_id=state.session.id, goal_continuation=True)
+    out = agent_tools.dispatch("goal", {"action": "create",
+                                        "objective": "巡检完所有节点", "max_rounds": 1}, ctx)
+    assert "已创建" in out
+    assert "巡检完所有节点" in agent_tools.dispatch("goal", {"action": "status"}, ctx)
+    # 非 REPL 形态拒绝创建（不会续跑，免得留下死目标）
+    plain = agent_tools.ToolContext(session_id=state.session.id)
+    assert "不会自动续跑" in agent_tools.dispatch(
+        "goal", {"action": "create", "objective": "x"}, plain)
+    calls = []
+    orig = loop.run_turn
+
+    def fake(task, session, ctx, **kwargs):
+        calls.append(task)
+        return "继续完成"
+
+    loop.run_turn = fake
+    try:
+        repl._continue_goal(state, ctx)
+    finally:
+        loop.run_turn = orig
+    assert len(calls) == 1 and "目标自动续跑" in calls[0]
+    assert goal.get(state.session.id)["status"] == "paused"
+    assert "completed" in agent_tools.dispatch("goal", {"action": "complete"}, ctx)
+    # 没有会话 id 时 goal 不可用
+    assert "不可用" in agent_tools.dispatch("goal", {"action": "status"},
+                                            agent_tools.ToolContext())
+    (core.STATE_DIR / "goals.json").unlink(missing_ok=True)
+
+
+def test_workflow_run_and_validation():
+    from agent import loop, tools as agent_tools, workflow
+    ctx = agent_tools.ToolContext()
+    assert "daily-inspection" in agent_tools.dispatch("workflow", {}, ctx)
+    assert len(workflow.load("daily-inspection")["steps"]) == 4
+    assert workflow.load("daily-inspection.json")["name"] == "daily-inspection"
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-test.json"
+    p.write_text(json.dumps({"description": "测试编排", "steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "基于上一步：{prev}"}]}), encoding="utf-8")
+    calls = []
+    orig = loop.run_turn
+
+    def fake(task, session, ctx, **kwargs):
+        calls.append((task, ctx.allowed))
+        return f"结果<{task}>"
+
+    loop.run_turn = fake
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-test"}, ctx)
+        for bad, needle in (
+                (json.dumps({"steps": []}), "没有 steps"),
+                (json.dumps({"steps": [{"name": "x"}]}), "缺少 prompt"),
+                ("{not json", "损坏"),
+                (json.dumps({"steps": [{"prompt": "x"}] * 9}), "步骤过多")):
+            p.write_text(bad, encoding="utf-8")
+            result = agent_tools.dispatch("workflow", {"name": "wf-test"}, ctx)
+            assert needle in result, (bad, result)
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert "结果<第一步>" in out and "步骤 2: 二" in out
+    assert len(calls) == 2
+    assert all(allowed == agent_tools.SUBAGENT_TOOLS for _, allowed in calls)
+    assert "结果<第一步>" in calls[1][0] and "{prev}" not in calls[1][0]
+    assert "错误" in agent_tools.dispatch("workflow", {"name": "no-such"}, ctx)
+    assert "非法" in agent_tools.dispatch("workflow", {"name": "../x"}, ctx)
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

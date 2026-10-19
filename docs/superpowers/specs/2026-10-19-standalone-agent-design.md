@@ -57,6 +57,19 @@
   仅 bash(R0)/read/skill/ops_list，不能写、不能嵌套派生，单任务 8 轮、沿用父代理模型；
   结果汇总后回落主代理，变更建议仍走变更单流程。74 项自测全绿。
 
+- **M5 ✅（2026-10-19）**：定时巡检（`agent/schedule.py` + `opsagent schedule`
+  list/add/remove/run）：`~/.ops-agent/schedules.json` 注册表（every_seconds / daily HH:MM），
+  到期先推进 next_run 再执行（长任务不重复触发），daemon 用 flock 防双开、注册表增删与
+  推进另有短锁防丢更新；无人值守只读运行（ask_user 不可用，写操作被拒），`--once` 适配 cron，
+  每次执行写审计 `schedule-run`。长目标（`agent/goal.py`）：目标按会话持久化，
+  REPL 每轮结束自动续跑（默认 6 轮、上限 20），完成/受阻/暂停/恢复显式建模，
+  `-p`/RPC/定时任务不续跑且拒绝创建；`/goal` 查看与暂停/恢复。
+  工作流编排（`agent/workflow.py`）：`workflows/*.json` + 用户目录覆盖，步骤顺序执行，
+  每步一个只读子代理，`{prev}` 引用前一步结论；自带 `daily-inspection` 每日巡检。
+  插件框架评估结论：不引入（见 5.1）。另修：`ops_approve` 在无确认通道时直接拒绝
+  （此前非 TTY 单发/定时任务可自建审批戳绕过人类授权），定时巡检工具集收紧为只读白名单。
+  82 项自测全绿。
+
 ## 1. 背景与目标
 
 ops-agent 现状是一个**守门工具**（guard rail）：`core.py` 风险分级 + 审批戳 + 快照 + 审计，
@@ -112,8 +125,8 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 │ agent/llm.py │ bash / read / ask_user /   │ core.py：分级/审批戳/快照/回滚/审计 │
 │ provider 分发│ ops_exec …注册表            │ config.yaml：R0-R3 规则            │
 ├──────────────┴───────────────────────────┴───────────────────────────────────┤
-│ 状态层：~/.ops-agent/（approvals, snapshots, targets.json, outputs, audit.jsonl）  │
-│         + sessions/*.jsonl（v1）                                             │
+│ 状态层：~/.ops-agent/（approvals, snapshots, targets.json, outputs, goals.json,│
+│         schedules.json, audit.jsonl）+ sessions/*.jsonl（v1）                 │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -137,8 +150,9 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 | 形态 | 入口 | 说明 |
 |---|---|---|
 | REPL | `opsagent` 或 `opsagent chat` | 交互式；`ask_user` 走终端；`/new` `/quit` |
-| 单发 | `opsagent -p "看一下 nginx 状态"` | 非交互，输出到 stdout，可进脚本；无 TTY 时 ask_user 返回"不可用"并降级为拒绝写操作 |
+| 单发 | `opsagent -p "看一下 nginx 状态"` | 非交互，输出到 stdout，可进脚本；无 TTY 时 ask_user 不可用、ops_approve 拒绝（写操作需人预先 `opsx approve`） |
 | RPC | `opsagent rpc` | stdio JSON-RPC：`prompt`（`stream:true` 推增量 event 通知，含 ask_user 回调请求）/ `reset`，供 Web UI、IM 机器人嵌入 |
+| 调度 | `opsagent schedule run` | 定时巡检：daemon 常驻或 `--once` 适配 cron；无人值守只读运行 |
 | MCP | `python3 mcp_server.py` | 保留现状，作为 Claude Code 等宿主的后端工具集 |
 
 ## 5. 演进路线（对照 DSH 子系统）
@@ -153,7 +167,15 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
   子代理（只读排查代理并行跑，工具白名单 + 轮次上限）。
 - **M4 ✅（2026-10-19）**：远程执行通道——SSH 目标注册表（只认注册目标）、远程快照拉回本地存档、
   回滚推回目标机、审批戳按目标绑定；把守门能力延伸到 ops.md 声称的远程场景。
-- **M5**：goal/schedule（定时巡检）、workflow 编排；按 DSH 的 cordis 思路评估是否引入插件框架（届时再议，M0 不引入）。
+- **M5 ✅（2026-10-19）**：goal（REPL 自动续跑的长目标）、schedule（定时巡检，daemon / cron）、
+  workflow 编排（JSON 多步只读）；插件框架按 DSH cordis 思路评估后决定不引入（5.1）。
+
+### 5.1 插件框架评估（M5 结论：暂不引入）
+
+DSH 用 cordis 管理插件上下文与生命周期。ops-agent 的扩展点目前只有三类：**工具注册表**
+（`agent/tools.py`）、**skills**（步骤知识，纯 markdown）、**workflow**（编排声明，纯 JSON）——
+都是数据或小函数，不需要依赖注入、生命周期或动态加载。现在引入插件框架的代价（新依赖、
+沙箱边界、守门语义被拆散到插件）大于收益。等出现第三方工具包、多租户或热加载需求时再评估。
 
 ## 6. 目录布局
 
@@ -162,11 +184,15 @@ ops-agent/
   core.py / opsx / config.yaml / mcp_server.py   # 现状；opsx 增加 --target/targets 子命令
   remote.py     # SSH 目标注册表 + 远程快照/回滚（M4）
   skills/       # 运维 playbook（*.md，文件名即 skill 名）
+  workflows/    # 巡检工作流定义（*.json，步骤 + {prev} 引用）
   agent/
     __init__.py
     llm.py        # provider 分发 + OpenAI 兼容 provider（urllib，可选 SSE）
     llm_anthropic.py  # Anthropic 原生 Messages provider（消息/工具双向转换）
     skills.py     # skills 目录：catalog() / load()，仓库 + 用户目录覆盖
+    goal.py       # 长目标持久化 + 续跑预算
+    schedule.py   # 定时巡检：注册表 / 到期执行 / daemon / --once
+    workflow.py   # 巡检工作流定义：catalog() / load()
     tools.py      # 工具注册表 + 内建工具
     loop.py       # agent loop
     session.py    # 会话持久化（jsonl, format v1）
@@ -188,3 +214,9 @@ ops-agent/
   本地端点/限流严格时按需减少 tasks 数。
 - **skills 是本地受信内容**：用户目录里的 playbook 与 config.override 同级信任；
   技能只给步骤，写操作仍受守门约束（bash 仅 R0、写操作必须审批戳）。
+- **定时任务无人值守**：没有 ask_user，写操作一律被拒；目标机巡检只做 R0，变更只给建议。
+  守护进程与 `--once` 都靠 flock 互斥，cron 与 daemon 不要同时调度同一份注册表之外的多份副本。
+- **goal 只在 REPL 续跑**：单发/RPC/定时任务不自动续跑，避免脚本/机器人里无限消耗轮次；
+  目标续跑中的写操作仍逐次确认，轮次上限默认 6。
+- **workflow 步骤顺序只读**：每步是独立子代理（8 轮上限），步骤间只通过 `{prev}` 传结论，
+  不做共享内存；需要并行的场景用 subagent。

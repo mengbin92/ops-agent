@@ -24,6 +24,7 @@ export OPSAGENT_API_KEY=sk-...
 ./opsagent                                # 交互式 REPL（/new 新会话，/quit 退出）
 ./opsagent -p "看一下本机磁盘和内存"        # 单发非交互，可进脚本/CI
 ./opsagent rpc                            # stdio JSON-RPC 长驻进程（供 Web UI/IM 嵌入）
+./opsagent schedule list                  # 定时巡检任务（M5，详见下文）
 ```
 
 REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown 终端渲染**
@@ -49,7 +50,8 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 四种形态共享同一内核与状态目录：REPL、单发、RPC、MCP（见下）。
 独立形态下守门在内核之内：bash 工具直接调 `core.check()`，写命令须
 变更单 → ask_user 确认 → ops_approve 建戳 → ops_exec 快照执行。
-非 TTY 环境 ask_user 不可用，写操作安全方向降级为拒绝。
+非 TTY 环境 ask_user 不可用：`ops_approve` 直接拒绝（没有确认通道，不能自己给自己发戳），
+写操作只能靠人工预先 `./opsx approve` 授权。
 
 ## 组成（Claude Code 插件形态）
 
@@ -129,6 +131,47 @@ playbook 里的只读命令直接用，写操作仍走变更单流程——skill
 `read` / `skill` / `ops_list`，不能写、也不能继续派生；每个任务最多 8 轮、沿用父代理的
 `--model`。子代理会话同样落在 `~/.ops-agent/sessions/`（计入 300 个会话保留上限），
 可在 `/resume` 里回看排查过程。
+
+## 定时巡检、长目标与工作流（M5）
+
+**定时巡检（schedule）**：任务存在 `~/.ops-agent/schedules.json`，到期后以无人值守模式跑一轮
+agent——没有可回答问题的人，因此只读排查，写操作会被守门拒绝，只输出建议。
+
+```bash
+./opsagent schedule add --daily 09:00 "只读巡检磁盘/内存/服务，异常给建议"
+./opsagent schedule add --every 1800 "检查 nginx 错误日志"
+./opsagent schedule list
+./opsagent schedule remove <id>       # id 可用唯一前缀
+./opsagent schedule run               # 守护进程（同一时刻只允许一个，flock 防双开）
+./opsagent schedule run --once        # 适合 cron：*/5 * * * * ... schedule run --once
+```
+
+agent 里也可以直接说"每天九点巡检一次"，模型用 `schedule` 工具登记（list / add / remove）。
+每次执行写审计（`schedule-run`，含结论摘要）；注册表的增删与 daemon 的推进各有锁，
+不会丢更新。每次巡检的会话也落在 `~/.ops-agent/sessions/`（计入 300 上限），可在
+`/resume` 回看。cron 场景记得在环境里带上 `OPSAGENT_API_KEY` / `OPSAGENT_BASE_URL`。
+
+**长目标（goal）**：在 REPL 里让 agent 推进多步目标（"排查到定位为止""升级并验证完"）。
+每轮结束后按目标状态自动续跑，默认最多 6 轮（`max_rounds` 可调，上限 20），完成后自动停。
+续跑中的写操作仍然逐次需要用户确认；`/goal` 查看状态，`/goal stop` 暂停，`/goal resume`
+恢复并重置轮次预算。`-p` / RPC / 定时任务不会自动续跑（单发语义），`goal` 工具在这些
+形态下拒绝创建，避免留下永远不推进的目标。
+
+**巡检工作流（workflow）**：把固定巡检步骤写成 JSON——仓库 [workflows/](workflows/) 自带
+`daily-inspection`，`~/.ops-agent/workflows/*.json` 同名覆盖。每步起一个只读子代理顺序执行，
+后一步用 `{prev}` 引用前一步结论：
+
+```json
+{"description": "每日巡检", "steps": [
+  {"name": "资源", "prompt": "只读检查磁盘/内存/负载"},
+  {"name": "汇总", "prompt": "基于前序结论写报告：{prev}"}
+]}
+```
+
+agent 里先 `workflow`（不带 name）列目录，再 `workflow {"name": "daily-inspection"}` 运行；
+定时任务的 prompt 也可以写"运行 workflow daily-inspection 并报告异常"。
+`opsagent schedule add --daily 09:00 "运行 workflow daily-inspection 并报告异常"` 就是一套
+完整的每日巡检。
 
 ## 防线说明
 

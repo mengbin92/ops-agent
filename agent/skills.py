@@ -75,6 +75,8 @@ def catalog() -> list[dict]:
 
 def load(name: str) -> str:
     """载入 skill 正文；名字/文件不存在时返回可读的错误说明。"""
+    if isinstance(name, str) and name.endswith(".md"):
+        name = name[:-3]
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         return f"[错误] 非法 skill 名: {name!r}（只允许字母数字与 ._-）"
     for d in reversed(SEARCH_DIRS):  # 用户目录优先

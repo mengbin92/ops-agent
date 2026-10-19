@@ -19,8 +19,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 import remote  # noqa: E402
+from . import goal as goal_mod  # noqa: E402
+from . import schedule as schedule_mod  # noqa: E402
 from . import session as session_mod  # noqa: E402
 from . import skills  # noqa: E402
+from . import workflow  # noqa: E402
 
 BASH_TIMEOUT = 120
 OUTPUT_LIMIT = 30_000   # 超限输出落盘，预览只留前 3 万字符
@@ -35,12 +38,18 @@ class ToolContext:
     ask_user(question) -> str；不可用返回 None。
     allowed：工具白名单（子代理只读），None = 全部。
     model：父代理使用的模型，子代理沿用（--model 覆盖时保持一致）。
+    session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
+    goal_continuation：只有 REPL 会跨轮续跑，-p/RPC/定时任务为 False。
     """
 
-    def __init__(self, ask_user=None, allowed: set[str] | None = None, model: str | None = None):
+    def __init__(self, ask_user=None, allowed: set[str] | None = None,
+                 model: str | None = None, session_id: str | None = None,
+                 goal_continuation: bool = False):
         self.ask_user = ask_user
         self.allowed = allowed
         self.model = model
+        self.session_id = session_id
+        self.goal_continuation = goal_continuation
 
 
 def _schema(name, description, properties, required):
@@ -165,6 +174,9 @@ def _ask_user(args: dict, ctx: ToolContext) -> str:
 
 
 def _ops_approve(args: dict, ctx: ToolContext) -> str:
+    if ctx.ask_user is None:  # 没有确认通道时不能自建审批戳（否则可绕过人类授权）
+        return ("[opsx 拒绝] 当前形态没有可确认的用户通道，不创建审批戳。"
+                "请由人执行 opsx approve（或改用 REPL / MCP 弹窗）后重试。")
     target = args.get("target") or None
     try:
         if target:  # 只允许给注册过的目标建戳
@@ -223,8 +235,22 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
 
 
 SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list"})
+# 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见
+SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent", "ops_list"})
 SUBAGENT_MAX_TASKS = 4
 SUBAGENT_MAX_TURNS = 8
+WORKFLOW_PREV_LIMIT = 6000
+
+
+def _run_isolated(task: str, ctx: ToolContext, system: str | None = None) -> str:
+    """跑一个只读子代理（子代理与 workflow 步骤共用）。"""
+    from . import loop  # 延迟导入：loop 依赖本模块
+    sub_session = session_mod.Session()
+    sub_ctx = ToolContext(ask_user=None, allowed=SUBAGENT_TOOLS, model=ctx.model,
+                          session_id=sub_session.id)
+    return loop.run_turn(task, sub_session, sub_ctx,
+                         system=system or loop.SUBAGENT_PROMPT,
+                         model=ctx.model, max_turns=SUBAGENT_MAX_TURNS)
 
 
 def _subagent(args: dict, ctx: ToolContext) -> str:
@@ -234,16 +260,12 @@ def _subagent(args: dict, ctx: ToolContext) -> str:
         return "[错误] tasks 不能为空：每个子任务写清目标与要回答的问题"
     if len(tasks) > SUBAGENT_MAX_TASKS:
         return f"[错误] 最多 {SUBAGENT_MAX_TASKS} 个并行子任务（收到 {len(tasks)} 个）"
-    from . import loop  # 延迟导入：loop 依赖本模块
 
     results: list[str] = [""] * len(tasks)
 
     def run(i: int, task: str) -> None:
         try:
-            sub_ctx = ToolContext(ask_user=None, allowed=SUBAGENT_TOOLS, model=ctx.model)
-            results[i] = loop.run_turn(task, session_mod.Session(), sub_ctx,
-                                       system=loop.SUBAGENT_PROMPT, model=ctx.model,
-                                       max_turns=SUBAGENT_MAX_TURNS)
+            results[i] = _run_isolated(task, ctx)
         except Exception as e:  # noqa: BLE001 —— 单个子任务失败不拖垮其余
             results[i] = f"[失败] {e}"
 
@@ -256,6 +278,74 @@ def _subagent(args: dict, ctx: ToolContext) -> str:
     report = "\n\n".join(f"## 子任务 {i}: {task}\n{results[i - 1] or '(无输出)'}"
                           for i, task in enumerate(tasks, 1))
     return _cap(report, "subagent")
+
+
+def _workflow(args: dict, ctx: ToolContext) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        entries = workflow.catalog()
+        if not entries:
+            return (f"(无 workflow：在 {workflow.DIRS[0]} 或 "
+                    f"{workflow.DIRS[1]} 放 *.json)")
+        return "可用 workflow：\n" + "\n".join(
+            f"{e['name']} — {e['description']}" if e["description"] else e["name"]
+            for e in entries)
+    try:
+        wf = workflow.load(name)
+    except workflow.WorkflowError as e:
+        return f"[错误] {e}"
+    prev, sections = "", []
+    for i, step in enumerate(wf["steps"], 1):
+        prompt = step["prompt"].replace(
+            "{prev}", prev[:WORKFLOW_PREV_LIMIT] if prev else "（无）")
+        try:
+            result = _run_isolated(prompt, ctx)
+        except Exception as e:  # noqa: BLE001 —— 单步失败仍保留前面结果
+            result = f"[失败] {e}"
+        sections.append(f"## 步骤 {i}: {step['name']}\n{result}")
+        prev = result
+    return _cap("\n\n".join(sections), f"workflow-{name}")
+
+
+def _schedule(args: dict, ctx: ToolContext) -> str:
+    action = args.get("action")
+    try:
+        if action == "list":
+            return schedule_mod.format_list()
+        if action == "add":
+            entry = schedule_mod.add(args.get("prompt") or "",
+                                     every_seconds=args.get("every_seconds"),
+                                     daily=args.get("daily"))
+            return (f"[schedule] 已添加 {entry['id']}：{schedule_mod.describe(entry)}，"
+                    f"下次 {schedule_mod.fmt_ts(entry['next_run'])}"
+                    "（无人值守只读运行，写操作会被拒绝）")
+        if action == "remove":
+            entry = schedule_mod.remove(args.get("id") or "")
+            return f"[schedule] 已删除 {entry['id']}"
+        return "[错误] action 应为 list / add / remove"
+    except schedule_mod.ScheduleError as e:
+        return f"[schedule] {e}"
+
+
+def _goal(args: dict, ctx: ToolContext) -> str:
+    if not ctx.session_id:
+        return "[目标] 当前上下文没有会话 id，goal 不可用"
+    action = args.get("action")
+    try:
+        if action == "status":
+            return goal_mod.format_one(goal_mod.get(ctx.session_id))
+        if action == "create":
+            if not ctx.goal_continuation:
+                return ("[目标] 当前形态（-p / RPC / 定时任务）不会自动续跑："
+                        "请直接在本轮完成；需要跨轮推进请在 REPL 里创建目标。")
+            st = goal_mod.create(ctx.session_id, args.get("objective") or "",
+                                 args.get("max_rounds") or goal_mod.DEFAULT_MAX_ROUNDS)
+            return (f"[目标] 已创建 {st['id']}：{st['objective']}"
+                    f"（最多续跑 {st['max_rounds']} 轮）")
+        st = goal_mod.update(ctx.session_id, action, reason=args.get("reason") or "")
+        return "[目标] " + goal_mod.format_one(st)
+    except goal_mod.GoalError as e:
+        return f"[目标] {e}"
 
 
 def _ops_list(args: dict, ctx: ToolContext) -> str:
@@ -293,6 +383,15 @@ REGISTRY: dict[str, dict] = {
                           []),
         "handler": _skill, "read_only": True,
     },
+    "workflow": {
+        "schema": _schema("workflow",
+                          "巡检工作流：不带 name 列目录，带 name 按 JSON 定义的步骤顺序执行。"
+                          "每步是只读子代理，后一步可用 {prev} 引用前一步结论。",
+                          {"name": {"type": "string",
+                                    "description": "workflow 名（workflows/*.json，可不带 .json）；省略=列目录"}},
+                          []),
+        "handler": _workflow, "read_only": True,
+    },
     "ask_user": {
         "schema": _schema("ask_user", "向用户提问并等待回答。写操作审批、歧义澄清时使用。",
                           {"question": {"type": "string", "description": "向用户展示的问题（含变更单）"}},
@@ -308,6 +407,34 @@ REGISTRY: dict[str, dict] = {
                                      "description": "子任务描述（写清目标主机、命名空间、日志路径与要回答的问题）"}},
                           ["tasks"]),
         "handler": _subagent, "read_only": True,
+    },
+    "schedule": {
+        "schema": _schema("schedule",
+                          "定时巡检：action=list 查看；add 添加（every_seconds 或 daily 'HH:MM' 二选一，"
+                          "prompt 要写清只读要求）；remove 删除（id 可用唯一前缀）。",
+                          {"action": {"type": "string", "enum": ["list", "add", "remove"]},
+                           "prompt": {"type": "string", "description": "巡检指令（无人值守、只读）"},
+                           "every_seconds": {"type": "integer", "description": "每隔多少秒（>= 60）"},
+                           "daily": {"type": "string", "description": "每天本地时间 HH:MM"},
+                           "id": {"type": "string", "description": "remove 时的任务 id（可用前缀）"}},
+                          ["action"]),
+        "handler": _schedule, "read_only": False,
+    },
+    "goal": {
+        "schema": _schema("goal",
+                          "长目标：跨自动续跑推进的多步目标（仅 REPL 会自动续跑）。"
+                          "action=create 登记（objective 必填）；status 查看；"
+                          "complete 完成；blocked 受阻（需 reason）；pause/resume 暂停/恢复。"
+                          "单轮能完成的任务不要建目标。",
+                          {"action": {"type": "string",
+                                      "enum": ["create", "status", "complete", "blocked",
+                                               "pause", "resume"]},
+                           "objective": {"type": "string", "description": "目标描述"},
+                           "max_rounds": {"type": "integer",
+                                          "description": f"最多续跑轮数（默认 {goal_mod.DEFAULT_MAX_ROUNDS}，上限 {goal_mod.MAX_ROUNDS}）"},
+                           "reason": {"type": "string", "description": "blocked 的原因"}},
+                          ["action"]),
+        "handler": _goal, "read_only": False,
     },
     "ops_approve": {
         "schema": _schema("ops_approve",
@@ -361,8 +488,8 @@ def tool_schemas(ctx: ToolContext | None = None) -> list[dict]:
 
 def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     if ctx.allowed is not None and name not in ctx.allowed:
-        return (f"[opsx 拒绝] 只读子代理不能使用 {name}；需要变更请把建议写进结论，"
-                "由主代理走变更单流程。")
+        return (f"[opsx 拒绝] 当前为只读上下文（子代理 / 定时任务），不能使用 {name}；"
+                "需要变更请把建议写进结论，由人走变更单流程。")
     tool = REGISTRY.get(name)
     if tool is None:
         return f"[错误] 未知工具: {name}"

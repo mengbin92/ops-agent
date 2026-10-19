@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 
+from . import goal as goal_mod
 from . import loop, markdown, session as sess_mod, tools
 
 # ---- 语义配色：按信息类型/重要程度区分，NO_COLOR 或非 TTY 自动禁色 ----
@@ -200,6 +201,22 @@ class ReplState:
                          f"  ◂ {payload['name']}: {preview}"))
 
 
+def _continue_goal(state: "ReplState", ctx: tools.ToolContext) -> None:
+    """一轮结束后按目标状态自动续跑，直到完成/受阻/轮次用尽。"""
+    while True:
+        try:
+            msg = goal_mod.continuation(state.session.id)
+        except goal_mod.GoalError as e:
+            warn(f"[目标] {e}")
+            return
+        if not msg:
+            return
+        info("↻ 目标续跑中…")
+        state.printer = StreamPrinter()
+        loop.run_turn(msg, state.session, ctx, on_event=state.emit,
+                      model=state.model, on_delta=state.printer.feed)
+
+
 def _pick_session() -> sess_mod.Session | None:
     """列出历史会话并让用户选择恢复。"""
     sessions = sess_mod.list_sessions()
@@ -220,10 +237,12 @@ def _pick_session() -> sess_mod.Session | None:
 
 def main(model: str | None = None) -> int:
     state = ReplState(model)
-    ctx = tools.ToolContext(ask_user=_terminal_ask, model=model)
+    ctx = tools.ToolContext(ask_user=_terminal_ask, model=model,
+                            session_id=state.session.id, goal_continuation=True)
     _load_history()
     info(f"ops-agent REPL（会话 {state.session.id}，模型 {model or '默认'}）。")
-    info("/new 新会话 · /resume 恢复会话 · /copy [all] 复制回复 · /quit 退出 · ↑/↓ 翻历史")
+    info("/new 新会话 · /resume 恢复会话 · /goal 查看/暂停/恢复目标 · "
+         "/copy [all] 复制回复 · /quit 退出 · ↑/↓ 翻历史")
     prompt = make_prompt("ops> ")
     while True:
         try:
@@ -239,6 +258,7 @@ def main(model: str | None = None) -> int:
             return 0
         if line == "/new":
             state.session = sess_mod.Session()
+            ctx.session_id = state.session.id
             state.last_reply = ""
             ok(f"已开启新会话 {state.session.id}")
             continue
@@ -246,9 +266,25 @@ def main(model: str | None = None) -> int:
             picked = _pick_session()
             if picked:
                 state.session = picked
+                ctx.session_id = picked.id
                 state.last_reply = ""
                 ok(f"已恢复会话 {picked.id}（{len(picked.messages)} 条消息）")
             continue
+        if line == "/goal" or line.startswith("/goal "):
+            try:
+                sub = line[len("/goal"):].strip()
+                if sub in ("stop", "pause"):
+                    goal_mod.update(state.session.id, "pause")
+                    ok("目标已暂停（/goal resume 可恢复）")
+                elif sub == "resume":
+                    goal_mod.update(state.session.id, "resume")
+                    ok("目标已恢复（续跑预算已重置）")
+                else:
+                    info(goal_mod.format_one(goal_mod.get(state.session.id)))
+            except goal_mod.GoalError as e:
+                warn(f"[目标] {e}")
+            continue
+
         if line.startswith("/copy"):
             if line.strip() == "/copy all":
                 text = "\n\n".join(m["content"] for m in state.session.messages
@@ -265,6 +301,7 @@ def main(model: str | None = None) -> int:
         try:
             loop.run_turn(line, state.session, ctx, on_event=state.emit,
                           model=state.model, on_delta=state.printer.feed)
+            _continue_goal(state, ctx)
         except loop.llm.LLMError as e:
             error(f"[LLM 错误] {e}")
         except KeyboardInterrupt:
