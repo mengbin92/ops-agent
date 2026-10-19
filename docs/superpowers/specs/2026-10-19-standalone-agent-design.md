@@ -49,6 +49,14 @@
   `event` 通知（delta/tool/stream_end），结果不再重复 events。exec 超时与输出入审计
   已在安全债中提前清偿。70 项自测全绿。
 
+- **M3 ✅（2026-10-19）**：skills 目录（`agent/skills.py` + 仓库 `skills/*.md` +
+  `~/.ops-agent/skills/` 同名覆盖）：文件名即技能名（形状校验防路径穿越），frontmatter 只认
+  `description`；`skill` 工具不带 name 列目录、带 name 才载入正文（不常驻上下文），
+  单篇 2 万字符截断；自带 nginx-5xx / disk-full / safe-service-restart 三个 playbook。
+  子代理：`subagent` 工具并行跑 2–4 个只读排查任务（线程 + 独立会话），上下文工具白名单
+  仅 bash(R0)/read/skill/ops_list，不能写、不能嵌套派生，单任务 8 轮、沿用父代理模型；
+  结果汇总后回落主代理，变更建议仍走变更单流程。74 项自测全绿。
+
 ## 1. 背景与目标
 
 ops-agent 现状是一个**守门工具**（guard rail）：`core.py` 风险分级 + 审批戳 + 快照 + 审计，
@@ -141,7 +149,8 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 - **M2 ✅（2026-10-19）**：Anthropic provider；工具输出 spill 落盘（`~/.ops-agent/outputs/`，
   `read` offset/limit 分段）；审批戳 revoke（`core.revoke` / `opsx revoke` / `ops_revoke`）；
   exec 超时与输出入审计（P0 安全债，提前清偿）；RPC 流式事件推送（`stream=true`）。
-- **M3**：skills 目录（仿 dsh-skill-filesystem：按需加载的运维 playbook）；子代理（只读排查代理并行跑）。
+- **M3 ✅（2026-10-19）**：skills 目录（按需加载的运维 playbook，仓库 + 用户目录覆盖）；
+  子代理（只读排查代理并行跑，工具白名单 + 轮次上限）。
 - **M4 ✅（2026-10-19）**：远程执行通道——SSH 目标注册表（只认注册目标）、远程快照拉回本地存档、
   回滚推回目标机、审批戳按目标绑定；把守门能力延伸到 ops.md 声称的远程场景。
 - **M5**：goal/schedule（定时巡检）、workflow 编排；按 DSH 的 cordis 思路评估是否引入插件框架（届时再议，M0 不引入）。
@@ -152,10 +161,12 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 ops-agent/
   core.py / opsx / config.yaml / mcp_server.py   # 现状；opsx 增加 --target/targets 子命令
   remote.py     # SSH 目标注册表 + 远程快照/回滚（M4）
+  skills/       # 运维 playbook（*.md，文件名即 skill 名）
   agent/
     __init__.py
     llm.py        # provider 分发 + OpenAI 兼容 provider（urllib，可选 SSE）
     llm_anthropic.py  # Anthropic 原生 Messages provider（消息/工具双向转换）
+    skills.py     # skills 目录：catalog() / load()，仓库 + 用户目录覆盖
     tools.py      # 工具注册表 + 内建工具
     loop.py       # agent loop
     session.py    # 会话持久化（jsonl, format v1）
@@ -173,3 +184,7 @@ ops-agent/
 - **双守门并存期**：hook（Claude Code）与内核守门（独立形态）规则同源（core.py），不会分叉。
 - **Anthropic 转换边界**：只映射 text / tool_use / tool_result 三类内容块，
   图片、thinking 等块不在 agent 使用范围内，暂不转换。
+- **子代理并发**：一次最多 4 个子代理各跑 ≤8 轮，会同时占用端点的并发配额；
+  本地端点/限流严格时按需减少 tasks 数。
+- **skills 是本地受信内容**：用户目录里的 playbook 与 config.override 同级信任；
+  技能只给步骤，写操作仍受守门约束（bash 仅 R0、写操作必须审批戳）。

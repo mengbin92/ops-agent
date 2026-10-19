@@ -1343,6 +1343,102 @@ def test_rpc_stream_events():
     assert plain["events"][0]["payload"] == "巡检完成"
 
 
+
+
+def test_skill_catalog_and_load():
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext()
+    catalog = agent_tools.dispatch("skill", {}, ctx)
+    for name in ("nginx-5xx", "disk-full", "safe-service-restart"):
+        assert name in catalog, catalog
+    body = agent_tools.dispatch("skill", {"name": "nginx-5xx"}, ctx)
+    assert "systemctl status nginx" in body and "变更单" in body
+    # 用户目录同名覆盖仓库
+    user_dir = Path(core.STATE_DIR, "skills")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    override = user_dir / "nginx-5xx.md"
+    override.write_text("---\ndescription: 覆盖版\n---\n# 覆盖正文\n", encoding="utf-8")
+    try:
+        assert "覆盖正文" in agent_tools.dispatch("skill", {"name": "nginx-5xx"}, ctx)
+        assert "覆盖版" in agent_tools.dispatch("skill", {}, ctx)
+    finally:
+        override.unlink(missing_ok=True)
+    # 名字形状校验与不存在
+    assert "非法 skill 名" in agent_tools.dispatch("skill", {"name": "../etc/passwd"}, ctx)
+    assert "未找到 skill" in agent_tools.dispatch("skill", {"name": "no-such-skill"}, ctx)
+
+
+def test_skill_reads_are_bounded_and_names_valid():
+    from agent import skills
+    user_dir = Path(core.STATE_DIR, "skills")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    big = user_dir / "big-skill.md"
+    big.write_text("# 大文件\n" + "x" * (skills.SKILL_LIMIT + 100), encoding="utf-8")
+    bad = user_dir / "bad name.md"
+    bad.write_text("---\ndescription: 名字非法\n---\nbody\n", encoding="utf-8")
+    try:
+        body = skills.load("big-skill")
+        assert "已截断" in body and len(body) < skills.SKILL_LIMIT + 200
+        names = [m["name"] for m in skills.catalog()]
+        assert "big-skill" in names and "bad name" not in names
+    finally:
+        big.unlink(missing_ok=True)
+        bad.unlink(missing_ok=True)
+
+
+def test_subagent_parallel_and_readonly():
+    import time as _t
+    from agent import loop, tools as agent_tools
+    orig = loop.run_turn
+    seen = []
+
+    def fake(task, session, ctx, **kwargs):
+        seen.append((task, ctx.allowed, kwargs.get("system"), kwargs.get("max_turns"),
+                     kwargs.get("model")))
+        _t.sleep(0.3)
+        return f"结论:{task}"
+
+    loop.run_turn = fake
+    try:
+        started = _t.monotonic()
+        out = agent_tools.dispatch("subagent", {"tasks": ["检查 A", "检查 B"]},
+                                   agent_tools.ToolContext(model="m-test"))
+        elapsed = _t.monotonic() - started
+    finally:
+        loop.run_turn = orig
+    assert "结论:检查 A" in out and "结论:检查 B" in out
+    assert elapsed < 0.55, elapsed  # 并行：总耗时约等于单个任务
+    assert len(seen) == 2
+    assert all(ctx_allowed == agent_tools.SUBAGENT_TOOLS for _, ctx_allowed, _, _, _ in seen)
+    assert all(system == loop.SUBAGENT_PROMPT for _, _, system, _, _ in seen)
+    assert all(turns == agent_tools.SUBAGENT_MAX_TURNS for _, _, _, turns, _ in seen)
+    assert all(model == "m-test" for _, _, _, _, model in seen)
+    # 子代理上下文：写工具被拒、工具列表只剩只读
+    sub_ctx = agent_tools.ToolContext(allowed=agent_tools.SUBAGENT_TOOLS)
+    assert "只读子代理" in agent_tools.dispatch(
+        "ops_exec", {"command": "systemctl restart x"}, sub_ctx)
+    names = {s["function"]["name"] for s in agent_tools.tool_schemas(sub_ctx)}
+    assert names == {"bash", "read", "skill", "ops_list"}
+    assert "subagent" not in names  # 不能继续嵌套派生
+    # 空任务 / 超量
+    assert "[错误]" in agent_tools.dispatch("subagent", {"tasks": []}, agent_tools.ToolContext())
+    assert "最多" in agent_tools.dispatch(
+        "subagent", {"tasks": [f"t{i}" for i in range(5)]}, agent_tools.ToolContext())
+
+
+def test_run_turn_max_turns_bounded():
+    from agent import loop, session as agent_session, tools as agent_tools
+    restore = _stub_llm([{"role": "assistant", "content": "", "tool_calls": [
+        _tool_call("c1", "bash", {"command": "uname"})]}])
+    try:
+        s = agent_session.Session()
+        text = loop.run_turn("循环", s, agent_tools.ToolContext(), max_turns=2)
+        assert "最大轮次" in text
+        assert len([m for m in s.messages if m.get("role") == "tool"]) == 2
+    finally:
+        restore()
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

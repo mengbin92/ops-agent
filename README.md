@@ -108,6 +108,28 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 - 边界：`ssh` 只是传输通道，目标机上的命令不受目标机本地 opsx 约束；
   MCP 形态仍只支持本机执行（MCP 宿主可直接调 `opsx exec --target` 获得同样能力）。
 
+## 技能库与子代理（M3）
+
+**技能库（skills）**：把标准运维场景写成按需加载的 playbook，模型先查目录、用时才载入正文
+（不常驻上下文）。仓库 [skills/](skills/) 自带示例，`~/.ops-agent/skills/*.md` 同名覆盖
+（个人/团队自定义）。文件名即 skill 名，frontmatter 只认 `description`：
+
+```markdown
+---
+description: nginx 返回 5xx 时的只读排查顺序
+---
+# ...
+```
+
+agent 需要时先 `skill`（不带 name）列出目录，再 `skill {"name": "nginx-5xx"}` 载入；
+playbook 里的只读命令直接用，写操作仍走变更单流程——skills 只提供步骤，不绕过守门。
+
+**子代理（subagent）**：一次下发 2–4 个独立只读排查任务并行执行（多主机、多命名空间、
+日志+配置+资源等），各自返回结论与证据，主代理汇总。子代理只能用 `bash`（仅 R0）/
+`read` / `skill` / `ops_list`，不能写、也不能继续派生；每个任务最多 8 轮、沿用父代理的
+`--model`。子代理会话同样落在 `~/.ops-agent/sessions/`（计入 300 个会话保留上限），
+可在 `/resume` 里回看排查过程。
+
 ## 防线说明
 
 两层防线：① Agent 流程纪律（变更单 → AskUserQuestion → opsx exec）；

@@ -21,9 +21,10 @@ from agent import loop, repl, rpc, session as sess_mod, tools  # noqa: E402
 def _print_mode(prompt: str, model: str | None) -> int:
     """单发：无 TTY 时 ask_user 不可用，写操作安全方向降级为拒绝。"""
     if not sys.stdin.isatty():
-        ctx = tools.ToolContext(ask_user=None)
+        ctx = tools.ToolContext(ask_user=None, model=model)
     else:
-        ctx = tools.ToolContext(ask_user=lambda q: input(f"\n{q}\n你的回答> ").strip())
+        ctx = tools.ToolContext(
+            ask_user=lambda q: input(f"\n{q}\n你的回答> ").strip(), model=model)
     session = sess_mod.Session()
     try:
         text = loop.run_turn(prompt, session, ctx, model=model)

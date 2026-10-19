@@ -21,9 +21,15 @@ def _prune_sessions() -> None:
     d = core.STATE_DIR / "sessions"
     if not d.exists():
         return
-    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    try:
+        files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    except OSError:  # 并发子代理同时建会话/修剪时 stat 可能失败，跳过本次
+        return
     for p in files[:-SESSION_KEEP]:
-        p.unlink(missing_ok=True)
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 class Session:
@@ -73,6 +79,9 @@ def list_sessions() -> list[dict]:
                         preview = str(rec.get("content", ""))[:60]
         except (OSError, json.JSONDecodeError):
             continue
-        out.append({"id": p.stem, "mtime": p.stat().st_mtime,
-                    "turns": turns, "preview": preview})
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:  # 列目录与修剪并发：文件刚被删就跳过
+            continue
+        out.append({"id": p.stem, "mtime": mtime, "turns": turns, "preview": preview})
     return sorted(out, key=lambda s: s["mtime"], reverse=True)

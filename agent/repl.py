@@ -220,7 +220,7 @@ def _pick_session() -> sess_mod.Session | None:
 
 def main(model: str | None = None) -> int:
     state = ReplState(model)
-    ctx = tools.ToolContext(ask_user=_terminal_ask)
+    ctx = tools.ToolContext(ask_user=_terminal_ask, model=model)
     _load_history()
     info(f"ops-agent REPL（会话 {state.session.id}，模型 {model or '默认'}）。")
     info("/new 新会话 · /resume 恢复会话 · /copy [all] 复制回复 · /quit 退出 · ↑/↓ 翻历史")

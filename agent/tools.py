@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 import remote  # noqa: E402
+from . import session as session_mod  # noqa: E402
+from . import skills  # noqa: E402
 
 BASH_TIMEOUT = 120
 OUTPUT_LIMIT = 30_000   # 超限输出落盘，预览只留前 3 万字符
@@ -27,10 +30,17 @@ READ_LIMIT = 2000       # read 默认返回行数
 
 
 class ToolContext:
-    """前端注入的人机回路：ask_user(question) -> str；不可用返回 None。"""
+    """前端注入的人机回路与运行参数。
 
-    def __init__(self, ask_user=None):
+    ask_user(question) -> str；不可用返回 None。
+    allowed：工具白名单（子代理只读），None = 全部。
+    model：父代理使用的模型，子代理沿用（--model 覆盖时保持一致）。
+    """
+
+    def __init__(self, ask_user=None, allowed: set[str] | None = None, model: str | None = None):
         self.ask_user = ask_user
+        self.allowed = allowed
+        self.model = model
 
 
 def _schema(name, description, properties, required):
@@ -101,6 +111,19 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         return f"[超时] 命令超过 {BASH_TIMEOUT}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
     return f"[exit={r.returncode}]\n" + _cap(out, "bash")
+
+
+def _skill(args: dict, ctx: ToolContext) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        entries = skills.catalog()
+        if not entries:
+            return (f"(无可用 skill：在 {skills.SEARCH_DIRS[0]} 或 "
+                    f"{skills.SEARCH_DIRS[1]} 放 *.md)")
+        return "可用 skill：\n" + "\n".join(
+            f"{e['name']} — {e['description']}" if e["description"] else e["name"]
+            for e in entries)
+    return skills.load(name)
 
 
 def _read(args: dict, ctx: ToolContext) -> str:
@@ -199,6 +222,42 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
         return f"[opsx 错误] {e}"
 
 
+SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list"})
+SUBAGENT_MAX_TASKS = 4
+SUBAGENT_MAX_TURNS = 8
+
+
+def _subagent(args: dict, ctx: ToolContext) -> str:
+    """并行只读排查：每个任务一个受限子代理，返回各自的结论与证据。"""
+    tasks = [str(t).strip() for t in args.get("tasks") or [] if str(t).strip()]
+    if not tasks:
+        return "[错误] tasks 不能为空：每个子任务写清目标与要回答的问题"
+    if len(tasks) > SUBAGENT_MAX_TASKS:
+        return f"[错误] 最多 {SUBAGENT_MAX_TASKS} 个并行子任务（收到 {len(tasks)} 个）"
+    from . import loop  # 延迟导入：loop 依赖本模块
+
+    results: list[str] = [""] * len(tasks)
+
+    def run(i: int, task: str) -> None:
+        try:
+            sub_ctx = ToolContext(ask_user=None, allowed=SUBAGENT_TOOLS, model=ctx.model)
+            results[i] = loop.run_turn(task, session_mod.Session(), sub_ctx,
+                                       system=loop.SUBAGENT_PROMPT, model=ctx.model,
+                                       max_turns=SUBAGENT_MAX_TURNS)
+        except Exception as e:  # noqa: BLE001 —— 单个子任务失败不拖垮其余
+            results[i] = f"[失败] {e}"
+
+    threads = [threading.Thread(target=run, args=(i, task), daemon=True)
+               for i, task in enumerate(tasks)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    report = "\n\n".join(f"## 子任务 {i}: {task}\n{results[i - 1] or '(无输出)'}"
+                          for i, task in enumerate(tasks, 1))
+    return _cap(report, "subagent")
+
+
 def _ops_list(args: dict, ctx: ToolContext) -> str:
     targets = remote.describe() or ["(未注册，配置 ~/.ops-agent/targets.json)"]
     return "\n".join(core.format_state(core.collect_state()) + ["== targets =="] + targets)
@@ -224,11 +283,31 @@ REGISTRY: dict[str, dict] = {
                           ["path"]),
         "handler": _read, "read_only": True,
     },
+    "skill": {
+        "schema": _schema("skill",
+                          "运维 playbook：不带 name 列出可用 skill，带 name 载入正文。"
+                          "标准场景（如 nginx 5xx、磁盘满、服务重启）先查 playbook 再动手；"
+                          "playbook 里的写操作仍须走变更单流程。",
+                          {"name": {"type": "string",
+                                    "description": "skill 名（文件名，可不带 .md）；省略=列目录"}},
+                          []),
+        "handler": _skill, "read_only": True,
+    },
     "ask_user": {
         "schema": _schema("ask_user", "向用户提问并等待回答。写操作审批、歧义澄清时使用。",
                           {"question": {"type": "string", "description": "向用户展示的问题（含变更单）"}},
                           ["question"]),
         "handler": _ask_user, "read_only": True,
+    },
+    "subagent": {
+        "schema": _schema("subagent",
+                          f"只读排查子代理：并行执行多个独立检查任务（最多 {SUBAGENT_MAX_TASKS} 个），"
+                          "各自返回结论与证据。子代理只能用 bash(R0)/read/skill/ops_list，不能写；"
+                          "需要变更时把建议写进结论，由主代理走变更单流程。",
+                          {"tasks": {"type": "array", "items": {"type": "string"},
+                                     "description": "子任务描述（写清目标主机、命名空间、日志路径与要回答的问题）"}},
+                          ["tasks"]),
+        "handler": _subagent, "read_only": True,
     },
     "ops_approve": {
         "schema": _schema("ops_approve",
@@ -273,11 +352,17 @@ REGISTRY: dict[str, dict] = {
 }
 
 
-def tool_schemas() -> list[dict]:
-    return [t["schema"] for t in REGISTRY.values()]
+def tool_schemas(ctx: ToolContext | None = None) -> list[dict]:
+    """按上下文白名单过滤：子代理只看到只读工具。"""
+    allowed = ctx.allowed if ctx else None
+    return [t["schema"] for name, t in REGISTRY.items()
+            if allowed is None or name in allowed]
 
 
 def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
+    if ctx.allowed is not None and name not in ctx.allowed:
+        return (f"[opsx 拒绝] 只读子代理不能使用 {name}；需要变更请把建议写进结论，"
+                "由主代理走变更单流程。")
     tool = REGISTRY.get(name)
     if tool is None:
         return f"[错误] 未知工具: {name}"
