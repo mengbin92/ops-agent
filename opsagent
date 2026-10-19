@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""opsagent —— ops-agent 独立智能体入口。
+
+形态：
+  opsagent                      交互式 REPL（默认）
+  opsagent chat                 同上
+  opsagent -p "查看 nginx 状态"  单发非交互（可进脚本/CI）
+  opsagent rpc                  stdio JSON-RPC 长驻进程
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from agent import loop, repl, rpc, session as sess_mod, tools  # noqa: E402
+
+
+def _print_mode(prompt: str, model: str | None) -> int:
+    """单发：无 TTY 时 ask_user 不可用，写操作安全方向降级为拒绝。"""
+    if not sys.stdin.isatty():
+        ctx = tools.ToolContext(ask_user=None)
+    else:
+        ctx = tools.ToolContext(ask_user=lambda q: input(f"\n{q}\n你的回答> ").strip())
+    session = sess_mod.Session()
+    try:
+        text = loop.run_turn(prompt, session, ctx, model=model)
+    except loop.llm.LLMError as e:
+        print(f"[LLM 错误] {e}", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="opsagent", description="ops-agent 独立运维智能体")
+    p.add_argument("--model", help="覆盖默认模型（或设 OPSAGENT_MODEL）")
+    p.add_argument("-p", "--print", dest="oneshot", metavar="PROMPT", help="单发非交互模式")
+    p.add_argument("mode", nargs="?", default="chat", choices=["chat", "rpc"], help="运行形态")
+    args = p.parse_args(argv)
+
+    if args.oneshot is not None:
+        return _print_mode(args.oneshot, args.model)
+    if args.mode == "rpc":
+        rpc.serve(model=args.model)
+        return 0
+    return repl.main(model=args.model)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -300,6 +300,106 @@ def test_mcp_write_cycle():
         c.close()
 
 
+def _stub_llm(script):
+    """按脚本返回 message：list[dict]，每次 chat 调用弹出一条。"""
+    from agent import llm
+    calls = {"n": 0}
+    orig = llm.chat
+
+    def fake(messages, tools=None, model=None, timeout=300):
+        m = dict(script[min(calls["n"], len(script) - 1)])
+        calls["n"] += 1
+        return m
+
+    llm.chat = fake
+    return lambda: setattr(llm, "chat", orig)
+
+
+def _tool_call(cid, name, arguments):
+    return {"id": cid, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+def test_agent_loop_readonly():
+    from agent import loop, session as agent_session, tools as agent_tools
+    restore = _stub_llm([
+        {"role": "assistant", "content": "", "tool_calls": [
+            _tool_call("c1", "bash", {"command": "uname"})]},
+        {"role": "assistant", "content": "结论是：只读命令可用。"},
+    ])
+    try:
+        s = agent_session.Session()
+        text = loop.run_turn("测试一下", s, agent_tools.ToolContext())
+        assert "只读命令可用" in text
+        tool_msgs = [m for m in s.messages if m.get("role") == "tool"]
+        assert tool_msgs and "[exit=0]" in tool_msgs[0]["content"]
+    finally:
+        restore()
+
+
+def test_agent_loop_guard_denies_write():
+    from agent import loop, session as agent_session, tools as agent_tools
+    restore = _stub_llm([
+        {"role": "assistant", "content": "", "tool_calls": [
+            _tool_call("c1", "bash", {"command": "systemctl restart nginx"})]},
+        {"role": "assistant", "content": "已按流程要求先提交变更单。"},
+    ])
+    try:
+        s = agent_session.Session()
+        loop.run_turn("重启 nginx", s, agent_tools.ToolContext(ask_user=None))
+        tool_msgs = [m for m in s.messages if m.get("role") == "tool"]
+        assert "opsx 拒绝" in tool_msgs[0]["content"]
+        assert "变更单" in tool_msgs[0]["content"]
+    finally:
+        restore()
+
+
+def test_agent_loop_approval_flow():
+    import tempfile as tf
+    from agent import loop, session as agent_session, tools as agent_tools
+    with tf.TemporaryDirectory() as td:
+        f = Path(td) / "svc.conf"
+        f.write_text("v1")
+        cmd = f"echo v2 > {f}"
+        restore = _stub_llm([
+            {"role": "assistant", "content": "", "tool_calls": [
+                _tool_call("c1", "ask_user", {"question": f"变更单：执行 {cmd}，确认？"})]},
+            {"role": "assistant", "content": "", "tool_calls": [
+                _tool_call("c2", "ops_approve", {"command": cmd, "ttl_seconds": 60})]},
+            {"role": "assistant", "content": "", "tool_calls": [
+                _tool_call("c3", "ops_exec", {"command": cmd, "snapshot_file": str(f)})]},
+            {"role": "assistant", "content": "变更完成。"},
+        ])
+        try:
+            s = agent_session.Session()
+            answers = iter(["确认执行"])
+            ctx = agent_tools.ToolContext(ask_user=lambda q: next(answers))
+            text = loop.run_turn("改配置", s, ctx)
+            assert "变更完成" in text
+            assert f.read_text() == "v2\n"
+            tool_msgs = [m for m in s.messages if m.get("role") == "tool"]
+            assert any("审批戳已创建" in m["content"] for m in tool_msgs)
+            assert any("执行成功" in m["content"] for m in tool_msgs)
+        finally:
+            restore()
+
+
+def test_agent_session_persistence():
+    from agent import session as agent_session
+    s = agent_session.Session("test-persist-0001")
+    s.append({"role": "user", "content": "hi"})
+    s2 = agent_session.Session("test-persist-0001")
+    assert s2.messages == [{"role": "user", "content": "hi"}]
+    first = s2.path.read_text(encoding="utf-8").splitlines()[0]
+    assert json.loads(first)["format"] == 1
+
+
+def test_agent_ask_user_degrades_without_tty():
+    from agent import tools as agent_tools
+    out = agent_tools.dispatch("ask_user", {"question": "确认？"}, agent_tools.ToolContext())
+    assert "视为用户拒绝" in out
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

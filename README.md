@@ -1,8 +1,31 @@
 # ops-agent
 
-默认只读、高风险操作需会话内授权并附风险说明与快照回滚的 Claude Code 运维子代理。
+默认只读、高风险操作需会话内授权并附风险说明与快照回滚的运维智能体。
+既可**独立运行**（自带 agent loop 与 LLM 接入），也可作为 Claude Code 子代理/MCP server 嵌入。
 
-## 组成
+## 独立 agent 形态（opsagent）
+
+自带 agent 内核（`agent/`：loop + OpenAI 兼容 provider + 工具注册表 + 会话持久化），
+守门核心 core.py 一行不改地成为其内置安全层。架构见
+`docs/superpowers/specs/2026-10-19-standalone-agent-design.md`。
+
+```bash
+# 配置（OpenAI 兼容协议，不绑定厂商：BASE_URL 指哪家用哪家）
+export OPSAGENT_API_KEY=sk-...
+# export OPSAGENT_BASE_URL=https://api.deepseek.com   # 默认 DeepSeek，可换任意兼容端点
+# export OPSAGENT_MODEL=deepseek-chat                 # 模型名随端点服务而定
+
+./opsagent                                # 交互式 REPL（/new 新会话，/quit 退出）
+./opsagent -p "看一下本机磁盘和内存"        # 单发非交互，可进脚本/CI
+./opsagent rpc                            # stdio JSON-RPC 长驻进程（供 Web UI/IM 嵌入）
+```
+
+四种形态共享同一内核与状态目录：REPL、单发、RPC、MCP（见下）。
+独立形态下守门在内核之内：bash 工具直接调 `core.check()`，写命令须
+变更单 → ask_user 确认 → ops_approve 建戳 → ops_exec 快照执行。
+非 TTY 环境 ask_user 不可用，写操作安全方向降级为拒绝。
+
+## 组成（Claude Code 插件形态）
 
 - `.claude/agents/ops.md` — Agent 定义（R0-R3 风险分级与流程纪律）
 - `.claude/settings.json` — PreToolUse hook，对所有 Bash 命令执行 `opsx hook`
@@ -67,4 +90,5 @@
 
 ## 演进
 
-core.py 为纯函数库；演进 MCP server 时直接包装同一组函数，状态目录布局即对外契约。
+core.py 为纯函数库；演进 MCP server / agent 内核时直接包装同一组函数，状态目录布局即对外契约。
+独立化演进路线（流式输出、compaction、skills、子代理、远程通道）见设计文档第 5 节。
