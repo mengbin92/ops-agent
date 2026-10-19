@@ -20,6 +20,18 @@ export OPSAGENT_API_KEY=sk-...
 ./opsagent rpc                            # stdio JSON-RPC 长驻进程（供 Web UI/IM 嵌入）
 ```
 
+REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown 终端渲染**
+（标题/表格/代码块/列表上色对齐，纯 stdlib ANSI）；**语义配色**——确认框
+黄色醒目（R3/不可逆升级红色警示）、工具结果按内容定色（拒绝/错误红、
+成功绿、降级黄、常规暗），非 TTY 或设 `NO_COLOR` 自动禁色（macOS libedit
+下 `input()` 提示符自动无色，避免历史重绘残影；GNU readline 保留彩色）；
+`/resume` 恢复历史会话；
+`/copy` 复制上条回复、`/copy all` 复制全部回复到剪贴板
+（pbcopy/wl-copy/xclip 自动探测）；`↑`/`↓` 翻历史输入（readline，
+历史持久化于 `~/.ops-agent/repl_history`）。
+上下文超长时自动 basic compaction：裁剪早期工具输出（仅裁剪发送内容，
+会话文件保留完整记录）。
+
 四种形态共享同一内核与状态目录：REPL、单发、RPC、MCP（见下）。
 独立形态下守门在内核之内：bash 工具直接调 `core.check()`，写命令须
 变更单 → ask_user 确认 → ops_approve 建戳 → ops_exec 快照执行。

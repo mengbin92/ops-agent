@@ -2,36 +2,47 @@
 
 方法：
   prompt  {text}        -> {"text": 最终回复, "events": [...]}；ask_user 经
-                           {"method":"ask_user","id":...} 反向请求客户端回答
+                           {"method":"ask_user","id":"srv-..."} 反向请求客户端回答
   reset   {}            -> 开新会话
   ping    {}            -> {}
+
+线程模型：stdin 由独立读线程消费（客户端响应经 resolve() 回填），主线程处理
+业务——否则 ask_user 反向请求会死锁（读循环阻塞在等待回答上，无法读取回答）。
 """
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import uuid
 
 from . import loop, session as sess_mod, tools
 
+ASK_USER_TIMEOUT = 600
+
 
 class RpcPeer:
     def __init__(self):
-        self._pending: dict[str, str] = {}
+        self._pending: dict[str, str | None] = {}
         self._cond = threading.Condition()
+        self._send_lock = threading.Lock()
 
     def send(self, obj: dict) -> None:
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        with self._send_lock:  # 读线程（错误响应）与主线程（正常响应）都会写 stdout
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
 
     def request(self, method: str, params: dict) -> str | None:
-        """反向请求客户端并阻塞等回答（通知/响应由 read 循环回填）。"""
+        """反向请求客户端并阻塞等回答（响应由读线程 resolve() 回填）。"""
         rid = "srv-" + uuid.uuid4().hex[:8]
         with self._cond:
             self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-            self._cond.wait_for(lambda: rid in self._pending, timeout=600)
-            return self._pending.pop(rid, None)
+            answered = self._cond.wait_for(lambda: rid in self._pending,
+                                           timeout=ASK_USER_TIMEOUT)
+            if answered:
+                return self._pending.pop(rid)
+            return None  # 超时：视为客户端未回答
 
     def resolve(self, msg: dict) -> bool:
         """若 msg 是对反向请求的响应则回填并返回 True。"""
@@ -49,23 +60,33 @@ class RpcPeer:
 def serve(model: str | None = None) -> None:
     peer = RpcPeer()
     session = sess_mod.Session()
+    inbox: queue.Queue = queue.Queue()
+
+    def reader() -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                peer.send({"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32700, "message": "Parse error"}})
+                continue
+            if not peer.resolve(msg):  # 反向请求的响应不入业务队列
+                inbox.put(msg)
+        inbox.put(None)  # EOF
+
+    threading.Thread(target=reader, daemon=True).start()
 
     def ask_user(question: str) -> str:
         answer = peer.request("ask_user", {"question": question})
         return answer if answer is not None else "（客户端未回答，视为拒绝）"
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            peer.send({"jsonrpc": "2.0", "id": None,
-                       "error": {"code": -32700, "message": "Parse error"}})
-            continue
-        if peer.resolve(msg):
-            continue
+    while True:
+        msg = inbox.get()
+        if msg is None:
+            return
         msg_id = msg.get("id")
         method = msg.get("method")
         if "id" not in msg:

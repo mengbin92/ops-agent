@@ -1,7 +1,32 @@
 # ops-agent 独立化重设计：从 Claude Code 插件到独立运维 Agent
 
 日期：2026-10-19
-状态：已评审（骨架 M0 随本文档落地）
+状态：M0 已落地并经真实端点验证（2026-10-19）
+
+## 0. 当前进度
+
+- **M0 骨架**：loop / provider / 工具注册表 / 会话 v1 / REPL / -p / RPC —— ✅ 完成（2026-10-19），
+  经 `https://api.mengbin.top/v1`（OpenAI 兼容）+ `deepseek-v4-pro-0813`
+  实测：只读链路、守门拒绝、审计落盘均正常。
+- **REPL 体验（M0.5，已提前落地）**：Markdown 终端渲染（`agent/markdown.py`，stdlib ANSI）、
+  `/copy` `/copy all` 剪贴板复制、readline 方向键历史（持久化 `~/.ops-agent/repl_history`）。
+- **M1 ✅（2026-10-19）**：SSE 流式（`llm.chat(on_delta=)`，tool_calls 增量按 index 组装；
+  真实端点实测增量拼接与最终消息一致）；REPL 增量渲染（StreamPrinter 整段重绘，
+  行数按终端宽度含换行估算）；basic compaction（>60k 字符裁剪 8 条之前的 tool 输出，
+  只裁剪发送内容，session 文件完整保留）；`/resume`（按 mtime 倒序编号选择）。
+- **REPL 语义配色 ✅（2026-10-19）**：确认框黄色醒目（R3/不可逆升级红粗警示）、
+  工具结果按内容定色（拒绝/错误红、成功绿、降级黄、常规暗）、`NO_COLOR`/非 TTY 禁色；
+  `make_prompt()` 修复 libedit 下彩色提示符导致的 ↑/↓ 历史重绘残影
+  （GNU readline 用 `\001\002` 保留彩色，libedit 退化无色）。
+  41 项自测全绿。
+- **环境变量**：`OPSAGENT_API_KEY` / `OPSAGENT_BASE_URL` / `OPSAGENT_MODEL`，
+  不带厂商暗示（2026-10-19 由 OPENAI/DEEPSEEK_* 改名）。
+- **安全债清偿 ✅（2026-10-19 全库 code review）**：`1>`/`&>`/`$()`/反引号绕过只读白名单已修；
+  `exec_change` 有超时（默认 3600s，exit=4）且输出入审计；`exec` 输出改为 capture，
+  修复 MCP stdio 协议被子进程输出污染；`bash` 工具收紧为仅 R0（写命令带戳也必须走
+  `ops_exec`，杜绝绕过快照）；RPC ask_user 同线程死锁已修（stdin 独立读线程）；
+  审批戳过期清理 + 坏戳容错；list 三处重复收敛为 `core.collect_state()`；
+  sessions 目录封顶 300。50 项自测全绿。
 
 ## 1. 背景与目标
 
@@ -87,9 +112,10 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 
 ## 5. 演进路线（对照 DSH 子系统）
 
-- **M0（本次落地）**：loop + OpenAI provider + bash/read/ask_user 工具 + REPL/-p/RPC + 会话 v1 持久化。
-- **M1**：SSE 流式输出；compaction（先 basic：超阈值裁剪早期 tool result）；`/resume`。
-- **M2**：Anthropic provider；工具输出截断与 spill（仿 dsh-output-retention）；审批戳 revoke/过期清理；exec 超时与输出入审计（P0 安全债）。
+- **M0 ✅（2026-10-19）**：loop + OpenAI provider + bash/read/ask_user 工具 + REPL/-p/RPC + 会话 v1 持久化。
+  追加落地：Markdown 终端渲染、`/copy` 剪贴板、readline 历史。
+- **M1 ✅（2026-10-19）**：SSE 流式输出（渲染器整段重绘支持增量）；compaction（basic：超阈值裁剪早期 tool result）；`/resume`。
+- **M2**：Anthropic provider；工具输出 spill 落盘（仿 dsh-output-retention，当前仅截断）；审批戳 revoke/过期清理；exec 超时与输出入审计（P0 安全债）；RPC 形态支持流式事件推送。
 - **M3**：skills 目录（仿 dsh-skill-filesystem：按需加载的运维 playbook）；子代理（只读排查代理并行跑）。
 - **M4**：远程执行通道（SSH 目标注册表，远程快照），把守门能力延伸到 ops.md 声称的远程场景。
 - **M5**：goal/schedule（定时巡检）、workflow 编排；按 DSH 的 cordis 思路评估是否引入插件框架（届时再议，M0 不引入）。

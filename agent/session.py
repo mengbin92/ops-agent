@@ -14,6 +14,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 
 FORMAT_VERSION = 1
+SESSION_KEEP = 300  # 会话文件保留上限，超出按修改时间删最旧
+
+
+def _prune_sessions() -> None:
+    d = core.STATE_DIR / "sessions"
+    if not d.exists():
+        return
+    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    for p in files[:-SESSION_KEEP]:
+        p.unlink(missing_ok=True)
 
 
 class Session:
@@ -23,6 +33,8 @@ class Session:
         self.messages: list[dict] = []
         if self.path.exists():
             self._load()
+        elif session_id is None:
+            _prune_sessions()  # 新会话时顺带修剪
 
     def _load(self) -> None:
         for line in self.path.read_text(encoding="utf-8").splitlines():
@@ -42,9 +54,25 @@ class Session:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
 
-def latest_session_id() -> str | None:
+def list_sessions() -> list[dict]:
+    """按修改时间倒序列出会话：{id, mtime, turns, preview}。preview 取首条用户消息。"""
     d = core.STATE_DIR / "sessions"
     if not d.exists():
-        return None
-    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-    return files[-1].stem if files else None
+        return []
+    out = []
+    for p in d.glob("*.jsonl"):
+        preview, turns = "", 0
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                rec = json.loads(line)
+                if rec.get("format"):
+                    continue
+                if rec.get("role") == "user":
+                    turns += 1
+                    if not preview:
+                        preview = str(rec.get("content", ""))[:60]
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append({"id": p.stem, "mtime": p.stat().st_mtime,
+                    "turns": turns, "preview": preview})
+    return sorted(out, key=lambda s: s["mtime"], reverse=True)

@@ -66,12 +66,28 @@ def classify(cmd: str) -> tuple[str, str | None]:
     return level, matched
 
 
+def _has_write_marker(seg: str) -> bool:
+    """白名单形状但藏写行为时不按只读放行。
+
+    覆盖：重定向（仅 `2>`/`2>>` 豁免，fd1 显式重定向 `1>` 算写）、`&>`全量重定向、
+    tee、find -exec/-delete、命令替换（`$(...)`/反引号，可在只读命令里藏任意写操作）。
+    """
+    if re.search(r"\btee\b|-exec\b|-delete\b", seg):
+        return True
+    if "$(" in seg or "`" in seg:
+        return True
+    if re.search(r"&>{1,2}", seg):
+        return True
+    for m in re.finditer(r"(\d*)>{1,2}", seg):
+        if m.group(1) != "2":  # 空（裸 >）、1>、3> 等都是写
+            return True
+    return False
+
+
 def _classify_single(seg: str, config: dict) -> str:
-    # 白名单形状但带写标记（重定向/tee/-exec/-delete）不按只读放行；fd 重定向（2>/dev/null）豁免。
-    write_marker = re.search(r"(?:^|[^0-9])>{1,2}|\btee\b|-exec\b|-delete\b", seg)
     for pat in config["readonly_patterns"]:
         if re.search(pat, seg):
-            if write_marker:
+            if _has_write_marker(seg):
                 break  # 带写标记：跳过只读放行，落入风险规则
             return "R0"
     for pat in config["risk_rules"]["R3"]:
@@ -125,6 +141,7 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False) -> Path:
     p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
+    prune_approvals()  # 顺带清理过期戳
     audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force)
     return p
 
@@ -133,8 +150,42 @@ def check_stamp(cmd: str) -> bool:
     p = STATE_DIR / "approvals" / (cmd_hash(cmd) + ".json")
     if not p.exists():
         return False
-    s = json.loads(p.read_text(encoding="utf-8"))
-    return time.time() < s["created"] + s["ttl"]
+    try:
+        s = json.loads(p.read_text(encoding="utf-8"))
+        return time.time() < s["created"] + s["ttl"]
+    except (json.JSONDecodeError, KeyError, TypeError, OSError):
+        return False  # 损坏的戳按无效处理（安全方向）
+
+
+def prune_approvals() -> None:
+    """清理已过期的审批戳。"""
+    adir = STATE_DIR / "approvals"
+    if not adir.exists():
+        return
+    now = time.time()
+    for p in adir.glob("*.json"):
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+            if now >= s["created"] + s["ttl"]:
+                p.unlink()
+        except (json.JSONDecodeError, KeyError, TypeError, OSError):
+            p.unlink(missing_ok=True)  # 损坏文件一并清掉
+
+
+def collect_state() -> dict:
+    """快照与审批戳的统一读取，opsx list / MCP / agent 工具共用。"""
+    sdir = STATE_DIR / "snapshots"
+    snapshots = sorted(p.name for p in sdir.iterdir() if p.is_dir()) if sdir.exists() else []
+    approvals = []
+    adir = STATE_DIR / "approvals"
+    if adir.exists():
+        for p in sorted(adir.glob("*.json")):
+            try:
+                st = json.loads(p.read_text(encoding="utf-8"))
+                approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"]})
+            except (json.JSONDecodeError, KeyError, OSError):
+                continue
+    return {"snapshots": snapshots, "approvals": approvals}
 
 
 def check(cmd: str) -> tuple[int, str]:
@@ -239,17 +290,27 @@ def prune_snapshots(keep: int = 200) -> None:
         audit("prune", snapshot_id=p.name)
 
 
+EXEC_TIMEOUT = 3600          # 变更命令默认最长 1 小时
+EXEC_AUDIT_OUTPUT = 2000     # 审计里保留的输出字符数
+
+
 def exec_change(
     cmd: str,
     snapshot_files: list[str] | None = None,
     snapshot_cmds: list[tuple[str, str]] | None = None,
-) -> int:
+    timeout: int = EXEC_TIMEOUT,
+) -> tuple[int, str | None, str]:
+    """原子执行：校验→快照→执行→审计。返回 (exit_code, snapshot_id, output)。
+
+    输出一律 capture（调用方自行展示）：避免经 MCP 嵌入时子进程输出污染
+    stdio 协议帧；同时写入审计（截断）。exit=4 表示超时终止。
+    """
     snapshot_files = snapshot_files or []
     snapshot_cmds = snapshot_cmds or []
     code, msg = check(cmd)
     if code != 0:
         print(msg, file=sys.stderr)
-        return code
+        return code, None, ""
     sid = None
     if snapshot_files or snapshot_cmds:
         sid, d = _begin_snapshot()
@@ -263,9 +324,16 @@ def exec_change(
             shutil.rmtree(d, ignore_errors=True)
             print(f"[opsx] 快照失败，已中止执行: {e}", file=sys.stderr)
             audit("exec-abort", cmd=cmd, reason=str(e))
-            return 3
+            return 3, None, ""
         _write_meta(d, sid, items)
-    r = subprocess.run(cmd, shell=True)
-    audit("exec", cmd=cmd, snapshot_id=sid, exit_code=r.returncode)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        output = r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
+        exit_code = r.returncode
+    except subprocess.TimeoutExpired:
+        output = f"[opsx] 超时：命令超过 {timeout}s 未结束，已终止"
+        exit_code = 4
+    audit("exec", cmd=cmd, snapshot_id=sid, exit_code=exit_code,
+          output=output[:EXEC_AUDIT_OUTPUT])
     prune_snapshots()
-    return r.returncode
+    return exit_code, sid, output

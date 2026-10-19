@@ -110,17 +110,6 @@ def _require(args, key):
     return args[key]
 
 
-def _last_exec_snapshot_id():
-    path = core.STATE_DIR / "audit.jsonl"
-    if not path.exists():
-        return None
-    for line in reversed(path.read_text(encoding="utf-8").strip().splitlines()):
-        rec = json.loads(line)
-        if rec.get("event") == "exec":
-            return rec.get("snapshot_id")
-    return None
-
-
 def call_tool(name, args):
     if name == "ops_check":
         cmd = _require(args, "command")
@@ -143,28 +132,18 @@ def call_tool(name, args):
         return _result({"stamp_file": path.name, "level": stamp["level"], "ttl_seconds": stamp["ttl"]})
     if name == "ops_exec":
         snap_cmds = [(c["command"], c.get("name", "")) for c in args.get("snapshot_cmds", [])]
-        code = core.exec_change(
+        code, sid, output = core.exec_change(
             _require(args, "command"),
             args.get("snapshot_files", []),
             snap_cmds,
         )
-        payload = {"exit_code": code}
-        if code == 0:
-            payload["snapshot_id"] = _last_exec_snapshot_id()
+        payload = {"exit_code": code, "snapshot_id": sid, "output": output[:4000]}
         return _result(payload)
     if name == "ops_rollback":
         report = core.rollback(_require(args, "snapshot_id"))
         return _result({"report": report})
     if name == "ops_list":
-        sdir = core.STATE_DIR / "snapshots"
-        snapshots = sorted(p.name for p in sdir.iterdir()) if sdir.exists() else []
-        approvals = []
-        adir = core.STATE_DIR / "approvals"
-        if adir.exists():
-            for p in sorted(adir.glob("*.json")):
-                st = json.loads(p.read_text(encoding="utf-8"))
-                approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"]})
-        return _result({"snapshots": snapshots, "approvals": approvals})
+        return _result(core.collect_state())
     if name == "ops_audit":
         tail = int(args.get("tail", 20))
         path = core.STATE_DIR / "audit.jsonl"

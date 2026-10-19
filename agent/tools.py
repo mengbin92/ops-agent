@@ -43,11 +43,18 @@ def _truncate(text: str) -> str:
 
 def _bash(args: dict, ctx: ToolContext) -> str:
     cmd = args["command"]
-    code, msg = core.check(cmd)
+    level, matched = core.classify(cmd)
+    if level != "R0":
+        # bash 只执行只读命令：写操作必须走 ops_exec（快照+审批戳+审计一体化），
+        # 防止带戳写命令绕过快照直接执行。
+        core.audit("bash-deny", cmd=cmd, level=level)
+        hit = f"（命中分段：{matched}）" if matched else ""
+        return (f"[opsx 拒绝] 该命令判定为 {level}{hit}，bash 仅执行只读命令。\n"
+                "写操作流程：向用户提交变更单（风险说明+回滚计划）→ ask_user 确认 → "
+                "ops_approve 建审批戳 → ops_exec（可带快照参数）执行。")
+    code, msg = core.check(cmd)  # R0 直接放行（check 内会写审计）
     if code != 0:
-        return (f"[opsx 拒绝] {msg}\n"
-                "流程：向用户提交变更单（风险说明+回滚计划）→ 用 ask_user 请用户确认 → "
-                "调 ops_approve 建审批戳 → 重新执行本命令。")
+        return f"[opsx 拒绝] {msg}"
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -92,13 +99,16 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     snap_cmds = []
     for spec in args.get("snapshot_cmds", []):
         snap_cmds.append((spec["command"], spec.get("name", "")))
-    code = core.exec_change(cmd, _snapshot_filespec(args), snap_cmds)
+    code, sid, output = core.exec_change(cmd, _snapshot_filespec(args), snap_cmds)
+    out_text = _truncate(output) if output else "(无输出)"
+    sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     if code == 0:
-        return "[完成] 执行成功（exit=0）。快照与审计已记录，可用 opsx list 查看 snapshot_id。"
+        return f"[完成] 执行成功（exit=0），{sid_text}。\n{out_text}"
     if code == 2:
         return ("[opsx 拒绝] 无有效审批戳。流程：变更单 → ask_user 确认 → "
                 "ops_approve 建戳 → 重新 ops_exec。")
-    return f"[失败] exit={code}（3 表示快照失败已中止；其余为命令自身退出码，详见 stderr/审计）"
+    reason = {3: "快照失败，已中止", 4: "超时终止"}.get(code, "命令非零退出")
+    return f"[失败] {reason}（exit={code}），{sid_text}。\n{out_text}"
 
 
 def _ops_rollback(args: dict, ctx: ToolContext) -> str:
@@ -109,17 +119,12 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
 
 
 def _ops_list(args: dict, ctx: ToolContext) -> str:
-    lines = []
-    sdir = core.STATE_DIR / "snapshots"
-    if sdir.exists():
-        lines.append("== snapshots ==")
-        lines += [x.name for x in sorted(sdir.iterdir()) if x.is_dir()]
-    adir = core.STATE_DIR / "approvals"
-    if adir.exists():
+    state = core.collect_state()
+    lines = ["== snapshots =="] + state["snapshots"] if state["snapshots"] else []
+    if state["approvals"]:
         lines.append("== approvals ==")
-        for x in sorted(adir.glob("*.json")):
-            st = json.loads(x.read_text(encoding="utf-8"))
-            lines.append(f"{st['cmd'][:80]}  (level={st['level']}, ttl={st['ttl']}s)")
+        lines += [f"{a['cmd'][:80]}  (level={a['level']}, ttl={a['ttl']}s)"
+                  for a in state["approvals"]]
     return "\n".join(lines) or "(空)"
 
 

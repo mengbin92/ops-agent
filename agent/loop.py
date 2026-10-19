@@ -10,6 +10,30 @@ from . import llm, session as sess_mod, tools
 
 MAX_TURNS = 40
 
+# basic compaction：发送给 LLM 的消息总字符数超阈值时，把早期 tool result 裁剪为占位符。
+# 只裁剪"发送内容"，session 文件保留完整记录（审计与追溯不受影响）。
+COMPACT_THRESHOLD = 60_000
+COMPACT_KEEP_RECENT = 8       # 最近 N 条消息不裁剪
+COMPACT_MIN_CONTENT = 200     # 短输出不值得裁剪
+COMPACT_PLACEHOLDER = "[历史工具输出已裁剪，如需细节请重新执行命令]"
+
+
+def _message_size(m: dict) -> int:
+    return len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or ""))
+
+
+def compact(messages: list[dict]) -> list[dict]:
+    if sum(_message_size(m) for m in messages) <= COMPACT_THRESHOLD:
+        return messages
+    cutoff = len(messages) - COMPACT_KEEP_RECENT
+    out = []
+    for i, m in enumerate(messages):
+        if (i < cutoff and m.get("role") == "tool"
+                and len(str(m.get("content") or "")) > COMPACT_MIN_CONTENT):
+            m = dict(m, content=COMPACT_PLACEHOLDER)
+        out.append(m)
+    return out
+
 SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机 macOS、远程 Linux（SSH）、K8s、Docker 环境的运维操作。
 
 ## 最高原则
@@ -33,25 +57,27 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
 
 
 def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
-             on_event=None, model: str | None = None) -> str:
+             on_event=None, model: str | None = None, on_delta=None) -> str:
     """执行一轮用户输入直到模型给出最终回复。on_event(kind, payload) 用于前端渲染。
 
-    kind: "text"（助手文本）| "tool"（工具调用与结果）| "info"
+    kind: "text"（助手完整文本，流式模式下仅在无 on_delta 时发出）| "tool" | "info"
+    on_delta：流式文本增量回调（传入即启用 SSE 流式）。
     返回最终文本。
     """
     emit = on_event or (lambda kind, payload: None)
     session.append({"role": "user", "content": user_input})
     final_text = ""
     for _ in range(MAX_TURNS):
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + session.messages
-        msg = llm.chat(messages, tools=tools.tool_schemas(), model=model)
+        messages = compact([{"role": "system", "content": SYSTEM_PROMPT}] + session.messages)
+        msg = llm.chat(messages, tools=tools.tool_schemas(), model=model, on_delta=on_delta)
         # 规范化为可持久化结构
         record = {"role": "assistant", "content": msg.get("content") or ""}
         if msg.get("tool_calls"):
             record["tool_calls"] = msg["tool_calls"]
         session.append(record)
         if msg.get("content"):
-            emit("text", msg["content"])
+            # 非流式：一次性发完整文本；流式：通知前端收尾该段流
+            emit("text" if on_delta is None else "stream_end", msg["content"])
             final_text = msg["content"]
         if not msg.get("tool_calls"):
             return final_text

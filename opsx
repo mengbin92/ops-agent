@@ -85,7 +85,12 @@ def main(argv: list[str] | None = None) -> int:
             for spec in args.snapshot_cmd:
                 name, _, cmd = spec.partition("::")
                 snap_cmds.append((cmd, name))
-            return core.exec_change(_join(args.command), args.snapshot_file, snap_cmds)
+            code, sid, output = core.exec_change(_join(args.command), args.snapshot_file, snap_cmds)
+            if output:
+                print(output, end="" if output.endswith("\n") else "\n")
+            if sid:
+                print(f"[opsx] snapshot_id: {sid}（回滚: opsx rollback {sid}）")
+            return code
 
         if args.sub == "snapshot":
             sid = core.snapshot_file(args.file) if args.file else core.snapshot_cmd(args.cmd, args.name)
@@ -97,17 +102,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.sub == "list":
-            lines = []
-            sdir = core.STATE_DIR / "snapshots"
-            if sdir.exists():
-                lines.append("== snapshots ==")
-                lines += [x.name for x in sorted(sdir.iterdir()) if x.is_dir()]
-            adir = core.STATE_DIR / "approvals"
-            if adir.exists():
+            state = core.collect_state()
+            lines = ["== snapshots =="] + state["snapshots"] if state["snapshots"] else []
+            if state["approvals"]:
                 lines.append("== approvals ==")
-                for x in sorted(adir.glob("*.json")):
-                    st = json.loads(x.read_text(encoding="utf-8"))
-                    lines.append(f"{st['cmd'][:80]}  (level={st['level']}, ttl={st['ttl']}s)")
+                lines += [f"{a['cmd'][:80]}  (level={a['level']}, ttl={a['ttl']}s)"
+                          for a in state["approvals"]]
             print("\n".join(lines) or "(空)")
             return 0
 
