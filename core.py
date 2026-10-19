@@ -180,6 +180,15 @@ def prune_approvals() -> None:
             p.unlink(missing_ok=True)  # 损坏文件一并清掉
 
 
+def revoke(cmd: str, target: str | None = None) -> bool:
+    """撤销审批戳（用户取消变更/提前失效）。返回是否确有戳被删除。"""
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
+    existed = p.exists()
+    p.unlink(missing_ok=True)
+    audit("revoke", cmd=cmd, target=target, existed=existed)
+    return existed
+
+
 def collect_state() -> dict:
     """快照与审批戳的统一读取，opsx list / MCP / agent 工具共用。"""
     sdir = STATE_DIR / "snapshots"

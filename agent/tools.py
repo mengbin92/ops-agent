@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,7 +20,10 @@ import core  # noqa: E402
 import remote  # noqa: E402
 
 BASH_TIMEOUT = 120
-OUTPUT_LIMIT = 30_000  # 超出截断，M2 再做 spill
+OUTPUT_LIMIT = 30_000   # 超限输出落盘，预览只留前 3 万字符
+SPILL_DIR = core.STATE_DIR / "outputs"
+SPILL_KEEP = 200        # 落盘输出保留份数，超出按时间删最旧
+READ_LIMIT = 2000       # read 默认返回行数
 
 
 class ToolContext:
@@ -38,10 +44,37 @@ def _schema(name, description, properties, required):
     }
 
 
-def _truncate(text: str) -> str:
+def _prune_outputs(keep: int = SPILL_KEEP) -> None:
+    # shortcut: 全局按 mtime 轮转；REPL/MCP 多进程同时落盘时可能删掉另一进程刚写的文件，
+    # 需要更久保留时改按进程/日期分目录
+    try:
+        files = sorted(SPILL_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime)
+    except OSError:  # 并发删除时 stat 会失败，跳过本次清理
+        return
+    for p in files[:-keep]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _cap(text: str, label: str) -> str:
+    """超长输出落盘（日志可能含密钥 → 0600），返回预览 + 路径供 read 分段读取。"""
     if len(text) <= OUTPUT_LIMIT:
         return text
-    return text[:OUTPUT_LIMIT] + f"\n...[已截断，共 {len(text)} 字符]"
+    try:
+        SPILL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        name = time.strftime("%Y%m%d-%H%M%S") + f"-{label[:40]}-{uuid.uuid4().hex[:6]}.txt"
+        path = SPILL_DIR / name
+        path.write_text(text, encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        # 磁盘满/文件名过长/无权限：降级为纯截断，别把"执行成功"变成工具报错
+        return text[:OUTPUT_LIMIT] + f"\n...[已截断，共 {len(text)} 字符；落盘失败，无法读取全文]"
+    _prune_outputs()
+    return (text[:OUTPUT_LIMIT]
+            + f"\n...[输出共 {len(text)} 字符，已截断；完整内容: {path}"
+              "（用 read 工具的 offset/limit 分段读取）]")
 
 
 def _bash(args: dict, ctx: ToolContext) -> str:
@@ -61,13 +94,13 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         return f"[opsx 拒绝] {msg}"
     if target:  # 远程只读：经 SSH 目标执行
         code, out = remote.run(target, cmd)
-        return f"[target={target} exit={code}]\n" + _truncate(out)
+        return f"[target={target} exit={code}]\n" + _cap(out, f"bash-{target}")
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
         return f"[超时] 命令超过 {BASH_TIMEOUT}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
-    return f"[exit={r.returncode}]\n" + _truncate(out)
+    return f"[exit={r.returncode}]\n" + _cap(out, "bash")
 
 
 def _read(args: dict, ctx: ToolContext) -> str:
@@ -75,9 +108,31 @@ def _read(args: dict, ctx: ToolContext) -> str:
     if not path.is_file():
         return f"[错误] 文件不存在: {path}"
     try:
-        return _truncate(path.read_text(encoding="utf-8", errors="replace"))
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
         return f"[错误] 读取失败: {e}"
+    if not lines:
+        return ""
+    try:
+        offset = max(1, int(args.get("offset", 1)))
+        limit = int(args.get("limit", READ_LIMIT))
+    except (TypeError, ValueError):
+        return "[错误] offset/limit 必须是整数"
+    if limit <= 0:
+        return "[错误] limit 必须是正整数"
+    if offset > len(lines):
+        return f"[错误] offset={offset} 超出文件行数（共 {len(lines)} 行）"
+    chunk = "\n".join(lines[offset - 1:offset - 1 + limit])
+    if len(chunk) > OUTPUT_LIMIT:  # 超长行等：只截断，按实际返回的行给下一页 offset
+        kept = chunk[:OUTPUT_LIMIT]
+        shown = kept.count("\n") + (0 if kept.endswith("\n") else 1)
+        cut = "" if kept.endswith("\n") else "（当前行余下部分未返回）"
+        return kept + (f"\n...[单次读取超过 {OUTPUT_LIMIT} 字符，已截断{cut}；"
+                       f"继续读取 offset={offset + shown}]")
+    end = min(offset - 1 + limit, len(lines))
+    if end < len(lines):
+        chunk += f"\n...[第 {offset}-{end} 行，共 {len(lines)} 行；继续读取 offset={end + 1}]"
+    return chunk
 
 
 def _ask_user(args: dict, ctx: ToolContext) -> str:
@@ -101,6 +156,14 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
             "现在可重新执行该命令。")
 
 
+def _ops_revoke(args: dict, ctx: ToolContext) -> str:
+    target = args.get("target") or None
+    existed = core.revoke(args["command"], target)
+    where = f"目标 {target}" if target else "本机"
+    return (f"[完成] 已撤销{where}的审批戳" if existed
+            else f"没有可撤销的{where}审批戳（可能已过期或未创建）")
+
+
 def _snapshot_filespec(args: dict) -> list[str]:
     return [args["snapshot_file"]] if args.get("snapshot_file") else []
 
@@ -116,7 +179,7 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
         code, sid, output = remote.exec_change(target, cmd, _snapshot_filespec(args), snap_cmds)
     else:
         code, sid, output = core.exec_change(cmd, _snapshot_filespec(args), snap_cmds)
-    out_text = _truncate(output) if output else "(无输出)"
+    out_text = _cap(output, f"exec-{target or 'local'}") if output else "(无输出)"
     sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     where = f"目标 {target} " if target else "本机"
     if code == 0:
@@ -153,8 +216,12 @@ REGISTRY: dict[str, dict] = {
         "handler": _bash, "read_only": False,
     },
     "read": {
-        "schema": _schema("read", "读取本地文本文件内容。",
-                          {"path": {"type": "string"}}, ["path"]),
+        "schema": _schema("read",
+                          f"读取本地文本文件（默认前 {READ_LIMIT} 行）；大文件用 offset/limit 分段读取。",
+                          {"path": {"type": "string"},
+                           "offset": {"type": "integer", "description": "起始行号（1-based），默认 1"},
+                           "limit": {"type": "integer", "description": f"最多读取行数，默认 {READ_LIMIT}"}},
+                          ["path"]),
         "handler": _read, "read_only": True,
     },
     "ask_user": {
@@ -172,6 +239,14 @@ REGISTRY: dict[str, dict] = {
                            "ttl_seconds": {"type": "integer", "default": 900},
                            "force": {"type": "boolean", "default": False}}, ["command"]),
         "handler": _ops_approve, "read_only": False,
+    },
+    "ops_revoke": {
+        "schema": _schema("ops_revoke",
+                          "撤销审批戳：用户取消变更、或建戳后决定不执行时使用。",
+                          {"command": {"type": "string"},
+                           "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"}},
+                          ["command"]),
+        "handler": _ops_revoke, "read_only": False,
     },
     "ops_exec": {
         "schema": _schema("ops_exec",

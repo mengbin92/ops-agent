@@ -70,6 +70,11 @@ TOOLS = [
         },
         "required": ["command"],
     }),
+    _tool("ops_revoke", "撤销审批戳（用户取消变更）", {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    }),
     _tool("ops_exec", "原子执行：校验审批戳→快照→执行→审计", {
         "type": "object",
         "properties": {
@@ -130,6 +135,9 @@ def call_tool(name, args):
         )
         stamp = json.loads(path.read_text(encoding="utf-8"))
         return _result({"stamp_file": path.name, "level": stamp["level"], "ttl_seconds": stamp["ttl"]})
+    if name == "ops_revoke":
+        revoked = core.revoke(_require(args, "command"))
+        return _result({"revoked": revoked})
     if name == "ops_exec":
         snap_cmds = [(c["command"], c.get("name", "")) for c in args.get("snapshot_cmds", [])]
         code, sid, output = core.exec_change(

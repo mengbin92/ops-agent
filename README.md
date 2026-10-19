@@ -5,7 +5,7 @@
 
 ## 独立 agent 形态（opsagent）
 
-自带 agent 内核（`agent/`：loop + OpenAI 兼容 provider + 工具注册表 + 会话持久化），
+自带 agent 内核（`agent/`：loop + provider（OpenAI 兼容 / Anthropic 原生）+ 工具注册表 + 会话持久化），
 守门核心 core.py 一行不改地成为其内置安全层。架构见
 `docs/superpowers/specs/2026-10-19-standalone-agent-design.md`。
 
@@ -14,6 +14,12 @@
 export OPSAGENT_API_KEY=sk-...
 # export OPSAGENT_BASE_URL=https://api.deepseek.com   # 默认 DeepSeek，可换任意兼容端点
 # export OPSAGENT_MODEL=deepseek-chat                 # 模型名随端点服务而定
+
+# 或改用 Anthropic 原生 Messages 协议（工具/流式同样支持）
+# export OPSAGENT_PROVIDER=anthropic
+# export OPSAGENT_API_KEY=sk-ant-...
+# export OPSAGENT_BASE_URL=https://api.anthropic.com  # 默认值；代理可给到 .../v1
+# export OPSAGENT_MODEL=claude-sonnet-4-5            # 默认值
 
 ./opsagent                                # 交互式 REPL（/new 新会话，/quit 退出）
 ./opsagent -p "看一下本机磁盘和内存"        # 单发非交互，可进脚本/CI
@@ -30,7 +36,15 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 （pbcopy/wl-copy/xclip 自动探测）；`↑`/`↓` 翻历史输入（readline，
 历史持久化于 `~/.ops-agent/repl_history`）。
 上下文超长时自动 basic compaction：裁剪早期工具输出（仅裁剪发送内容，
-会话文件保留完整记录）。
+会话文件保留完整记录）。命令输出（`bash` / `ops_exec`）超过 3 万字符时完整内容
+落盘到 `~/.ops-agent/outputs/`（0600，保留 200 份），回复里给预览 + 文件路径，
+`read` 工具带 `offset`/`limit` 分段读取（大文件同理）。
+
+RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `reset` / `ping`。
+`stream=true` 时边跑边推通知 `{"method":"event","params":{"kind":"delta","payload":"..."}}`
+（`delta` 文本增量、`tool` 工具调用/结果、`stream_end` 文本段收尾），最终结果不再重复
+`events`；不传 `stream` 则维持一次性返回 `{"text","events","session_id"}`。
+`ask_user` 用 `{"method":"ask_user","id":"srv-..."}` 反向请求，客户端把回答作为响应回传。
 
 四种形态共享同一内核与状态目录：REPL、单发、RPC、MCP（见下）。
 独立形态下守门在内核之内：bash 工具直接调 `core.check()`，写命令须
@@ -54,6 +68,9 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 
 # 手动预授权（AskUserQuestion 不可用时的降级路径）
 ./opsx approve 'systemctl restart nginx' --ttl 900  # （`!` 前缀 = 你本人直接执行，即授权动作本身）
+
+# 用户取消变更时立即撤销审批戳（不必等 TTL 过期）
+./opsx revoke 'systemctl restart nginx'
 
 # 查看审计 / 快照 / 审批戳
 ./opsx audit --tail 20
@@ -99,6 +116,9 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 `opsx exec` 的 `--snapshot-cmd` 抓取命令同样过守门（R0 免戳，其余需它自己的审批戳），
 防止把写操作藏进快照参数。状态目录与快照目录按 `0700` 创建——远程拉回的配置/密钥只有本人可读。
 
+审批戳可随时 `opsx revoke`（agent 内为 `ops_revoke`）撤销，不必等 TTL 过期；
+远程戳按目标绑定，撤销本机同名命令不会波及目标机。
+
 已知边界：审批戳由 Agent 侧在获得用户确认后创建，防"误执行"不防"恶意 Agent"；
 命令分类为线性正则匹配，不解析 shell AST（复合命令按 `;` `&&` `||` `|` 分段取最高级）。
 
@@ -117,7 +137,7 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 }
 ```
 
-只读工具（`ops_check` / `ops_list` / `ops_audit`）建议 allowlist 免弹窗；写工具（`ops_approve` / `ops_exec` / `ops_rollback` / `ops_snapshot_*`）保持每次弹窗（双保险），审批戳仍是硬闸门。Claude Code 的权限配置片段：
+只读工具（`ops_check` / `ops_list` / `ops_audit`）建议 allowlist 免弹窗；写工具（`ops_approve` / `ops_revoke` / `ops_exec` / `ops_rollback` / `ops_snapshot_*`）保持每次弹窗（双保险），审批戳仍是硬闸门。Claude Code 的权限配置片段：
 
 ```json
 {

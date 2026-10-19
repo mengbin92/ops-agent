@@ -34,6 +34,8 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
    绑定，本机戳与别的目标的戳都不能复用。
 5. 执行后报告：结果、snapshot_id、`opsx rollback <snapshot_id>` 回滚命令。
    服务/部署类回滚：先 `opsx rollback <id>` 取回执行前状态，再按回滚计划执行逆操作。
+6. 用户建戳后取消变更：`opsx revoke '<命令>'`（远程加 `--target <目标名>`）立即作废审批戳，
+   不必等 TTL 过期。
 
 ## R3 流程
 

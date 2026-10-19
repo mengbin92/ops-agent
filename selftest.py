@@ -302,11 +302,11 @@ def test_mcp_tools_list():
     c = McpClient()
     try:
         tools = c.request("tools/list")["result"]["tools"]
-        assert len(tools) == 8
+        assert len(tools) == 9
         by_name = {t["name"]: t for t in tools}
         assert set(by_name) == {
             "ops_check", "ops_snapshot_file", "ops_snapshot_cmd", "ops_approve",
-            "ops_exec", "ops_rollback", "ops_list", "ops_audit",
+            "ops_revoke", "ops_exec", "ops_rollback", "ops_list", "ops_audit",
         }
         assert by_name["ops_check"]["annotations"]["readOnlyHint"] is True
         assert by_name["ops_list"]["annotations"]["readOnlyHint"] is True
@@ -342,6 +342,8 @@ def test_mcp_write_cycle():
             f = Path(td) / "mcp-demo.conf"
             f.write_text("v1")
             cmd = f"echo v2 > {f}"
+            _, payload = c.call_tool("ops_revoke", {"command": "systemctl restart mcp-none"})
+            assert payload["revoked"] is False
             _, payload = c.call_tool("ops_approve", {"command": cmd, "ttl_seconds": 60})
             assert payload["level"] == "R2"
             _, payload = c.call_tool("ops_exec", {"command": cmd, "snapshot_files": [str(f)]})
@@ -1042,6 +1044,303 @@ def test_ops_list_survives_corrupt_registry():
         assert "== snapshots ==" in out and "== targets ==" in out and "解析失败" in out
     finally:
         _write_targets()
+
+
+
+def _fake_anthropic_response(content_blocks):
+    import io
+
+    class FakeResp:
+        def __enter__(self):
+            return io.BytesIO(json.dumps({"content": content_blocks}).encode())
+
+        def __exit__(self, *a):
+            return False
+
+    return FakeResp()
+
+
+def _with_urlopen(fake, fn):
+    """临时替换 urlopen，捕获请求；返回 (结果, 捕获的 {url, headers, body})。"""
+    import urllib.request
+    captured: dict = {}
+
+    def wrapper(req, timeout=300):
+        captured["url"] = req.full_url
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        captured["body"] = json.loads(req.data.decode())
+        return fake(req, timeout)
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = wrapper
+    try:
+        return fn(), captured
+    finally:
+        urllib.request.urlopen = orig
+
+
+def test_anthropic_provider_request_and_response():
+    from agent import llm, llm_anthropic
+    env = {"OPSAGENT_PROVIDER": "anthropic", "OPSAGENT_API_KEY": "test-dummy",
+           "OPSAGENT_BASE_URL": "https://proxy.example/v1", "OPSAGENT_MODEL": "claude-test"}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+
+    def fake(req, timeout):
+        return _fake_anthropic_response([
+            {"type": "text", "text": "结论："},
+            {"type": "tool_use", "id": "tu1", "name": "bash", "input": {"command": "uname"}}])
+
+    def call():
+        messages = [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tool_call("c1", "bash", {"command": "uname"})]},
+            {"role": "tool", "tool_call_id": "c1", "name": "bash", "content": "Darwin"},
+            {"role": "tool", "tool_call_id": "c2", "name": "bash", "content": "Linux"},
+            {"role": "assistant", "content": "读完了"},
+        ]
+        tools = [{"type": "function", "function": {
+            "name": "bash", "description": "d",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        return llm.chat(messages, tools=tools)
+
+    try:
+        msg, cap = _with_urlopen(fake, call)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert cap["url"] == "https://proxy.example/v1/messages"
+    assert cap["headers"]["x-api-key"] == "test-dummy"
+    assert cap["headers"]["anthropic-version"] == llm_anthropic.API_VERSION
+    body = cap["body"]
+    assert body["model"] == "claude-test" and body["stream"] is False and body["max_tokens"] > 0
+    assert body["system"] == "SYS"
+    assert body["tools"][0]["input_schema"]["required"] == ["command"]
+    assert "type" not in body["tools"][0]  # OpenAI 包装层已去除
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["user", "assistant", "user", "assistant"], roles
+    assistant = body["messages"][1]["content"]
+    assert assistant[0]["type"] == "tool_use" and assistant[0]["input"] == {"command": "uname"}
+    # 连续 tool 结果合并成一条 user 消息（两条 tool_result）
+    results = body["messages"][2]["content"]
+    assert [r["type"] for r in results] == ["tool_result", "tool_result"]
+    assert [r["tool_use_id"] for r in results] == ["c1", "c2"]
+    # 响应 → OpenAI 形状
+    assert msg["content"] == "结论："
+    tc = msg["tool_calls"][0]
+    assert tc["id"] == "tu1" and tc["function"]["name"] == "bash"
+    assert json.loads(tc["function"]["arguments"]) == {"command": "uname"}
+
+
+def test_anthropic_defaults_and_unknown_provider():
+    from agent import llm, llm_anthropic
+    saved = {k: os.environ.get(k) for k in
+             ("OPSAGENT_PROVIDER", "OPSAGENT_API_KEY", "OPSAGENT_BASE_URL", "OPSAGENT_MODEL")}
+    os.environ.pop("OPSAGENT_BASE_URL", None)
+    os.environ.pop("OPSAGENT_MODEL", None)
+    os.environ["OPSAGENT_PROVIDER"] = "anthropic"
+    os.environ["OPSAGENT_API_KEY"] = "test-dummy"
+
+    def fake(req, timeout):
+        return _fake_anthropic_response([{"type": "text", "text": "ok"}])
+
+    try:
+        msg, cap = _with_urlopen(fake, lambda: llm.chat([{"role": "user", "content": "x"}]))
+        assert cap["url"] == "https://api.anthropic.com/v1/messages"
+        assert cap["body"]["model"] == llm_anthropic.DEFAULT_MODEL
+        assert msg["content"] == "ok"
+        os.environ["OPSAGENT_PROVIDER"] = "bogus"
+        try:
+            llm.chat([{"role": "user", "content": "x"}])
+            raise AssertionError("未知 provider 应报错")
+        except llm.LLMError as e:
+            assert "未知 provider" in str(e)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_anthropic_sse_stream():
+    import io
+    from agent import llm
+    saved = {k: os.environ.get(k) for k in
+             ("OPSAGENT_PROVIDER", "OPSAGENT_API_KEY", "OPSAGENT_BASE_URL")}
+    os.environ.update({"OPSAGENT_PROVIDER": "anthropic", "OPSAGENT_API_KEY": "test-dummy"})
+    os.environ.pop("OPSAGENT_BASE_URL", None)
+
+    sse = "\n".join([
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"m1"}}',
+        'event: content_block_start',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"结论："}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"一切正常"}}',
+        'data: {"type":"content_block_stop","index":0}',
+        'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu1","name":"bash","input":{}}}',
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":"}}',
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"uname\\"}"}}',
+        'data: {"type":"content_block_stop","index":1}',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+    ]) + "\n"
+
+    class FakeResp:
+        def __enter__(self):
+            return io.BytesIO(sse.encode())
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=300: FakeResp()
+    try:
+        deltas: list[str] = []
+        msg = llm.chat([{"role": "user", "content": "hi"}], on_delta=deltas.append)
+        assert "".join(deltas) == "结论：一切正常"
+        assert msg["content"] == "结论：一切正常"
+        assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"command": "uname"}
+
+        err_sse = ('data: {"type":"error","error":{"type":"overloaded_error",'
+                   '"message":"busy"}}\n')
+        urllib.request.urlopen = lambda req, timeout=300: type("R", (), {
+            "__enter__": lambda self: io.BytesIO(err_sse.encode()),
+            "__exit__": lambda self, *a: False})()
+        try:
+            llm.chat([{"role": "user", "content": "hi"}], on_delta=lambda _t: None)
+            raise AssertionError("流式 error 事件应抛 LLMError")
+        except llm.LLMError as e:
+            assert "流式错误" in str(e)
+    finally:
+        urllib.request.urlopen = orig
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_output_spill_and_read_pagination():
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext()
+    td = tempfile.TemporaryDirectory(prefix="opsx-spill-")
+    big = Path(td.name) / "big.log"
+    big.write_text("\n".join(f"line {i}" for i in range(1, 20001)) + "\n", encoding="utf-8")
+    out = agent_tools.dispatch("bash", {"command": f"cat {big}"}, ctx)
+    assert out.startswith("[exit=0]")
+    m = re.search(r"完整内容: (\S+\.txt)", out)
+    assert m, out[:300]
+    path = Path(m.group(1))
+    assert path.exists() and path.stat().st_size > agent_tools.OUTPUT_LIMIT
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert str(agent_tools.SPILL_DIR) in str(path)
+    # 预览被截断
+    assert len(out) < path.stat().st_size
+    # read 分段读到尾部
+    head = agent_tools.dispatch("read", {"path": str(path), "offset": 1, "limit": 2}, ctx)
+    assert head.startswith("line 1\nline 2") and "继续读取 offset=3" in head
+    tail = agent_tools.dispatch("read", {"path": str(path), "offset": 19990, "limit": 20}, ctx)
+    assert "line 20000" in tail and "继续读取" not in tail
+    # 越界/非法参数
+    assert "超出文件行数" in agent_tools.dispatch(
+        "read", {"path": str(path), "offset": 99999}, ctx)
+    assert "limit 必须是正整数" in agent_tools.dispatch(
+        "read", {"path": str(path), "limit": 0}, ctx)
+    assert "[错误] 文件不存在" in agent_tools.dispatch("read", {"path": "/nonexistent/x"}, ctx)
+    # 超长行：截断提示与下一页 offset 必须一致（此前会谎报"第 1-2000 行"）
+    longline = Path(td.name) / "longline.txt"
+    longline.write_text("x" * 31000 + "\nsecond\n", encoding="utf-8")
+    r = agent_tools.dispatch("read", {"path": str(longline)}, ctx)
+    assert "单次读取超过" in r and "继续读取 offset=2" in r
+    assert "第 1-2000 行" not in r
+    td.cleanup()
+
+
+def test_spill_prune():
+    from agent import tools as agent_tools
+    orig, td = agent_tools.SPILL_DIR, tempfile.TemporaryDirectory(prefix="opsx-prune-")
+    agent_tools.SPILL_DIR = Path(td.name)
+    try:
+        made = []
+        for i in range(3):
+            f = agent_tools.SPILL_DIR / f"prune-test-{i}.txt"
+            f.write_text("x")
+            os.utime(f, (1000 + i, 1000 + i))
+            made.append(f)
+        agent_tools._prune_outputs(keep=2)
+        assert not made[0].exists() and made[1].exists() and made[2].exists()
+    finally:
+        agent_tools.SPILL_DIR = orig
+        td.cleanup()
+
+
+def test_revoke_stamp():
+    import subprocess
+    import sys as _sys
+    from agent import tools as agent_tools
+    cmd = "systemctl restart revoke-svc"
+    assert core.revoke(cmd) is False  # 未建戳
+    core.approve(cmd, ttl_seconds=60)
+    assert core.check_stamp(cmd) is True
+    out = agent_tools.dispatch("ops_revoke", {"command": cmd},
+                               agent_tools.ToolContext())
+    assert "已撤销" in out and core.check_stamp(cmd) is False
+    # 目标绑定：本机 revoke 不会撤销 web1 的戳
+    _write_targets()
+    core.approve(cmd, ttl_seconds=60, target="web1")
+    assert core.revoke(cmd) is False
+    assert core.check_stamp(cmd, "web1") is True
+    # CLI
+    cli_cmd = "systemctl restart cli-revoke"
+    core.approve(cli_cmd, ttl_seconds=60)
+    r = subprocess.run([_sys.executable, "opsx", "revoke", cli_cmd], capture_output=True,
+                       text=True, cwd=str(Path(__file__).resolve().parent))
+    assert r.returncode == 0 and "已撤销" in r.stdout, r.stderr
+    assert core.check_stamp(cli_cmd) is False
+    assert core.revoke(cmd, "web1") is True  # 清理本用例留下的远程戳
+
+
+def test_rpc_stream_events():
+    import io
+    import sys as _sys
+    from agent import rpc
+    restore = _stub_llm([{"role": "assistant", "content": "巡检完成"}])
+    stdin = io.StringIO(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "prompt",
+                    "params": {"text": "检查", "stream": True}}) + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "prompt",
+                      "params": {"text": "再查"}}) + "\n")
+    stdout = io.StringIO()
+    orig_in, orig_out = _sys.stdin, _sys.stdout
+    _sys.stdin, _sys.stdout = stdin, stdout
+    try:
+        rpc.serve()
+    finally:
+        _sys.stdin, _sys.stdout = orig_in, orig_out
+        restore()
+    lines = [json.loads(l) for l in stdout.getvalue().splitlines() if l.strip()]
+    notes = [l for l in lines if l.get("method") == "event"]
+    kinds = [n["params"]["kind"] for n in notes]
+    assert "delta" in kinds and "stream_end" in kinds, kinds
+    delta = [n for n in notes if n["params"]["kind"] == "delta"][0]
+    assert delta["params"]["payload"] == "巡检完成"
+    result = [l for l in lines if l.get("id") == 1][0]["result"]
+    assert result["text"] == "巡检完成" and "events" not in result
+    assert result["session_id"]
+    # 不传 stream 时保持旧契约：一次性返回 events
+    plain = [l for l in lines if l.get("id") == 2][0]["result"]
+    assert [e["kind"] for e in plain["events"]] == ["text"], plain
+    assert plain["events"][0]["payload"] == "巡检完成"
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

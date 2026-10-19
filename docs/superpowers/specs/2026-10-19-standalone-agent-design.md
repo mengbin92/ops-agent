@@ -19,8 +19,8 @@
   `make_prompt()` 修复 libedit 下彩色提示符导致的 ↑/↓ 历史重绘残影
   （GNU readline 用 `\001\002` 保留彩色，libedit 退化无色）。
   41 项自测全绿。
-- **环境变量**：`OPSAGENT_API_KEY` / `OPSAGENT_BASE_URL` / `OPSAGENT_MODEL`，
-  不带厂商暗示（2026-10-19 由 OPENAI/DEEPSEEK_* 改名）。
+- **环境变量**：`OPSAGENT_PROVIDER` / `OPSAGENT_API_KEY` / `OPSAGENT_BASE_URL` / `OPSAGENT_MODEL`，
+  不带厂商暗示（2026-10-19 由 OPENAI/DEEPSEEK_* 改名；M2 增 provider 选择）。
 - **安全债清偿 ✅（2026-10-19 全库 code review）**：`1>`/`&>`/`$()`/反引号绕过只读白名单已修；
   `exec_change` 有超时（默认 3600s，exit=4）且输出入审计；`exec` 输出改为 capture，
   修复 MCP stdio 协议被子进程输出污染；`bash` 工具收紧为仅 R0（写命令带戳也必须走
@@ -38,6 +38,16 @@
   评审加固：快照 id 形状校验（此前 `rollback("../../x")` 可读写快照目录之外）；
   快照/状态目录 0700（远程拉回的配置可能含密钥）；注册表损坏时 list 不再整体失败；
   list 格式收敛到 `core.format_state()`。63 项自测全绿。
+- **M2 ✅（2026-10-19）**：Anthropic 原生 provider（`agent/llm_anthropic.py`，
+  `OPSAGENT_PROVIDER=anthropic`）：messages/tools 在边界处与 OpenAI 形状双向转换
+  （system 抽顶层、tool_calls ↔ tool_use、tool 结果 ↔ tool_result 并合并连续结果），
+  loop 零改动；BASE_URL 末尾是 `/v1` 时只补 `/messages`，否则补 `/v1/messages`；
+  流式解析 text_delta / input_json_delta。工具输出 spill：超 3 万字符写入
+  `~/.ops-agent/outputs/`（0600、保留 200 份、按 mtime 删最旧），回复给预览+路径，
+  `read` 增加 offset/limit 分段读取。审批戳 revoke：`core.revoke()`（按目标绑定）、
+  `opsx revoke`、`ops_revoke` 工具。RPC 流式推送：`prompt {stream:true}` 推
+  `event` 通知（delta/tool/stream_end），结果不再重复 events。exec 超时与输出入审计
+  已在安全债中提前清偿。70 项自测全绿。
 
 ## 1. 背景与目标
 
@@ -92,17 +102,19 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 ├──────────────┬───────────────────────────┬───────────────────────────────────┤
 │ provider 层  │ 工具层 (agent/tools.py)    │ 守门层（现有，零改动）              │
 │ agent/llm.py │ bash / read / ask_user /   │ core.py：分级/审批戳/快照/回滚/审计 │
-│ OpenAI 兼容  │ ops_exec …注册表            │ config.yaml：R0-R3 规则            │
+│ provider 分发│ ops_exec …注册表            │ config.yaml：R0-R3 规则            │
 ├──────────────┴───────────────────────────┴───────────────────────────────────┤
-│ 状态层：~/.ops-agent/（approvals, snapshots, audit.jsonl）+ sessions/*.jsonl（v1） │
+│ 状态层：~/.ops-agent/（approvals, snapshots, targets.json, outputs, audit.jsonl）  │
+│         + sessions/*.jsonl（v1）                                             │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 关键决策：
 
 - **Python 3.9+，stdlib 起步**。LLM 调用用 `urllib`（SSE 流式也手写解析）；core.py 一行不改。
-- **provider 先行做 OpenAI 兼容**（`/chat/completions` + tools），一个实现覆盖
-  DeepSeek / OpenAI / Kimi / Qwen 等；Anthropic 原生协议留作 M2 的第二 provider。
+- **provider 先做 OpenAI 兼容**（`/chat/completions` + tools），一个实现覆盖
+  DeepSeek / OpenAI / Kimi / Qwen 等；M2 补 Anthropic 原生 Messages（`llm_anthropic.py`），
+  两者对 loop 输出同一 OpenAI 形状。
 - **工具即注册表**：`{name: {schema, handler, read_only}}`，前端只渲染、内核只分发。
 - **守门在内核之内而非 hook 之外**：`bash` 工具handler 直接调 `core.check()`，
   拒绝时把变更单流程指令作为 tool result 回给模型；不再需要 PreToolUse 这一外部防线
@@ -118,7 +130,7 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 |---|---|---|
 | REPL | `opsagent` 或 `opsagent chat` | 交互式；`ask_user` 走终端；`/new` `/quit` |
 | 单发 | `opsagent -p "看一下 nginx 状态"` | 非交互，输出到 stdout，可进脚本；无 TTY 时 ask_user 返回"不可用"并降级为拒绝写操作 |
-| RPC | `opsagent rpc` | stdio JSON-RPC：`prompt`（含 ask_user 回调请求）/ `reset`，供 Web UI、IM 机器人嵌入 |
+| RPC | `opsagent rpc` | stdio JSON-RPC：`prompt`（`stream:true` 推增量 event 通知，含 ask_user 回调请求）/ `reset`，供 Web UI、IM 机器人嵌入 |
 | MCP | `python3 mcp_server.py` | 保留现状，作为 Claude Code 等宿主的后端工具集 |
 
 ## 5. 演进路线（对照 DSH 子系统）
@@ -126,7 +138,9 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 - **M0 ✅（2026-10-19）**：loop + OpenAI provider + bash/read/ask_user 工具 + REPL/-p/RPC + 会话 v1 持久化。
   追加落地：Markdown 终端渲染、`/copy` 剪贴板、readline 历史。
 - **M1 ✅（2026-10-19）**：SSE 流式输出（渲染器整段重绘支持增量）；compaction（basic：超阈值裁剪早期 tool result）；`/resume`。
-- **M2**：Anthropic provider；工具输出 spill 落盘（仿 dsh-output-retention，当前仅截断）；审批戳 revoke（过期清理已做）；exec 超时与输出入审计（P0 安全债，已提前清偿）；RPC 形态支持流式事件推送。
+- **M2 ✅（2026-10-19）**：Anthropic provider；工具输出 spill 落盘（`~/.ops-agent/outputs/`，
+  `read` offset/limit 分段）；审批戳 revoke（`core.revoke` / `opsx revoke` / `ops_revoke`）；
+  exec 超时与输出入审计（P0 安全债，提前清偿）；RPC 流式事件推送（`stream=true`）。
 - **M3**：skills 目录（仿 dsh-skill-filesystem：按需加载的运维 playbook）；子代理（只读排查代理并行跑）。
 - **M4 ✅（2026-10-19）**：远程执行通道——SSH 目标注册表（只认注册目标）、远程快照拉回本地存档、
   回滚推回目标机、审批戳按目标绑定；把守门能力延伸到 ops.md 声称的远程场景。
@@ -140,7 +154,8 @@ ops-agent/
   remote.py     # SSH 目标注册表 + 远程快照/回滚（M4）
   agent/
     __init__.py
-    llm.py        # OpenAI 兼容 provider（urllib，可选 SSE）
+    llm.py        # provider 分发 + OpenAI 兼容 provider（urllib，可选 SSE）
+    llm_anthropic.py  # Anthropic 原生 Messages provider（消息/工具双向转换）
     tools.py      # 工具注册表 + 内建工具
     loop.py       # agent loop
     session.py    # 会话持久化（jsonl, format v1）
@@ -152,6 +167,9 @@ ops-agent/
 
 ## 7. 风险与取舍
 
-- **stdlib urllib 无 SSE 解析库**：M0 非流式（`stream:false`），REPL 体验稍钝，M1 补。
+- **stdlib urllib 无 SSE 解析库**：流式解析手写（OpenAI `data:` 行与 Anthropic
+  `content_block_delta` 两套），M1/M2 已落地；新增 provider 时按同样形状适配即可。
 - **ask_user 在非 TTY 环境**：安全方向降级——写操作一律拒绝并提示用户改用 REPL。
 - **双守门并存期**：hook（Claude Code）与内核守门（独立形态）规则同源（core.py），不会分叉。
+- **Anthropic 转换边界**：只映射 text / tool_use / tool_result 三类内容块，
+  图片、thinking 等块不在 agent 使用范围内，暂不转换。

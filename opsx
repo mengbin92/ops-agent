@@ -29,6 +29,10 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--force", action="store_true", help="R3 不可逆操作必须显式加此 flag")
     a.add_argument("--target", default="", help="SSH 目标名（戳只对该目标有效）；省略=本机")
 
+    rv = sub.add_parser("revoke", help="撤销审批戳（用户取消变更）")
+    rv.add_argument("command", nargs="+")
+    rv.add_argument("--target", default="", help="SSH 目标名；省略=本机")
+
     e = sub.add_parser("exec", help="原子执行：校验→快照→执行→审计")
     e.add_argument("command", nargs="+")
     e.add_argument("--target", default="", help="SSH 目标名；省略=本机")
@@ -87,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
             stamp = json.loads(path.read_text(encoding="utf-8"))
             where = f"目标 {args.target}" if args.target else "本机"
             print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s，{where}）")
+            return 0
+
+        if args.sub == "revoke":
+            existed = core.revoke(_join(args.command), args.target or None)
+            where = f"目标 {args.target}" if args.target else "本机"
+            print(f"已撤销{where}的审批戳" if existed else f"无匹配的审批戳（{where}，可能已过期）")
             return 0
 
         if args.sub == "exec":
