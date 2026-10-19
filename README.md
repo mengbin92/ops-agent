@@ -61,10 +61,43 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 ./opsx rollback <snapshot_id>
 ```
 
+## 远程执行（SSH 目标）
+
+写操作可以下发到远程机，守门仍在本机跑：同一份 `config.yaml`、同一套审批戳、本地审计。
+先在 `~/.ops-agent/targets.json` 注册目标——**只允许操作注册过的目标**，模型无法自行指定主机：
+
+```json
+{
+  "web1": {"host": "10.0.0.11", "user": "ops", "port": 22,
+           "identity": "~/.ssh/id_ed25519",
+           "options": ["-o", "StrictHostKeyChecking=accept-new"]}
+}
+```
+
+```bash
+./opsx targets                                            # 列出已注册目标
+./opsx approve --target web1 'systemctl restart nginx'    # 戳按「目标+命令」绑定
+./opsx exec --target web1 --snapshot-file /etc/nginx/nginx.conf 'systemctl restart nginx'
+./opsx rollback <snapshot_id>                             # 远程快照自动推回目标机
+```
+
+- agent 内：只读排查用 `bash` 带 `target`（仍要求 R0）；写操作 `ops_approve` 与 `ops_exec`
+  必须带同一个 `target`——本机戳不能用于远程目标，A 机器的戳也不能拿到 B 机器用。
+- 远程快照：执行前用 `cat` 拉回 `~/.ops-agent/snapshots/<id>/files/...` 存档（快照路径用绝对路径）；
+  回滚用 stdin 覆盖写回（保留原 inode/权限；文件已被删则重建，权限取默认值）。
+  目标机不需要安装任何东西。
+- 认证：`BatchMode=yes`，要求密钥/ssh-agent 免密——agent 无人值守，不能停在密码提示上。
+- 目标字段（host/user/port/identity）含空白或前导 `-` 一律拒绝，避免配置值被 ssh 当成选项。
+- 边界：`ssh` 只是传输通道，目标机上的命令不受目标机本地 opsx 约束；
+  MCP 形态仍只支持本机执行（MCP 宿主可直接调 `opsx exec --target` 获得同样能力）。
+
 ## 防线说明
 
 两层防线：① Agent 流程纪律（变更单 → AskUserQuestion → opsx exec）；
 ② PreToolUse hook 硬拦截（无白名单命中且无有效审批戳 → exit 2 拒绝）。
+
+`opsx exec` 的 `--snapshot-cmd` 抓取命令同样过守门（R0 免戳，其余需它自己的审批戳），
+防止把写操作藏进快照参数。状态目录与快照目录按 `0700` 创建——远程拉回的配置/密钥只有本人可读。
 
 已知边界：审批戳由 Agent 侧在获得用户确认后创建，防"误执行"不防"恶意 Agent"；
 命令分类为线性正则匹配，不解析 shell AST（复合命令按 `;` `&&` `||` `|` 分段取最高级）。

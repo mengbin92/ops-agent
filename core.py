@@ -106,7 +106,11 @@ AUDIT_ROTATE_BYTES = 10 * 1024 * 1024  # ponytail: 单备份轮转 audit.jsonl.1
 
 
 def audit(event: str, **fields) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(STATE_DIR, 0o700)  # 审计/会话/快照里可能有敏感输出，只留本人可读
+    except OSError:
+        pass
     path = STATE_DIR / "audit.jsonl"
     if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
         os.replace(path, STATE_DIR / "audit.jsonl.1")
@@ -119,19 +123,23 @@ def normalize(cmd: str) -> str:
     return " ".join(cmd.split())
 
 
-def cmd_hash(cmd: str) -> str:
-    return hashlib.sha256(normalize(cmd).encode()).hexdigest()
+def cmd_hash(cmd: str, target: str | None = None) -> str:
+    """审批戳键。远程目标参与哈希：在 A 机器批准的命令不能拿到 B 机器执行。"""
+    key = f"{target}\n{normalize(cmd)}" if target else normalize(cmd)
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
-def approve(cmd: str, ttl_seconds: int = 900, force: bool = False) -> Path:
+def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
+            target: str | None = None) -> Path:
     level, _ = classify(cmd)
     if level == "R0":
         raise OpsxError("只读命令无需审批戳")
     if level == "R3" and not force:
         raise OpsxError("R3 命令需 --force 显式确认（不可逆操作）")
     stamp = {
-        "cmd_hash": cmd_hash(cmd),
+        "cmd_hash": cmd_hash(cmd, target),
         "cmd": cmd,
+        "target": target,
         "created": time.time(),
         "ttl": ttl_seconds,
         "force": force,
@@ -142,12 +150,12 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
     prune_approvals()  # 顺带清理过期戳
-    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force)
+    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target)
     return p
 
 
-def check_stamp(cmd: str) -> bool:
-    p = STATE_DIR / "approvals" / (cmd_hash(cmd) + ".json")
+def check_stamp(cmd: str, target: str | None = None) -> bool:
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
     if not p.exists():
         return False
     try:
@@ -182,21 +190,35 @@ def collect_state() -> dict:
         for p in sorted(adir.glob("*.json")):
             try:
                 st = json.loads(p.read_text(encoding="utf-8"))
-                approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"]})
+                approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"],
+                                  "target": st.get("target")})
             except (json.JSONDecodeError, KeyError, OSError):
                 continue
     return {"snapshots": snapshots, "approvals": approvals}
 
 
-def check(cmd: str) -> tuple[int, str]:
+def format_state(state: dict) -> list[str]:
+    """快照/审批戳摘要（opsx list 与 agent ops_list 共用，避免两处格式漂移）。"""
+    lines = []
+    if state["snapshots"]:
+        lines += ["== snapshots =="] + state["snapshots"]
+    if state["approvals"]:
+        lines.append("== approvals ==")
+        lines += [f"{a['cmd'][:80]}  (level={a['level']}, ttl={a['ttl']}s, "
+                  f"{'target=' + a['target'] if a.get('target') else '本机'})"
+                  for a in state["approvals"]]
+    return lines
+
+
+def check(cmd: str, target: str | None = None) -> tuple[int, str]:
     level, matched = classify(cmd)
     if level == "R0":
-        audit("check", cmd=cmd, level=level, result="allow")
+        audit("check", cmd=cmd, level=level, result="allow", target=target)
         return 0, "只读命令，放行"
-    if check_stamp(cmd):
-        audit("check", cmd=cmd, level=level, result="allow-stamp")
+    if check_stamp(cmd, target):
+        audit("check", cmd=cmd, level=level, result="allow-stamp", target=target)
         return 0, "有效审批戳，放行"
-    audit("check", cmd=cmd, level=level, result="deny")
+    audit("check", cmd=cmd, level=level, result="deny", target=target)
     hit = f"（命中分段：{matched}）" if matched else ""
     return 2, (
         f"[opsx] 拒绝执行：该命令判定为 {level}{hit}。"
@@ -208,10 +230,10 @@ def _new_snapshot_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 
-def _begin_snapshot() -> tuple[str, Path]:
+def begin_snapshot() -> tuple[str, Path]:
     sid = _new_snapshot_id()
     d = STATE_DIR / "snapshots" / sid
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)  # 快照可能含密钥/配置，仅本人可读
     return sid, d
 
 
@@ -245,7 +267,7 @@ def _write_meta(d: Path, sid: str, items: list) -> None:
 
 
 def snapshot_file(path_str: str) -> str:
-    sid, d = _begin_snapshot()
+    sid, d = begin_snapshot()
     items: list = []
     _snapshot_file_into(d, path_str, items)
     _write_meta(d, sid, items)
@@ -254,7 +276,7 @@ def snapshot_file(path_str: str) -> str:
 
 
 def snapshot_cmd(cmd: str, name: str = "") -> str:
-    sid, d = _begin_snapshot()
+    sid, d = begin_snapshot()
     items: list = []
     _snapshot_cmd_into(d, cmd, name, items)
     _write_meta(d, sid, items)
@@ -262,8 +284,18 @@ def snapshot_cmd(cmd: str, name: str = "") -> str:
     return sid
 
 
+_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def snapshot_dir(snapshot_id: str) -> Path:
+    """快照目录。id 来自模型/用户：允许路径分隔符就能让 rollback 读写任意目录。"""
+    if not isinstance(snapshot_id, str) or not _SNAPSHOT_ID_RE.fullmatch(snapshot_id):
+        raise OpsxError(f"非法快照 id: {snapshot_id!r}")
+    return STATE_DIR / "snapshots" / snapshot_id
+
+
 def rollback(snapshot_id: str) -> str:
-    d = STATE_DIR / "snapshots" / snapshot_id
+    d = snapshot_dir(snapshot_id)
     if not d.exists():
         raise OpsxError(f"快照不存在: {snapshot_id}")
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
@@ -311,9 +343,15 @@ def exec_change(
     if code != 0:
         print(msg, file=sys.stderr)
         return code, None, ""
+    for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
+        code, _ = check(c)
+        if code != 0:
+            audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
+            print(f"[opsx] 快照命令未通过守门，已中止执行: {c}", file=sys.stderr)
+            return 2, None, ""
     sid = None
     if snapshot_files or snapshot_cmds:
-        sid, d = _begin_snapshot()
+        sid, d = begin_snapshot()
         items: list = []
         try:
             for f in snapshot_files:

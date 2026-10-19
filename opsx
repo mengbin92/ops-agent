@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import core  # noqa: E402
+import remote  # noqa: E402
 
 
 def _join(parts: list[str]) -> str:
@@ -26,9 +27,11 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("command", nargs="+")
     a.add_argument("--ttl", type=int, default=900, help="有效期秒数")
     a.add_argument("--force", action="store_true", help="R3 不可逆操作必须显式加此 flag")
+    a.add_argument("--target", default="", help="SSH 目标名（戳只对该目标有效）；省略=本机")
 
     e = sub.add_parser("exec", help="原子执行：校验→快照→执行→审计")
     e.add_argument("command", nargs="+")
+    e.add_argument("--target", default="", help="SSH 目标名；省略=本机")
     e.add_argument("--snapshot-file", action="append", default=[])
     e.add_argument("--snapshot-cmd", action="append", default=[],
                    help="'name::command' 形式，可多次")
@@ -38,11 +41,13 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--file")
     g.add_argument("--cmd")
     s.add_argument("--name", default="")
+    s.add_argument("--target", default="", help="SSH 目标名；省略=本机")
 
     r = sub.add_parser("rollback")
     r.add_argument("snapshot_id")
 
-    sub.add_parser("list", help="列出快照与审批戳")
+    sub.add_parser("list", help="列出快照、审批戳与 SSH 目标")
+    sub.add_parser("targets", help="列出已注册的 SSH 目标")
 
     at = sub.add_parser("audit")
     at.add_argument("--tail", type=int, default=20)
@@ -75,9 +80,13 @@ def main(argv: list[str] | None = None) -> int:
             return code
 
         if args.sub == "approve":
-            path = core.approve(_join(args.command), ttl_seconds=args.ttl, force=args.force)
+            if args.target:
+                remote.get_target(args.target)  # 只允许给注册过的目标建戳
+            path = core.approve(_join(args.command), ttl_seconds=args.ttl, force=args.force,
+                                target=args.target or None)
             stamp = json.loads(path.read_text(encoding="utf-8"))
-            print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s）")
+            where = f"目标 {args.target}" if args.target else "本机"
+            print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s，{where}）")
             return 0
 
         if args.sub == "exec":
@@ -85,7 +94,11 @@ def main(argv: list[str] | None = None) -> int:
             for spec in args.snapshot_cmd:
                 name, _, cmd = spec.partition("::")
                 snap_cmds.append((cmd, name))
-            code, sid, output = core.exec_change(_join(args.command), args.snapshot_file, snap_cmds)
+            cmd = _join(args.command)
+            if args.target:
+                code, sid, output = remote.exec_change(args.target, cmd, args.snapshot_file, snap_cmds)
+            else:
+                code, sid, output = core.exec_change(cmd, args.snapshot_file, snap_cmds)
             if output:
                 print(output, end="" if output.endswith("\n") else "\n")
             if sid:
@@ -93,22 +106,26 @@ def main(argv: list[str] | None = None) -> int:
             return code
 
         if args.sub == "snapshot":
-            sid = core.snapshot_file(args.file) if args.file else core.snapshot_cmd(args.cmd, args.name)
+            if args.target:
+                sid = (remote.snapshot_file(args.target, args.file) if args.file
+                       else remote.snapshot_cmd(args.target, args.cmd, args.name))
+            else:
+                sid = core.snapshot_file(args.file) if args.file else core.snapshot_cmd(args.cmd, args.name)
             print(sid)
             return 0
 
         if args.sub == "rollback":
-            print(core.rollback(args.snapshot_id))
+            print(remote.rollback(args.snapshot_id))  # 远程快照推回，本机走 core
+            return 0
+
+        if args.sub == "targets":
+            print("\n".join(remote.describe()) or "(未注册目标)")
+            print(f"[opsx] 注册文件: {core.STATE_DIR / 'targets.json'}")
             return 0
 
         if args.sub == "list":
-            state = core.collect_state()
-            lines = ["== snapshots =="] + state["snapshots"] if state["snapshots"] else []
-            if state["approvals"]:
-                lines.append("== approvals ==")
-                lines += [f"{a['cmd'][:80]}  (level={a['level']}, ttl={a['ttl']}s)"
-                          for a in state["approvals"]]
-            print("\n".join(lines) or "(空)")
+            targets = remote.describe() or ["(未注册)"]
+            print("\n".join(core.format_state(core.collect_state()) + ["== targets =="] + targets))
             return 0
 
         if args.sub == "audit":
@@ -125,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             import selftest
             return selftest.main()
 
-    except core.OpsxError as e:
+    except (core.OpsxError, remote.RemoteError) as e:
         print(f"[opsx] 错误: {e}", file=sys.stderr)
         return 1
 

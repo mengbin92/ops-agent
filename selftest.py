@@ -6,6 +6,7 @@ os.environ["OPSX_STATE_DIR"] = tempfile.mkdtemp(prefix="opsx-test-")
 
 from pathlib import Path  # noqa: E402
 import json  # noqa: E402
+import re  # noqa: E402
 
 import core  # noqa: E402
 import importlib
@@ -720,6 +721,327 @@ def test_session_prune():
         assert len(remaining) <= 3, remaining
     finally:
         agent_session.SESSION_KEEP = keep
+
+
+def _write_targets():
+    p = Path(core.STATE_DIR, "targets.json")
+    p.write_text(json.dumps({
+        "web1": {"host": "10.0.0.11", "user": "ops", "port": 2222,
+                 "identity": "~/.ssh/id_test"},
+        "db1": {"host": "db.internal.example"},
+    }), encoding="utf-8")
+    return p
+
+
+def test_remote_targets_registry_and_argv():
+    import remote
+    _write_targets()
+    argv = remote.ssh_argv("web1", "uptime")
+    assert argv[0] == "ssh" and argv[-2:] == ["10.0.0.11", "uptime"]
+    assert argv[argv.index("-l") + 1] == "ops"
+    assert argv[argv.index("-p") + 1] == "2222"
+    assert "BatchMode=yes" in argv  # 无人值守不弹密码提示
+    assert any(a.startswith("ConnectTimeout=") for a in argv)
+    assert str(Path("~/.ssh/id_test").expanduser()) in argv
+    # 主机只能来自注册表：未注册 / 非法名一律拒绝
+    for bad in ("evil.example", "../web1", "web1 x", ""):
+        try:
+            remote.ssh_argv(bad, "id")
+            raise AssertionError(f"非法目标应拒绝: {bad!r}")
+        except remote.RemoteError:
+            pass
+
+
+def test_remote_target_fields_cannot_inject_options():
+    """注册表手误（host 以 '-' 开头/含空白）不能被 ssh 当成选项。"""
+    import remote
+    p = _write_targets()
+    data = json.loads(p.read_text())
+    for bad_host in ("-oProxyCommand=touch /tmp/pwned", "10.0.0.11 10.0.0.12"):
+        data["evil"] = {"host": bad_host}
+        p.write_text(json.dumps(data))
+        try:
+            remote.ssh_argv("evil", "id")
+            raise AssertionError(f"应拒绝: {bad_host!r}")
+        except remote.RemoteError:
+            pass
+
+
+def test_remote_exec_snapshot_and_rollback():
+    import subprocess
+    import remote
+    _write_targets()
+    calls = []
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        calls.append((name, cmd, stdin))
+        if cmd.startswith("cat --"):
+            return subprocess.CompletedProcess([], 0, stdout=b"remote-v1\n", stderr=b"")
+        if cmd.startswith("systemctl restart"):
+            return subprocess.CompletedProcess([], 0, stdout=b"restarted\n", stderr=b"")
+        return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        # 本机审批戳不能用于远程目标
+        core.approve("systemctl restart nginx", ttl_seconds=60)
+        code, sid, _ = remote.exec_change("web1", "systemctl restart nginx")
+        assert code == 2 and sid is None and calls == []
+        # 戳按「目标+命令」绑定：web1 的戳不能拿到 db1 用
+        core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
+        assert core.check_stamp("systemctl restart nginx", target="web1") is True
+        assert core.check_stamp("systemctl restart nginx", target="db1") is False
+
+        code, sid, output = remote.exec_change(
+            "web1", "systemctl restart nginx", snapshot_files=["/etc/nginx/nginx.conf"])
+        assert code == 0 and sid and "restarted" in output
+        meta = json.loads(Path(core.STATE_DIR, "snapshots", sid, "meta.json").read_text())
+        assert meta["target"] == "web1"
+        assert meta["items"][0]["src"] == "/etc/nginx/nginx.conf"
+        archived = Path(core.STATE_DIR, "snapshots", sid, meta["items"][0]["dest"])
+        assert archived.read_text() == "remote-v1\n"  # 快照落在本机
+
+        report = remote.rollback(sid)
+        assert "web1:/etc/nginx/nginx.conf" in report
+        pushed = [c for c in calls if c[1].startswith("cat >")]
+        assert pushed and pushed[0][2] == b"remote-v1\n"  # 回滚经 stdin 推回
+
+        # 审计带目标，输出截断入库
+        recs = [json.loads(line) for line in
+                Path(core.STATE_DIR, "audit.jsonl").read_text().splitlines()]
+        ex = [r for r in recs if r["event"] == "exec" and r.get("target") == "web1"]
+        assert ex and ex[-1]["exit_code"] == 0 and "restarted" in ex[-1]["output"]
+
+        # 本机快照仍由 core.rollback 负责
+        with tempfile.TemporaryDirectory(prefix="opsx-local-") as td:
+            f = Path(td) / "local.conf"
+            f.write_text("v1")
+            local_sid = core.snapshot_file(str(f))
+            f.write_text("v2")
+            assert "已恢复文件" in remote.rollback(local_sid) and f.read_text() == "v1"
+    finally:
+        remote._ssh = orig
+
+
+def test_remote_snapshot_failure_aborts():
+    import subprocess
+    import remote
+    _write_targets()
+    core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
+    sdir = Path(core.STATE_DIR, "snapshots")
+    before = len(list(sdir.iterdir())) if sdir.exists() else 0
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"cat: no such file")
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        code, sid, _ = remote.exec_change("web1", "systemctl restart nginx",
+                                          snapshot_files=["/missing.conf"])
+        assert code == 3 and sid is None
+        after = len(list(sdir.iterdir())) if sdir.exists() else 0
+        assert after == before  # 失败快照不留垃圾
+    finally:
+        remote._ssh = orig
+
+
+def test_bash_tool_remote_readonly():
+    import subprocess
+    import remote
+    from agent import tools as agent_tools
+    _write_targets()
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.CompletedProcess([], 0, stdout=b"load 0.10 0.20", stderr=b"")
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        out = agent_tools.dispatch("bash", {"command": "uptime", "target": "web1"},
+                                   agent_tools.ToolContext())
+        assert "target=web1" in out and "load 0.10" in out
+        # 远程写命令仍必须走 ops_exec（不能靠 bash 带戳直连）
+        out = agent_tools.dispatch("bash", {"command": "systemctl restart nginx",
+                                            "target": "web1"}, agent_tools.ToolContext())
+        assert "opsx 拒绝" in out and "ops_exec" in out
+    finally:
+        remote._ssh = orig
+    # 未注册目标：工具层给出可读错误，不发起 ssh（走真实 ssh_argv 校验）
+    out = agent_tools.dispatch("bash", {"command": "uptime", "target": "nope"},
+                               agent_tools.ToolContext())
+    assert "未注册" in out
+
+
+def test_ops_list_shows_targets():
+    from agent import tools as agent_tools
+    _write_targets()
+    out = agent_tools.dispatch("ops_list", {}, agent_tools.ToolContext())
+    assert "== targets ==" in out and "web1" in out and "10.0.0.11" in out
+
+
+def test_opsx_cli_remote_end_to_end():
+    """真实 CLI + 假 ssh 二进制：验证 --target 参数接线、快照/回滚路径。"""
+    import subprocess
+    import sys
+    state = tempfile.mkdtemp(prefix="opsx-cli-remote-")
+    bindir = Path(state, "bin")
+    bindir.mkdir()
+    log = Path(state, "ssh.log")
+    pushed = Path(state, "pushed.bin")
+    fake = bindir / "ssh"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{log}"\n'
+        'case "$*" in\n'
+        "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
+        '  *"cat > "*) cat > "$OPSX_TEST_PUSHED" ;;\n'
+        "  *) printf 'remote-ok\\n' ;;\n"
+        'esac\n'
+    )
+    fake.chmod(0o755)
+    Path(state, "targets.json").write_text(json.dumps({"web1": {"host": "10.0.0.11"}}))
+    env = dict(os.environ, OPSX_STATE_DIR=state,
+               PATH=f"{bindir}:{os.environ['PATH']}", OPSX_TEST_PUSHED=str(pushed))
+    opsx = str(core.REPO_DIR / "opsx")
+
+    def run(*a):
+        return subprocess.run([sys.executable, opsx, *a], capture_output=True, text=True, env=env)
+
+    r = run("targets")
+    assert r.returncode == 0 and "web1" in r.stdout, r.stderr
+    r = run("approve", "--target", "web1", "systemctl", "restart", "nginx")
+    assert r.returncode == 0 and "目标 web1" in r.stdout, r.stderr
+    r = run("exec", "--target", "web1", "--snapshot-file", "/etc/nginx/nginx.conf",
+            "systemctl", "restart", "nginx")
+    assert r.returncode == 0, r.stderr
+    m = re.search(r"snapshot_id: (\S+?)（", r.stdout)
+    assert m, r.stdout
+    sid = m.group(1)
+    r = run("rollback", sid)
+    assert r.returncode == 0 and "web1:/etc/nginx/nginx.conf" in r.stdout, r.stderr
+    assert pushed.read_bytes() == b"remote-v1\n"
+    assert "cat > /etc/nginx/nginx.conf" in log.read_text()
+    # 独立远程快照（opsx snapshot --target --cmd）
+    r = run("snapshot", "--target", "web1", "--cmd", "uptime", "--name", "up")
+    assert r.returncode == 0 and r.stdout.strip(), r.stderr
+    sid2 = r.stdout.strip()
+    meta2 = json.loads(Path(state, "snapshots", sid2, "meta.json").read_text())
+    assert meta2["target"] == "web1" and meta2["items"][0]["cmd"] == "uptime"
+    assert Path(state, "snapshots", sid2, "cmd-up.txt").read_text() == "remote-ok\n"
+    # 未注册目标：明确指出配置缺失，且不发起 ssh
+    r = run("exec", "--target", "nope", "systemctl", "restart", "nginx")
+    assert r.returncode == 1 and "未注册" in r.stderr, (r.returncode, r.stderr)
+    assert not log.read_text().count("nope")
+
+
+def test_snapshot_cmds_also_guarded():
+    """快照抓取命令同样过守门：不能把写操作藏进 exec 的 snapshot_cmds。"""
+    import tempfile as tf
+    with tf.TemporaryDirectory() as td:
+        cap_target = f"{td}/cap-xyz"
+        main = f"echo main > {td}/m.txt"
+        core.approve(main, ttl_seconds=60)
+        code, sid, _ = core.exec_change(main, snapshot_cmds=[(f"rm -rf {cap_target}", "")])
+        assert code == 2 and sid is None
+        assert not Path(cap_target).exists()
+        # 已单独审批过的抓取命令可以使用
+        core.approve("echo cap-ok", ttl_seconds=60)
+        code, sid, _ = core.exec_change(main, snapshot_cmds=[("echo cap-ok", "cap")])
+        assert code == 0 and sid
+        cap = Path(core.STATE_DIR, "snapshots", sid, "cmd-cap.txt")
+        assert "cap-ok" in cap.read_text()
+
+
+def test_snapshot_id_path_traversal_rejected():
+    """snapshot_id 来自模型：带路径分隔符就能借 rollback 覆盖任意文件。"""
+    import shutil
+    import remote
+    outside = Path(core.STATE_DIR).parent / "opsx-trav-check"
+    victim = Path(tempfile.mkdtemp(prefix="opsx-victim-")) / "v.txt"
+    victim.write_text("keep")
+    outside.mkdir(exist_ok=True)
+    (outside / "meta.json").write_text(json.dumps({"items": [
+        {"type": "file", "dest": str(victim), "src": str(victim), "mode": 0o644}]}))
+    try:
+        for bad in ("../../opsx-trav-check", "/etc", "..", "a/b", ""):
+            for mod in (core, remote):
+                try:
+                    mod.rollback(bad)
+                    raise AssertionError(f"应拒绝非法快照 id: {bad!r}")
+                except core.OpsxError:
+                    pass
+        assert victim.read_text() == "keep"
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+        shutil.rmtree(victim.parent, ignore_errors=True)
+
+
+def test_snapshot_dirs_private():
+    """快照里可能有密钥/配置：目录必须只有本人可读（远程拉回的文件同受保护）。"""
+    assert core.begin_snapshot()[1].stat().st_mode & 0o077 == 0
+    core.audit("perm-probe")
+    assert core.STATE_DIR.stat().st_mode & 0o077 == 0
+
+
+def test_remote_timeout_paths():
+    import subprocess
+    import remote
+    _write_targets()
+    core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
+
+    def timeout_ssh(name, cmd, stdin=None, timeout=120):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    orig = remote._ssh
+    remote._ssh = timeout_ssh
+    try:
+        assert remote.run("web1", "uptime")[0] == 4
+        code, sid, output = remote.exec_change("web1", "systemctl restart nginx")
+        assert code == 4 and sid is None and "超时" in output
+    finally:
+        remote._ssh = orig
+
+
+def test_remote_rollback_failure_reported():
+    import subprocess
+    import remote
+    _write_targets()
+    core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        if cmd.startswith("cat --"):
+            return subprocess.CompletedProcess([], 0, stdout=b"v1", stderr=b"")
+        if cmd.startswith("systemctl restart"):
+            return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        return subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"denied")
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        code, sid, _ = remote.exec_change("web1", "systemctl restart nginx",
+                                          snapshot_files=["/etc/nginx/nginx.conf"])
+        assert code == 0 and sid
+        try:
+            remote.rollback(sid)
+            raise AssertionError("推回失败应报错")
+        except remote.RemoteError as e:
+            assert "回滚失败" in str(e)
+    finally:
+        remote._ssh = orig
+
+
+def test_ops_list_survives_corrupt_registry():
+    from agent import tools as agent_tools
+    core.snapshot_cmd("echo corrupt-reg", name="cr")
+    p = Path(core.STATE_DIR, "targets.json")
+    p.write_text("{not json", encoding="utf-8")
+    try:
+        out = agent_tools.dispatch("ops_list", {}, agent_tools.ToolContext())
+        assert "== snapshots ==" in out and "== targets ==" in out and "解析失败" in out
+    finally:
+        _write_targets()
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -27,6 +27,17 @@
   `ops_exec`，杜绝绕过快照）；RPC ask_user 同线程死锁已修（stdin 独立读线程）；
   审批戳过期清理 + 坏戳容错；list 三处重复收敛为 `core.collect_state()`；
   sessions 目录封顶 300。50 项自测全绿。
+- **M4 ✅（2026-10-19）远程执行通道**：`remote.py`（SSH 目标注册表 `~/.ops-agent/targets.json`
+  + 远程快照/回滚）。守门仍在本机：审批戳按「目标+命令」绑定（`core.cmd_hash(cmd, target)`），
+  本机戳与跨目标复用戳都被拒；远程文件用 `cat` 拉回本地快照存档，回滚经 stdin 覆盖写回
+  （保留 inode/权限）；目标机零安装。主机只能来自注册表（模型不能自选主机），目标字段
+  空白/前导 `-` 拒绝以防 ssh 选项注入；`BatchMode=yes` 要求免密。工具层 `bash`/`ops_approve`/
+  `ops_exec` 支持 `target`，`ops_list` 列出目标；CLI `opsx targets|exec|snapshot|approve --target`，
+  `opsx rollback` 自动识别远程快照；MCP 形态保持本机执行（宿主可调 CLI）。
+  顺带补上 `exec` 快照抓取命令的守门（此前可把写操作藏进 `snapshot_cmds` 绕过审批戳）。
+  评审加固：快照 id 形状校验（此前 `rollback("../../x")` 可读写快照目录之外）；
+  快照/状态目录 0700（远程拉回的配置可能含密钥）；注册表损坏时 list 不再整体失败；
+  list 格式收敛到 `core.format_state()`。63 项自测全绿。
 
 ## 1. 背景与目标
 
@@ -115,16 +126,18 @@ cordis（Context + 插件生命周期）为骨架的**单一职责包**组合，
 - **M0 ✅（2026-10-19）**：loop + OpenAI provider + bash/read/ask_user 工具 + REPL/-p/RPC + 会话 v1 持久化。
   追加落地：Markdown 终端渲染、`/copy` 剪贴板、readline 历史。
 - **M1 ✅（2026-10-19）**：SSE 流式输出（渲染器整段重绘支持增量）；compaction（basic：超阈值裁剪早期 tool result）；`/resume`。
-- **M2**：Anthropic provider；工具输出 spill 落盘（仿 dsh-output-retention，当前仅截断）；审批戳 revoke/过期清理；exec 超时与输出入审计（P0 安全债）；RPC 形态支持流式事件推送。
+- **M2**：Anthropic provider；工具输出 spill 落盘（仿 dsh-output-retention，当前仅截断）；审批戳 revoke（过期清理已做）；exec 超时与输出入审计（P0 安全债，已提前清偿）；RPC 形态支持流式事件推送。
 - **M3**：skills 目录（仿 dsh-skill-filesystem：按需加载的运维 playbook）；子代理（只读排查代理并行跑）。
-- **M4**：远程执行通道（SSH 目标注册表，远程快照），把守门能力延伸到 ops.md 声称的远程场景。
+- **M4 ✅（2026-10-19）**：远程执行通道——SSH 目标注册表（只认注册目标）、远程快照拉回本地存档、
+  回滚推回目标机、审批戳按目标绑定；把守门能力延伸到 ops.md 声称的远程场景。
 - **M5**：goal/schedule（定时巡检）、workflow 编排；按 DSH 的 cordis 思路评估是否引入插件框架（届时再议，M0 不引入）。
 
 ## 6. 目录布局
 
 ```
 ops-agent/
-  core.py / opsx / config.yaml / mcp_server.py   # 现状，不动
+  core.py / opsx / config.yaml / mcp_server.py   # 现状；opsx 增加 --target/targets 子命令
+  remote.py     # SSH 目标注册表 + 远程快照/回滚（M4）
   agent/
     __init__.py
     llm.py        # OpenAI 兼容 provider（urllib，可选 SSE）
