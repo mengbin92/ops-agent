@@ -142,11 +142,21 @@ def copy_to_clipboard(text: str) -> str:
 
 
 class StreamPrinter:
-    """流式增量渲染：每次更新清除已打印区域并重绘完整文本。"""
+    """流式增量渲染：每次更新清除已打印区域并重绘完整文本。
+
+    内容超出屏幕可重绘行数后，光标最多只能回到屏幕顶（块起点已滚出屏幕），
+    继续整段重绘会把同一内容反复打印——此时停止重绘，只追加增量。
+    """
 
     def __init__(self):
         self._buf = ""
         self._printed_rows = 0
+        self._overflow = False
+
+    @staticmethod
+    def _max_rows() -> int:
+        """可重绘的行数上限：留两行余量，避免顶到屏幕底。"""
+        return max(4, shutil.get_terminal_size().lines - 2)
 
     @staticmethod
     def _rows_of(text: str) -> int:
@@ -169,11 +179,25 @@ class StreamPrinter:
 
     def feed(self, delta: str) -> None:
         self._buf += delta
+        if self._overflow:
+            sys.stdout.write(delta)
+            sys.stdout.flush()
+            return
+        if self._rows_of(markdown.render(self._buf)) > self._max_rows():
+            # 超出屏幕：旧块保持不动，之后只追加增量（尾部为未渲染原文）
+            self._overflow = True
+            sys.stdout.write(delta)
+            sys.stdout.flush()
+            return
         self._repaint()
 
     def finish(self) -> str:
-        self._repaint()
-        text, self._buf, self._printed_rows = self._buf, "", 0
+        if self._overflow:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            self._repaint()
+        text, self._buf, self._printed_rows, self._overflow = self._buf, "", 0, False
         return text
 
 

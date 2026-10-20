@@ -1711,6 +1711,11 @@ def test_ssh_readonly_extended_command_set():
         'ssh user@10.0.0.1 "hostname; date; ps aux"',
         'ssh neo@10.0.0.1 "echo ok"',
         'ssh neo@10.0.0.1 "systemctl status nginx"',
+        'ssh neo@10.0.0.1 "systemctl list-units --state=failed --no-pager"',
+        'ssh neo@10.0.0.1 "systemctl --failed"',
+        'ssh neo@10.0.0.1 "systemctl is-system-running"',
+        'ssh neo@10.0.0.1 "w"',
+        'ssh neo@10.0.0.1 "who"',
         "ssh neo@10.0.0.1 \"find /var/log -name '*.log'\"",
     ):
         assert core.classify(cmd)[0] == "R0", cmd
@@ -1727,10 +1732,39 @@ def test_ssh_readonly_extended_command_set():
 
 def test_echo_is_readonly():
     for cmd in ('echo hello', 'echo "---"', 'ls /tmp; echo "done"',
-                'echo 中文标记'):
+                'echo 中文标记', 'w', 'who'):
         assert core.classify(cmd)[0] == "R0", cmd
     for cmd in ('echo x > /tmp/x', 'echo $(cat /etc/passwd)', 'echo x | tee /tmp/x'):
         assert core.classify(cmd)[0] != "R0", cmd
+
+
+
+
+def test_stream_printer_overflow_appends_without_repaint():
+    """内容超过屏幕可重绘行数后不再整段重绘（否则同一内容被反复打印）。"""
+    import io
+    import os
+    import shutil
+    from agent import repl
+    orig_size = shutil.get_terminal_size
+    shutil.get_terminal_size = lambda: os.terminal_size((80, 12))  # 12 行屏，可重绘 10 行
+    buf = io.StringIO()
+    import sys as _sys
+    orig_out = _sys.stdout
+    _sys.stdout = buf
+    try:
+        printer = repl.StreamPrinter()
+        for i in range(1, 31):
+            printer.feed(f"第{i}行内容\n")
+        text = printer.finish()
+    finally:
+        _sys.stdout = orig_out
+        shutil.get_terminal_size = orig_size
+    out = buf.getvalue()
+    # 溢出前最多重绘 ~10 次；若仍在整段重绘（bug）第 1 行会出现 30 次
+    assert out.count("第1行内容") <= 11, out.count("第1行内容")
+    assert out.count("第30行内容") == 1
+    assert "第1行内容" in text and "第30行内容" in text
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

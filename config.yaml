@@ -5,11 +5,11 @@ readonly_patterns:
   - ^journalctl\b
   - ^docker\s+(ps|images|logs|inspect|stats|port|top|version|info)\b
   - ^docker\s+compose\s+(ps|logs|config|top)\b
-  - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|env|which|whoami|id|echo)\b
+  - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|env|which|whoami|id|echo|w|who)\b
   # ssh 直连（未注册主机的只读排查）：远程命令集与本机白名单对齐（不含 env——
   # 远程环境变量更可能含生产密钥，不进模型上下文）；不允许 -o 选项
   # （ProxyCommand 等可执行本地命令），单引号也不放行——统一用双引号
-  - ^ssh\s+\S+\s+"(systemctl\s+status|journalctl|docker\s+ps|kubectl\s+get|cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|which|whoami|id|echo)\b
+  - ^ssh\s+\S+\s+"(systemctl\s+(status|list-units|list-timers|show|is-active|is-enabled|list-dependencies|is-system-running|--failed)|journalctl|docker\s+ps|kubectl\s+get|cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|hostname|date|uptime|which|whoami|id|echo|w|who)\b
   - ^git\s+(status|log|diff|show|blame|rev-parse|ls-files|ls-remote|rev-list|cat-file|for-each-ref|shortlog|describe|reflog|grep|count-objects)\b
   - ^git\s+branch\s*$
   - ^git\s+branch\s+(-[avr]+|--all|--list)\s*$
