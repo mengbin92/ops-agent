@@ -1767,6 +1767,52 @@ def test_stream_printer_overflow_appends_without_repaint():
     assert "第1行内容" in text and "第30行内容" in text
 
 
+def test_memory_store_and_recall():
+    from agent import memory
+    p = memory.path()
+    p.unlink(missing_ok=True)
+    assert memory.recall() == ""
+    entry = memory.add("user01-X99：Ubuntu，systemd 255，9 个 docker 容器健康")
+    assert entry.startswith("- [") and "user01-X99" in entry
+    assert oct(p.stat().st_mode & 0o777) == "0o600"  # 主机信息 0600
+    memory.add("多行条目\n续行缩进")
+    recalled = memory.recall()
+    assert "user01-X99" in recalled and "\n  续行缩进" in recalled
+    for bad, needle in (("x" * 501, "太长"), ("   ", "不能为空")):
+        try:
+            memory.add(bad)
+            raise AssertionError(f"应拒绝：{needle}")
+        except memory.MemoryError as e:
+            assert needle in str(e)
+    p.write_text("旧" * 9000 + "\n新事实\n", encoding="utf-8")
+    tail = memory.recall()
+    assert "新事实" in tail and "早期记忆已省略" in tail and len(tail) < 9000
+    p.unlink(missing_ok=True)
+
+
+def test_memory_tool_and_system_injection():
+    from agent import loop, tools as agent_tools
+    p = core.STATE_DIR / "memory.md"
+    p.unlink(missing_ok=True)
+    # 无记忆时 system prompt 原样
+    assert loop._default_system() == loop.SYSTEM_PROMPT
+    ctx = agent_tools.ToolContext()
+    out = agent_tools.dispatch("remember", {"text": "db-01 的 5432 是只读备库"}, ctx)
+    assert "已记录" in out
+    system = loop._default_system()
+    assert "db-01" in system and "长期记忆" in system
+    # 只读上下文（子代理/定时任务）不可用 remember
+    ro = agent_tools.ToolContext(allowed=agent_tools.SUBAGENT_TOOLS)
+    assert "只读上下文" in agent_tools.dispatch("remember", {"text": "x"}, ro)
+    assert agent_tools.SCHEDULED_TOOLS.isdisjoint({"remember"})
+    # 审计留痕
+    line = Path(core.STATE_DIR, "audit.jsonl").read_text().strip().splitlines()[-1]
+    assert json.loads(line)["event"] == "memory-add"
+    # 空内容经工具返回可读错误
+    assert "不能为空" in agent_tools.dispatch("remember", {"text": " "}, ctx)
+    p.unlink(missing_ok=True)
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

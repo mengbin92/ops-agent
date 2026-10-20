@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 import remote  # noqa: E402
 from . import goal as goal_mod  # noqa: E402
+from . import memory as memory_mod  # noqa: E402
 from . import schedule as schedule_mod  # noqa: E402
 from . import session as session_mod  # noqa: E402
 from . import skills  # noqa: E402
@@ -348,6 +349,15 @@ def _goal(args: dict, ctx: ToolContext) -> str:
         return f"[目标] {e}"
 
 
+def _remember(args: dict, ctx: ToolContext) -> str:
+    try:
+        entry = memory_mod.add(args.get("text") or "")
+    except memory_mod.MemoryError as e:
+        return f"[记忆] {e}"
+    return (f"[记忆] 已记录：{entry.splitlines()[0]}"
+            f"（之后每轮自动加载；文件 {memory_mod.path()}，过时条目可手动删除）")
+
+
 def _ops_list(args: dict, ctx: ToolContext) -> str:
     targets = remote.describe() or ["(未注册，配置 ~/.ops-agent/targets.json)"]
     return "\n".join(core.format_state(core.collect_state()) + ["== targets =="] + targets)
@@ -435,6 +445,14 @@ REGISTRY: dict[str, dict] = {
                            "reason": {"type": "string", "description": "blocked 的原因"}},
                           ["action"]),
         "handler": _goal, "read_only": False,
+    },
+    "remember": {
+        "schema": _schema("remember",
+                          "记入长期记忆（跨会话自动加载）：确认过的主机事实（OS/服务清单/已排除项）、"
+                          "用户偏好、环境约定。只记结论（不超过 500 字符）；一次性状态不要记。",
+                          {"text": {"type": "string", "description": "要记住的事实结论"}},
+                          ["text"]),
+        "handler": _remember, "read_only": False,
     },
     "ops_approve": {
         "schema": _schema("ops_approve",

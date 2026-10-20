@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from . import llm, session as sess_mod, tools
+from . import llm, memory as memory_mod, session as sess_mod, tools
 
 MAX_TURNS = 40
 
@@ -84,12 +84,26 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
   每轮结束会自动续跑，完成用 action=complete，受阻用 action=blocked（说明原因）。
 - 单轮能完成的任务不要建目标；目标续跑中的写操作仍逐次需要用户确认。
 
+## 长期记忆（remember）
+- 确认过的主机事实（OS/平台、服务清单、已排除的告警项）、用户偏好、环境约定：
+  用 remember 记入长期记忆，之后每轮自动加载（见文末"长期记忆"节），不要重复排查已知事实。
+- 一次性状态（当前负载、单次报错）不要记；反复出现的排查模式提示用户晋升进 skills/*.md。
+- 记忆与现状冲突时以现状为准，并用 remember 记录更正。
+
 ## 报告义务
 每次变更执行后报告：目标（本机/远程）、执行的命令、退出码、snapshot_id（用 ops_list 查询）、回滚命令 opsx rollback <id>。
 
 ## 输出
 - 默认使用中文。
 - 只读排查时先给结论再给证据（命令+关键输出摘要）。"""
+
+
+def _default_system() -> str:
+    """主代理 system prompt：拼装长期记忆（子代理等传入独立 system 时不注入）。"""
+    mem = memory_mod.recall()
+    if not mem:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n## 长期记忆（自动加载，可能过时，以现状为准）\n" + mem
 
 
 SUBAGENT_PROMPT = """你是 ops-agent 的只读排查子代理。主代理把独立检查任务并行下发给你，
@@ -118,7 +132,7 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
     session.append({"role": "user", "content": user_input})
     final_text = ""
     for _ in range(max_turns):
-        messages = compact([{"role": "system", "content": system or SYSTEM_PROMPT}]
+        messages = compact([{"role": "system", "content": system or _default_system()}]
                            + session.messages)
         msg = llm.chat(messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta)
         # 规范化为可持久化结构

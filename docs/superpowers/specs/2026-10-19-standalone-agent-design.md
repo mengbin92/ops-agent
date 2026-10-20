@@ -81,6 +81,14 @@
   屏幕行数后光标无法回到块起点（顶部已滚出），同一内容被反复打印，现超过屏幕可重绘行数
   后停止重绘、只追加增量。85 项自测全绿。
 
+- **长期记忆 ✅（2026-10-20）**：`agent/memory.py` + `remember` 工具——确认过的主机事实
+  （OS/服务清单/已排除项）、用户偏好、环境约定追加进 `~/.ops-agent/memory.md`
+  （0600，单条 ≤500 字符，写审计 `memory-add`）；`run_turn` 每轮把文件尾部 8K 字符
+  注入主代理 system prompt（子代理独立提示不注入；只读上下文——子代理/定时任务——
+  不可用 remember），跨会话不再重复排查已知事实。晋升路径：反复出现的排查模式由人
+  确认后手动写进 skills/*.md，memory 保持流水。明确不做向量检索/框架——纯文本追加
+  在该量级足够（升级路径：按主机拆文件或 grep 召回）。87 项自测全绿。
+
 ## 1. 背景与目标
 
 ops-agent 现状是一个**守门工具**（guard rail）：`core.py` 风险分级 + 审批戳 + 快照 + 审计，
@@ -202,6 +210,7 @@ ops-agent/
     llm_anthropic.py  # Anthropic 原生 Messages provider（消息/工具双向转换）
     skills.py     # skills 目录：catalog() / load()，仓库 + 用户目录覆盖
     goal.py       # 长目标持久化 + 续跑预算
+    memory.py     # 长期记忆：memory.md 追加 + 尾部注入 system prompt
     schedule.py   # 定时巡检：注册表 / 到期执行 / daemon / --once
     workflow.py   # 巡检工作流定义：catalog() / load()
     tools.py      # 工具注册表 + 内建工具

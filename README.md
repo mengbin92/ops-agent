@@ -173,6 +173,13 @@ agent 里先 `workflow`（不带 name）列目录，再 `workflow {"name": "dail
 `opsagent schedule add --daily 09:00 "运行 workflow daily-inspection 并报告异常"` 就是一套
 完整的每日巡检。
 
+**长期记忆（remember）**：排查中确认的主机事实（OS/服务清单/已排除的告警项）、用户偏好、
+环境约定，agent 用 `remember` 工具记入 `~/.ops-agent/memory.md`（0600，单条 ≤500 字符），
+之后每轮自动加载到 system prompt——下次会话不再重复排查已知事实。只记结论，一次性状态
+不记；反复出现的排查模式建议晋升进 `skills/*.md`（沉淀为 playbook，memory 保持流水）。
+过时条目直接编辑该文件删除即可；记忆与现状冲突时 agent 以现状为准并记录更正。
+定时巡检等只读形态不可用 `remember`（无人值守不积累噪声），但能读到已有记忆。
+
 ## 防线说明
 
 两层防线：① Agent 流程纪律（变更单 → AskUserQuestion → opsx exec）；
