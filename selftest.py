@@ -69,8 +69,8 @@ def test_snapshot_cmd():
 
 
 def test_exec_aborts_on_snapshot_failure():
-    core.approve("echo hi", ttl_seconds=60)
-    code, sid, _ = core.exec_change("echo hi", snapshot_files=["/nonexistent/path/xyz"])
+    core.approve("printf hi", ttl_seconds=60)
+    code, sid, _ = core.exec_change("printf hi", snapshot_files=["/nonexistent/path/xyz"])
     assert code == 3 and sid is None
 
 
@@ -87,8 +87,8 @@ def test_exec_happy():
 
 
 def test_exec_output_captured_to_audit():
-    core.approve("echo audit-capture-check", ttl_seconds=60)
-    code, sid, output = core.exec_change("echo audit-capture-check")
+    core.approve("printf audit-capture-check", ttl_seconds=60)
+    code, sid, output = core.exec_change("printf audit-capture-check")
     assert code == 0 and "audit-capture-check" in output
     last = Path(core.STATE_DIR, "audit.jsonl").read_text().strip().splitlines()[-1]
     rec = json.loads(last)
@@ -949,8 +949,8 @@ def test_snapshot_cmds_also_guarded():
         assert code == 2 and sid is None
         assert not Path(cap_target).exists()
         # 已单独审批过的抓取命令可以使用
-        core.approve("echo cap-ok", ttl_seconds=60)
-        code, sid, _ = core.exec_change(main, snapshot_cmds=[("echo cap-ok", "cap")])
+        core.approve("printf cap-ok", ttl_seconds=60)
+        code, sid, _ = core.exec_change(main, snapshot_cmds=[("printf cap-ok", "cap")])
         assert code == 0 and sid
         cap = Path(core.STATE_DIR, "snapshots", sid, "cmd-cap.txt")
         assert "cap-ok" in cap.read_text()
@@ -1696,6 +1696,41 @@ def test_workflow_run_and_validation():
     assert "结果<第一步>" in calls[1][0] and "{prev}" not in calls[1][0]
     assert "错误" in agent_tools.dispatch("workflow", {"name": "no-such"}, ctx)
     assert "非法" in agent_tools.dispatch("workflow", {"name": "../x"}, ctx)
+
+
+
+
+def test_ssh_readonly_extended_command_set():
+    """ssh 直连只读白名单：远程命令集与本机对齐（uptime/free/df 等），且带词边界防前缀注入。"""
+    for cmd in (
+        'ssh neo@10.0.0.1 "uptime"',
+        'ssh neo@10.0.0.1 "free -h"',
+        'ssh neo@10.0.0.1 "df -h"',
+        'ssh neo@10.0.0.1 "cat /var/log/nginx/error.log"',
+        'ssh neo@10.0.0.1 "uptime; uname -a; free -h; df -h"',
+        'ssh user@10.0.0.1 "hostname; date; ps aux"',
+        'ssh neo@10.0.0.1 "echo ok"',
+        'ssh neo@10.0.0.1 "systemctl status nginx"',
+        "ssh neo@10.0.0.1 \"find /var/log -name '*.log'\"",
+    ):
+        assert core.classify(cmd)[0] == "R0", cmd
+    for cmd in (
+        'ssh neo@10.0.0.1 "systemctl restart nginx"',
+        'ssh -o ProxyCommand=cat host "uptime"',   # 选项注入仍拒绝
+        'ssh neo@10.0.0.1 "uptime > /tmp/x"',
+        'ssh neo@10.0.0.1 "echo $(cat /etc/passwd)"',
+        'ssh neo@10.0.0.1 "psql -c \\"DROP TABLE t\\""',  # ps 前缀注入拒绝（psql 不是 ps）
+        'ssh neo@10.0.0.1 "find / -delete"',
+    ):
+        assert core.classify(cmd)[0] != "R0", cmd
+
+
+def test_echo_is_readonly():
+    for cmd in ('echo hello', 'echo "---"', 'ls /tmp; echo "done"',
+                'echo 中文标记'):
+        assert core.classify(cmd)[0] == "R0", cmd
+    for cmd in ('echo x > /tmp/x', 'echo $(cat /etc/passwd)', 'echo x | tee /tmp/x'):
+        assert core.classify(cmd)[0] != "R0", cmd
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
