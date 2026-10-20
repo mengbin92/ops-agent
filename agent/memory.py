@@ -18,7 +18,8 @@ import core  # noqa: E402
 
 MEMORY_LIMIT = 8000   # 注入 system prompt 的最大字符（取文件尾部，新事实优先）
 ENTRY_LIMIT = 500     # 单条记忆长度上限：只记结论，不贴输出
-HEADER = "# ops-agent 长期记忆（remember 工具追加；过时条目手动删除）\n"
+HEADER = ("# ops-agent 长期记忆（remember 工具追加；过时条目手动删除）\n"
+          "# 写法约定：主机: 属性 = 值；服务 X depends_on db-01；同类事实用同一词汇\n")
 
 
 class MemoryError(Exception):

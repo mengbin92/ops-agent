@@ -449,7 +449,8 @@ REGISTRY: dict[str, dict] = {
     "remember": {
         "schema": _schema("remember",
                           "记入长期记忆（跨会话自动加载）：确认过的主机事实（OS/服务清单/已排除项）、"
-                          "用户偏好、环境约定。只记结论（不超过 500 字符）；一次性状态不要记。",
+                          "用户偏好、环境约定。只记结论（不超过 500 字符）；一次性状态不要记。"
+                          "写法约定：`主机: 属性 = 值`、依赖记 `X depends_on Y`，同类事实用词一致。",
                           {"text": {"type": "string", "description": "要记住的事实结论"}},
                           ["text"]),
         "handler": _remember, "read_only": False,

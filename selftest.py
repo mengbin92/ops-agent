@@ -1778,6 +1778,7 @@ def test_memory_store_and_recall():
     memory.add("多行条目\n续行缩进")
     recalled = memory.recall()
     assert "user01-X99" in recalled and "\n  续行缩进" in recalled
+    assert "写法约定" not in recalled  # 多行头注释不进入注入内容
     for bad, needle in (("x" * 501, "太长"), ("   ", "不能为空")):
         try:
             memory.add(bad)
