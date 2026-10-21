@@ -33,7 +33,7 @@ def _targets_file() -> Path:
 
 
 def _check_name(name: str) -> str:
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise RemoteError(f"非法的目标名: {name!r}（只允许字母数字._-）")
     return name
 
@@ -45,7 +45,7 @@ def load_targets() -> dict[str, dict]:
         return {}
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         raise RemoteError(f"目标注册表解析失败 {f}: {e}") from e
     if not isinstance(data, dict):
         raise RemoteError(f"目标注册表须为 {{名称: 配置}} 对象: {f}")
@@ -69,7 +69,7 @@ def _str_field(t: dict, key: str) -> str:
     v = t.get(key)
     if v in (None, ""):
         return ""
-    if not isinstance(v, str) or v[0] == "-" or re.search(r"\s", v):
+    if not isinstance(v, str) or v[0] == "-" or "\x00" in v or re.search(r"\s", v):
         raise RemoteError(f"目标字段 {key} 非法: {v!r}")
     return v
 
@@ -81,13 +81,13 @@ def ssh_argv(name: str, remote_cmd: str | None = None) -> list[str]:
     if not host:
         raise RemoteError(f"目标 {name} 缺 host 字段")
     ct = t.get("connect_timeout", CONNECT_TIMEOUT)
-    if not isinstance(ct, int) or ct <= 0:
+    if type(ct) is not int or ct <= 0:
         raise RemoteError(f"目标 {name} 的 connect_timeout 非法: {ct!r}")
     # BatchMode：不弹密码提示（agent 无人值守会挂死）；要求密钥/agent 免密。
     argv = [SSH, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={ct}"]
     port = t.get("port")
     if port is not None:
-        if not isinstance(port, int) or not 0 < port < 65536:
+        if type(port) is not int or not 0 < port < 65536:
             raise RemoteError(f"目标 {name} 的 port 非法: {port!r}")
         argv += ["-p", str(port)]
     user = _str_field(t, "user")
@@ -96,8 +96,8 @@ def ssh_argv(name: str, remote_cmd: str | None = None) -> list[str]:
     ident = _str_field(t, "identity")
     if ident:
         argv += ["-i", str(Path(ident).expanduser())]
-    opts = t.get("options") or []
-    if not isinstance(opts, list) or not all(isinstance(o, str) for o in opts):
+    opts = t.get("options", [])
+    if not isinstance(opts, list) or not all(isinstance(o, str) and "\x00" not in o for o in opts):
         raise RemoteError(f"目标 {name} 的 options 须为字符串数组")
     argv += opts
     argv.append(host)
@@ -116,6 +116,8 @@ def _ssh(name: str, remote_cmd: str, stdin: bytes | None = None,
         raise RemoteError(f"找不到 ssh 客户端: {e}") from e
     except PermissionError as e:
         raise RemoteError(f"ssh 不可执行: {argv[0]}: {e}") from e
+    except (OSError, ValueError) as e:
+        raise RemoteError(f"ssh 执行失败: {e}") from e
 
 
 def _text(r: subprocess.CompletedProcess) -> str:
@@ -129,11 +131,13 @@ def run(name: str, cmd: str, timeout: int = IO_TIMEOUT) -> tuple[int, str]:
     try:
         r = _ssh(name, cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return 4, f"[opsx] 超时：远程命令超过 {timeout}s 未结束，已终止"
+        return 4, f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认"
     return r.returncode, _text(r)
 
 
 def _dest(d: Path, path_str: str) -> Path:
+    if not isinstance(path_str, str) or not path_str.startswith("/") or "\x00" in path_str:
+        raise RemoteError(f"远程快照须用绝对路径: {path_str!r}")
     parts = [p for p in str(path_str).split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise RemoteError(f"快照路径非法: {path_str}")
@@ -163,7 +167,7 @@ def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list) -> None:
         raise RemoteError(f"远程抓取状态超时: {cmd}") from e
     if r.returncode != 0:
         raise RemoteError(f"远程抓取状态失败({r.returncode}): {cmd}: {_text(r)[:300]}")
-    fname = f"cmd-{(label or 'output').replace('/', '_')}.txt"
+    fname = core._snapshot_output_name(label, items)
     (d / fname).write_bytes(r.stdout)
     items.append({"type": "cmd", "remote": name, "cmd": cmd, "name": label, "output": fname})
 
@@ -180,24 +184,30 @@ def snapshot_file(name: str, path_str: str) -> str:
     items: list = []
     try:
         _pull_file(name, path_str, d, items)
+        _write_meta(d, sid, name, items)
     except (RemoteError, OSError):
         shutil.rmtree(d, ignore_errors=True)
         raise
-    _write_meta(d, sid, name, items)
     core.audit("snapshot", id=sid, kind="file", target=name, src=path_str)
+    core.prune_snapshots()
     return sid
 
 
 def snapshot_cmd(name: str, cmd: str, label: str = "") -> str:
+    get_target(name)
+    code, msg = core.check(cmd, target=name)
+    if code != 0:
+        raise RemoteError(msg)
     sid, d = core.begin_snapshot()
     items: list = []
     try:
         _capture_cmd(name, cmd, label, d, items)
+        _write_meta(d, sid, name, items)
     except (RemoteError, OSError):
         shutil.rmtree(d, ignore_errors=True)
         raise
-    _write_meta(d, sid, name, items)
     core.audit("snapshot", id=sid, kind="cmd", target=name, cmd=cmd)
+    core.prune_snapshots()
     return sid
 
 
@@ -215,13 +225,14 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
     code, msg = core.check(cmd, target=name)
     if code != 0:
         print(msg, file=sys.stderr)
-        return code, None, ""
+        return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = core.check(c, target=name)
         if code != 0:
             core.audit("exec-abort", cmd=cmd, target=name, reason=f"快照命令未通过守门: {c}")
-            print(f"[opsx] 快照命令未通过守门，已中止执行: {c}", file=sys.stderr)
-            return 2, None, ""
+            output = f"[opsx] 快照命令未通过守门，已中止执行: {c}"
+            print(output, file=sys.stderr)
+            return 2, None, output
     sid = None
     if snapshot_files or snapshot_cmds:
         sid, d = core.begin_snapshot()
@@ -231,18 +242,19 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
                 _pull_file(name, f, d, items)
             for c, label in snapshot_cmds:
                 _capture_cmd(name, c, label, d, items)
+            _write_meta(d, sid, name, items)
         except (RemoteError, OSError, subprocess.SubprocessError) as e:
             shutil.rmtree(d, ignore_errors=True)
-            print(f"[opsx] 远程快照失败，已中止执行: {e}", file=sys.stderr)
+            output = f"[opsx] 远程快照失败，已中止执行: {e}"
+            print(output, file=sys.stderr)
             core.audit("exec-abort", cmd=cmd, target=name, reason=str(e))
-            return 3, None, ""
-        _write_meta(d, sid, name, items)
+            return 3, None, output
     try:
         r = _ssh(name, cmd, timeout=timeout)
         output = _text(r)
         exit_code = r.returncode
     except subprocess.TimeoutExpired:
-        output = f"[opsx] 超时：远程命令超过 {timeout}s 未结束，已终止"
+        output = f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认"
         exit_code = 4
     core.audit("exec", cmd=cmd, target=name, snapshot_id=sid, exit_code=exit_code,
                output=output[:core.EXEC_AUDIT_OUTPUT])
@@ -250,19 +262,9 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
     return exit_code, sid, output
 
 
-def _meta(snapshot_id: str) -> tuple[Path, dict]:
-    d = core.snapshot_dir(snapshot_id)  # 校验 id 形状，防路径穿越
-    if not d.exists():
-        raise RemoteError(f"快照不存在: {snapshot_id}")
-    try:
-        return d, json.loads((d / "meta.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise RemoteError(f"快照元数据损坏: {snapshot_id}: {e}") from e
-
-
 def rollback(snapshot_id: str) -> str:
     """回滚：远程快照推回目标机，本机快照交给 core.rollback。"""
-    d, meta = _meta(snapshot_id)
+    d, meta = core.load_snapshot(snapshot_id)
     target = meta.get("target")
     if not target:
         return core.rollback(snapshot_id)

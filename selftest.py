@@ -283,6 +283,87 @@ def test_mcp_handshake():
         c.close()
 
 
+def test_tool_schema_validation_before_side_effects():
+    from agent import tools as agent_tools
+    import mcp_server
+    cmd = "rm -rf /tmp/schema-validation-must-not-run"
+    cases = [
+        ("ops_approve", {"command": cmd, "force": "false"}),
+        ("ops_approve", {"command": cmd, "force": True, "ttl_seconds": True}),
+        ("ops_exec", {"command": "echo ok", "snapshot_cmds": [{}]}),
+        ("ops_exec", {"command": "echo ok", "snapshot_cmds": "echo bad"}),
+        ("ops_list", []),
+    ]
+    ctx = agent_tools.ToolContext(ask_user=lambda q: "确认")
+    for name, args in cases:
+        out = agent_tools.dispatch(name, args, ctx)
+        assert "错误" in out, (name, out)
+        resp = mcp_server.handle_message({"jsonrpc": "2.0", "id": 1,
+            "method": "tools/call", "params": {"name": name, "arguments": args}})
+        assert resp["result"].get("isError"), resp
+    assert not core.check_stamp(cmd)
+    for method in ("initialize", "tools/call"):
+        resp = mcp_server.handle_message({"jsonrpc": "2.0", "id": 2,
+                                          "method": method, "params": []})
+        assert resp["error"]["code"] == -32602, resp
+    assert mcp_server.handle_message({"id": 3, "method": "ping"})["error"]["code"] == -32600
+    resp = mcp_server.handle_message({"jsonrpc": "2.0", "id": 4,
+        "method": "initialize", "params": {"protocolVersion": {"unexpected": "object"}}})
+    assert resp["error"]["code"] == -32602
+    result = mcp_server.call_tool("ops_audit", {"tail": 0})
+    assert json.loads(result["content"][0]["text"])["events"] == []
+
+
+def test_ops_exec_nonzero_exit_does_not_claim_no_change():
+    from agent import tools as agent_tools
+    import shlex
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "changed.txt"
+        cmd = f"echo changed > {shlex.quote(str(f))}; exit 3"
+        core.approve(cmd)
+        out = agent_tools.dispatch("ops_exec", {"command": cmd}, agent_tools.ToolContext())
+        assert f.read_text() == "changed\n" and "exit=3" in out
+        assert "快照失败" not in out and "已中止" not in out
+
+
+def test_hook_guarded_cli_and_snapshot_command_forms():
+    import shlex
+    import subprocess
+    import sys
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ, OPSX_STATE_DIR=str(Path(td) / "state"))
+        entry = str(core.REPO_DIR / "opsx")
+        f = Path(td) / "hook.conf"
+        f.write_text("before")
+        command = f"echo after > {shlex.quote(str(f))}"
+        wrappers = [
+            shlex.join([entry, "approve", command]),
+            shlex.join([sys.executable, entry, "exec", command]),
+        ]
+        def hook(text):
+            return subprocess.run([sys.executable, entry, "hook"],
+                input=json.dumps({"tool_input": {"command": text}}), env=env,
+                capture_output=True, text=True, timeout=5).returncode
+        for wrapper in wrappers:
+            assert hook(wrapper) == 0, wrapper
+            for suffix in (" && echo extra", " > /tmp/hook-output", "\necho extra"):
+                assert hook(wrapper + suffix) == 2, wrapper + suffix
+        assert hook("/tmp/opsx approve 'systemctl restart x'") == 2
+        denied = subprocess.run([sys.executable, entry, "exec", command], env=env,
+                                capture_output=True, text=True)
+        assert denied.returncode == 2 and f.read_text() == "before"
+        subprocess.run([sys.executable, entry, "approve", command], env=env,
+                       check=True, capture_output=True, text=True)
+        executed = subprocess.run([sys.executable, entry, "exec", command,
+                                  "--snapshot-file", str(f), "--snapshot-cmd", "echo prior-state"],
+                                 env=env, capture_output=True, text=True)
+        assert executed.returncode == 0 and f.read_text() == "after\n", executed.stderr
+        sid = re.search(r"snapshot_id: ([^（\s]+)", executed.stdout).group(1)
+        restored = subprocess.run([sys.executable, entry, "rollback", sid], env=env,
+                                 capture_output=True, text=True, check=True)
+        assert f.read_text() == "before" and "prior-state" in restored.stdout
+
+
 def test_mcp_protocol_errors():
     c = McpClient()
     try:
@@ -426,8 +507,6 @@ def test_agent_loop_approval_flow():
         cmd = f"echo v2 > {f}"
         restore = _stub_llm([
             {"role": "assistant", "content": "", "tool_calls": [
-                _tool_call("c1", "ask_user", {"question": f"变更单：执行 {cmd}，确认？"})]},
-            {"role": "assistant", "content": "", "tool_calls": [
                 _tool_call("c2", "ops_approve", {"command": cmd, "ttl_seconds": 60})]},
             {"role": "assistant", "content": "", "tool_calls": [
                 _tool_call("c3", "ops_exec", {"command": cmd, "snapshot_file": str(f)})]},
@@ -455,6 +534,97 @@ def test_agent_session_persistence():
     assert s2.messages == [{"role": "user", "content": "hi"}]
     first = s2.path.read_text(encoding="utf-8").splitlines()[0]
     assert json.loads(first)["format"] == 1
+
+
+def test_session_security_and_partial_write_recovery():
+    from agent import session as agent_session
+    saved_dir = core.STATE_DIR
+    old_umask = os.umask(0)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            core.STATE_DIR = Path(td) / "private-state"
+            for bad_id in ("../outside", "/tmp/outside", "", 12):
+                try:
+                    agent_session.Session(bad_id)
+                    raise AssertionError(f"非法会话 id 应拒绝: {bad_id}")
+                except ValueError:
+                    pass
+            s = agent_session.Session("test-secure")
+            s.append({"role": "user", "content": "secret"})
+            assert s.path.stat().st_mode & 0o777 == 0o600
+            assert s.path.parent.stat().st_mode & 0o777 == 0o700
+            assert core.STATE_DIR.stat().st_mode & 0o777 == 0o700
+            with s.path.open("ab") as f:
+                f.write(b'{"role":"user","content":"\xe4')
+            resumed = agent_session.Session(s.id)
+            assert resumed.messages == s.messages
+            resumed.append({"role": "assistant", "content": "done"})
+            assert agent_session.Session(s.id).messages == resumed.messages
+            # 完整 JSON 恰好缺少末尾换行也能继续追加。
+            s.path.write_bytes(s.path.read_bytes().rstrip(b"\n"))
+            resumed = agent_session.Session(s.id)
+            resumed.append({"role": "user", "content": "next"})
+            assert len(agent_session.Session(s.id).messages) == 3
+            before = list(resumed.messages)
+            try:
+                resumed.append({"role": "user", "content": object()})
+                raise AssertionError("不可序列化消息应失败")
+            except TypeError:
+                pass
+            assert resumed.messages == before
+            s.path.write_text('{"format":2,"id":"test-secure"}\n', encoding="utf-8")
+            try:
+                agent_session.Session(s.id)
+                raise AssertionError("未知版本不能当成 v1 读取")
+            except ValueError:
+                pass
+            assert agent_session.list_sessions() == []
+    finally:
+        os.umask(old_umask)
+        core.STATE_DIR = saved_dir
+
+
+def test_loop_invalid_arguments_and_interruption_recovery():
+    from agent import loop, llm, session as agent_session, tools as agent_tools
+    original_chat, original_dispatch = llm.chat, agent_tools.dispatch
+    calls, received = [], []
+    agent_tools.dispatch = lambda name, args, ctx: calls.append((name, args)) or "ok"
+    try:
+        for arguments in ('{"command":', '["uname"]', 'null'):
+            script = iter([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "bad-args", "type": "function", "function": {
+                        "name": "ops_list", "arguments": arguments}}]},
+                {"role": "assistant", "content": "已处理参数错误"}])
+            llm.chat = lambda *a, **kw: next(script)
+            s = agent_session.Session()
+            loop.run_turn("检查", s, agent_tools.ToolContext())
+            assert "有效 JSON 对象" in s.messages[-2]["content"]
+        assert calls == [], calls
+        s = agent_session.Session()
+        s.append({"role": "user", "content": "原任务"})
+        s.append({"role": "assistant", "content": "", "tool_calls": [
+            _tool_call("done", "ops_list", {}), _tool_call("interrupted", "ops_exec", {"command": "x"})]})
+        s.append({"role": "tool", "tool_call_id": "done", "name": "ops_list", "content": "ok"})
+
+        def recovered(messages, **kwargs):
+            received.extend(messages)
+            return {"role": "assistant", "content": "已核实"}
+
+        llm.chat = recovered
+        assert loop.run_turn("继续", s, agent_tools.ToolContext()) == "已核实"
+        missing = [m for m in received if m.get("tool_call_id") == "interrupted"]
+        assert len(missing) == 1 and "勿直接重试写操作" in missing[0]["content"]
+        assert calls == []
+        # 工具前的计划文本不能掩盖耗尽轮次。
+        llm.chat = lambda *a, **kw: {"role": "assistant", "content": "先检查",
+                                    "tool_calls": [_tool_call("loop", "ops_list", {})]}
+        events = []
+        text = loop.run_turn("检查", agent_session.Session(), agent_tools.ToolContext(),
+                             max_turns=1, on_event=lambda k, p: events.append((k, p)))
+        assert "最大轮次" in text and any("最大轮次" in str(p) for _, p in events)
+    finally:
+        llm.chat, agent_tools.dispatch = original_chat, original_dispatch
 
 
 def test_agent_ask_user_degrades_without_tty():
@@ -567,6 +737,75 @@ def test_llm_sse_stream():
         urllib.request.urlopen = orig
 
 
+def test_llm_stream_and_response_fail_closed():
+    import io
+    import http.client
+    from unittest.mock import patch
+    from agent import llm
+
+    tool_delta = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                  "function": {"name": "ops_list", "arguments": "{}"}}]}}]}
+    truncated_openai = "data: " + json.dumps(tool_delta) + "\n"
+    truncated_anthropic = ('data: {"type":"content_block_start","index":0,'
+                           '"content_block":{"type":"tool_use","id":"c1",'
+                           '"name":"ops_list","input":{}}}\n')
+    cases = [
+        ("openai", truncated_openai),
+        ("openai", truncated_openai + 'data: {"error":{"message":"busy"}}\n'),
+        ("openai", 'data: {"choices":[{"delta":{"content":"部分回复"}}]}\n'
+                   'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n'),
+        ("openai", 'data: {broken}\ndata: [DONE]\n'),
+        ("openai", 'data: {"choices":[null]}\n'),
+        ("openai", 'data: {"choices":[{"delta":{"tool_calls":[{"function":12}]}}]}\n'),
+        ("openai", 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                   '"function":{"name":"ops_list","arguments":"{}"}}]}}]}\ndata: [DONE]\n'),
+        ("anthropic", truncated_anthropic),
+        ("anthropic", 'data: {"type":"content_block_delta","delta":12}\n'),
+        ("anthropic", 'data: {"type":"content_block_start","content_block":12}\n'),
+        ("anthropic", truncated_anthropic + 'data: {"type":"message_delta",'
+                      '"delta":{"stop_reason":"max_tokens"}}\ndata: {"type":"message_stop"}\n'),
+    ]
+    for provider, payload in cases:
+        with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
+                patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+            try:
+                llm.chat([{"role": "user", "content": "x"}], on_delta=lambda p: None)
+                raise AssertionError(f"应拒绝不完整或错误的 {provider} 流")
+            except llm.LLMError:
+                pass
+    # Anthropic 首块可以自带文本，不应丢失。
+    payload = ('data: {"type":"content_block_start","index":0,'
+               '"content_block":{"type":"text","text":"开头"}}\n'
+               'data: {"type":"message_stop"}\n')
+    with patch.dict(os.environ, {"OPSAGENT_PROVIDER": "anthropic", "OPSAGENT_API_KEY": "test-dummy"}), \
+            patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+        deltas = []
+        assert llm.chat([{"role": "user", "content": "x"}], on_delta=deltas.append)["content"] == "开头"
+        assert deltas == ["开头"]
+
+    class FailedRead(io.BytesIO):
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"partial", 20)
+
+    for provider in ("openai", "anthropic"):
+        with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
+                patch("urllib.request.urlopen", side_effect=lambda *a, **kw: FailedRead()):
+            try:
+                llm.chat([{"role": "user", "content": "x"}])
+                raise AssertionError("读取失败应统一为 LLMError")
+            except llm.LLMError as e:
+                assert "读取失败" in str(e)
+        for payload in ("null", "[]", '{"content":[{"type":"text","text":12}]}',
+                        '{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":{}}}]}'):
+            with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
+                    patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+                try:
+                    llm.chat([{"role": "user", "content": "x"}])
+                    raise AssertionError("无效响应必须统一拒绝")
+                except llm.LLMError:
+                    pass
+
+
 def test_loop_compaction():
     from agent import loop
     big = "x" * 5000
@@ -607,6 +846,7 @@ def test_stream_printer_repaint(capsys=None):
     from agent import repl
     printer = repl.StreamPrinter()
     buf = io.StringIO()
+    buf.isatty = lambda: True
     import sys as _sys
     orig = _sys.stdout
     _sys.stdout = buf
@@ -619,6 +859,48 @@ def test_stream_printer_repaint(capsys=None):
     out = buf.getvalue()
     assert "\033[" in out  # 第二次重绘发了光标移动序列
     assert out.count("标题") >= 2  # 增量重绘：旧内容被新内容覆盖打印
+
+
+def test_repl_plain_stream_and_no_color():
+    import io
+    from unittest.mock import patch
+    from agent import markdown, repl
+    text = "# 标题\n正文**加粗**"
+    assert "\033[" not in markdown.render(text, color=False)
+    buf = io.StringIO()
+    with patch("sys.stdout", buf):
+        printer = repl.StreamPrinter()
+        printer.feed("# 标题")
+        printer.feed("\n正文**加粗**")
+        assert printer.finish() == text
+    assert buf.getvalue() == text + "\n"
+    with patch.object(repl, "_USE_COLOR", False), patch("sys.stdout", io.StringIO()) as out:
+        repl.ReplState(None).emit("text", text)
+        assert "\033[" not in out.getvalue()
+
+
+def test_repl_resume_runs_goal_and_non_tty_has_no_approval_channel():
+    from unittest.mock import patch
+    from agent import repl
+    state = repl.ReplState(None)
+    calls, contexts = [], []
+    def run_goal(st, ctx):
+        calls.append(st)
+        contexts.append(ctx)
+    with patch.object(repl, "ReplState", return_value=state), \
+         patch.object(repl.goal_mod, "update"), \
+         patch.object(repl, "_continue_goal", side_effect=run_goal), \
+         patch.object(repl, "_load_history"), patch.object(repl, "_save_history"), \
+         patch("sys.stdin.isatty", return_value=False), \
+         patch("builtins.input", side_effect=["/goal resume", "/quit"]):
+        assert repl.main() == 0
+    assert calls == [state] and contexts[0].ask_user is None
+    with patch.object(repl, "ReplState", return_value=state), \
+         patch.object(repl.loop, "run_turn", side_effect=KeyboardInterrupt), \
+         patch.object(repl.goal_mod, "get", side_effect=repl.goal_mod.GoalError("目标文件损坏")), \
+         patch.object(repl, "_load_history"), patch.object(repl, "_save_history"), \
+         patch("builtins.input", side_effect=["检查", "/quit"]):
+        assert repl.main() == 0
 
 
 def test_result_color_semantics():
@@ -706,6 +988,68 @@ def test_rpc_peer_request_resolve_no_deadlock():
     result = peer.request("ask_user", {"question": "确认？"})
     t.join(timeout=2)
     assert result == "确认执行"
+
+
+def test_rpc_protocol_validation_and_disconnect():
+    import io
+    import sys
+    from unittest.mock import patch
+    from agent import rpc
+    inputs = [[], None, 12, {"jsonrpc": "1.0", "id": 1, "method": "ping"},
+              {"jsonrpc": "2.0", "id": {}, "method": "ping"},
+              {"jsonrpc": "2.0", "id": 2, "method": "prompt", "params": {"text": 12}},
+              {"jsonrpc": "2.0", "id": 3, "method": "prompt", "params": {"text": "x", "stream": "false"}},
+              {"jsonrpc": "2.0", "id": 4, "method": "unknown"},
+              {"jsonrpc": "2.0", "id": 5, "method": "ping"},
+              {"jsonrpc": "2.0", "id": "srv-unsolicited", "result": "yes"}]
+    stdout = io.StringIO()
+    with patch.object(sys, "stdin", io.StringIO("\n".join(json.dumps(m) for m in inputs) + "\n")), \
+            patch.object(sys, "stdout", stdout):
+        rpc.serve()
+    replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert len([m for m in replies if m.get("error", {}).get("code") == -32600]) == 5
+    keyed = {m["id"]: m for m in replies if m["id"] is not None}
+    assert keyed[2]["error"]["code"] == keyed[3]["error"]["code"] == -32602
+    assert keyed[4]["error"]["code"] == -32601 and keyed[5]["result"] == {}
+    assert "srv-unsolicited" not in keyed
+    # stdin EOF 时，已排队 prompt 的确认也不能等到十分钟超时。
+    stdout = io.StringIO()
+    request = {"jsonrpc": "2.0", "id": 6, "method": "prompt", "params": {"text": "变更"}}
+
+    def ask_at_eof(text, session, ctx, **kwargs):
+        return ctx.ask_user("确认？")
+
+    with patch.object(sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+            patch.object(sys, "stdout", stdout), patch.object(rpc.loop, "run_turn", ask_at_eof):
+        rpc.serve()
+    assert "拒绝" in json.loads(stdout.getvalue().splitlines()[-1])["result"]["text"]
+
+
+def test_rpc_peer_rejects_unsolicited_and_error_responses():
+    import threading
+    from unittest.mock import patch
+    from agent import rpc
+    peer = rpc.RpcPeer()
+    assert not peer.resolve({"jsonrpc": "2.0", "id": "srv-unknown", "result": "yes"})
+    assert peer._pending == {}
+    for answer in ({"error": {"code": -1, "message": "cancelled"}}, {"result": {"answer": "yes"}},
+                   {"result": None}, {"result": "yes"}):
+        peer.send = lambda request: peer.resolve({"jsonrpc": "2.0", "id": request["id"], **answer})
+        assert peer.request("ask_user", {}) == ("yes" if answer == {"result": "yes"} else None)
+        assert peer._pending == {}
+    sent = threading.Event()
+    peer.send = lambda request: sent.set()
+    answers = []
+    worker = threading.Thread(target=lambda: answers.append(peer.request("ask_user", {})), daemon=True)
+    worker.start()
+    assert sent.wait(2)
+    peer.close()
+    worker.join(2)
+    assert not worker.is_alive() and answers == [None] and peer._pending == {}
+    with patch.object(rpc, "ASK_USER_TIMEOUT", 0):
+        peer = rpc.RpcPeer()
+        peer.send = lambda request: None
+        assert peer.request("ask_user", {}) is None and peer._pending == {}
 
 
 def test_session_prune():
@@ -1038,10 +1382,11 @@ def test_ops_list_survives_corrupt_registry():
     from agent import tools as agent_tools
     core.snapshot_cmd("echo corrupt-reg", name="cr")
     p = Path(core.STATE_DIR, "targets.json")
-    p.write_text("{not json", encoding="utf-8")
     try:
-        out = agent_tools.dispatch("ops_list", {}, agent_tools.ToolContext())
-        assert "== snapshots ==" in out and "== targets ==" in out and "解析失败" in out
+        for content in (b"{not json", b"\xff\xfe"):
+            p.write_bytes(content)
+            out = agent_tools.dispatch("ops_list", {}, agent_tools.ToolContext())
+            assert "== snapshots ==" in out and "== targets ==" in out and "解析失败" in out
     finally:
         _write_targets()
 
@@ -1264,6 +1609,28 @@ def test_output_spill_and_read_pagination():
     assert "单次读取超过" in r and "继续读取 offset=2" in r
     assert "第 1-2000 行" not in r
     td.cleanup()
+
+
+def test_read_large_lines_uses_bounded_memory():
+    import tracemalloc
+    from agent import tools as agent_tools
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "long.log"
+        with p.open("w") as f:
+            for _ in range(100):
+                f.write("x" * 80_000)
+            f.write("\nlast line\n")
+        tracemalloc.start()
+        try:
+            out = agent_tools.dispatch("read", {"path": str(p), "limit": 1},
+                                       agent_tools.ToolContext())
+            tail = agent_tools.dispatch("read", {"path": str(p), "offset": 2},
+                                        agent_tools.ToolContext())
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert "单次读取超过" in out and "offset=2" in out
+        assert tail == "last line" and peak < 1_000_000, (tail, peak)
 
 
 def test_spill_prune():
@@ -1540,6 +1907,93 @@ def test_schedule_corrupt_entry_disabled():
     (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
 
 
+def test_schedule_corrupt_times_and_daily_dst():
+    import time
+    from agent import schedule
+    p = core.STATE_DIR / "schedules.json"
+    p.unlink(missing_ok=True)
+    good = schedule.add("正常巡检", every_seconds=60)
+    items = schedule.list_entries()
+    items[0]["next_run"] = 0
+    bad_values = [{"next_run": value} for value in (None, "soon", [], float("nan"),
+                                                   float("inf"), 10 ** 300)]
+    bad_values += [{"every_seconds": value} for value in (-60, True, 60.5, "bad")]
+    bad_values += [{"every_seconds": None, "daily": "99:99"},
+                   {"every_seconds": 60, "daily": "09:00"}]
+    for i, values in enumerate(bad_values):
+        items.append({"id": f"sch-bad-{i}", "prompt": "坏任务", "next_run": 0,
+                      "every_seconds": 60, "daily": None, **values})
+    schedule._save(items)
+    original = schedule._run_entry
+    schedule._run_entry = lambda entry, model: "报告"
+    try:
+        assert "时间配置损坏" in schedule.format_list()
+        assert [it["id"] for it, _ in schedule.run_due()] == [good["id"]]
+        assert all(not it["enabled"] for it in schedule.list_entries()[1:])
+        assert schedule.run_due() == []
+    finally:
+        schedule._run_entry = original
+        p.unlink(missing_ok=True)
+    malformed = json.dumps({"items": [{"id": 123, "prompt": "坏任务"}]})
+    p.write_text(malformed, encoding="utf-8")
+    try:
+        try:
+            schedule.add("不能覆盖坏文件", every_seconds=60)
+            raise AssertionError("应报告格式错误，不能静默丢掉损坏条目")
+        except schedule.ScheduleError:
+            assert p.read_text(encoding="utf-8") == malformed
+    finally:
+        p.unlink(missing_ok=True)
+    for value in (False, True, 60.5, float("inf"), 10 ** 300):
+        try:
+            schedule.add("x", every_seconds=value)
+            raise AssertionError(f"应拒绝无效间隔: {value}")
+        except schedule.ScheduleError:
+            pass
+    if hasattr(time, "tzset"):
+        previous_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            time.tzset()
+            for month, day in ((3, 7), (10, 31)):
+                now = time.mktime((2026, month, day, 12, 0, 0, 0, 0, -1))
+                next_run = schedule._next_daily("09:00", now)
+                local = time.localtime(next_run)
+                assert (local.tm_mon, local.tm_mday, local.tm_hour, local.tm_min) == (
+                    month if month == 3 else 11, day + 1 if month == 3 else 1, 9, 0)
+        finally:
+            if previous_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_tz
+            time.tzset()
+
+
+def test_schedule_memory_and_readonly_context():
+    from agent import loop, memory, schedule, tools as agent_tools
+    p = memory.path()
+    p.unlink(missing_ok=True)
+    memory.add("db-scheduled: OS = Linux")
+    calls = []
+    original = loop.run_turn
+
+    def fake(prompt, session, ctx, **kwargs):
+        calls.append((ctx, kwargs["system"]))
+        return "未发现异常"
+
+    loop.run_turn = fake
+    try:
+        assert schedule._run_entry({"prompt": "巡检"}, "scheduled-model") == "未发现异常"
+        ctx, system = calls[0]
+        assert "db-scheduled" in system and schedule.SCHEDULE_PROMPT in system
+        assert ctx.ask_user is None and ctx.allowed == agent_tools.SCHEDULED_TOOLS
+        assert ctx.model == "scheduled-model"
+        assert ctx.allowed.isdisjoint({"remember", "goal", "schedule", "ops_exec", "ops_approve"})
+    finally:
+        loop.run_turn = original
+        p.unlink(missing_ok=True)
+
+
 def test_schedule_tool_and_lock():
     from agent import schedule, tools as agent_tools
     (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
@@ -1570,6 +2024,25 @@ def test_ops_approve_requires_interactive_channel():
     out = agent_tools.dispatch("ops_approve", {"command": cmd, "ttl_seconds": 60},
                                agent_tools.ToolContext(ask_user=lambda q: "确认"))
     assert "审批戳已创建" in out and core.check_stamp(cmd) is True
+    core.revoke(cmd)
+
+
+def test_ops_approve_requires_explicit_answer_for_command_and_target():
+    from agent import tools as agent_tools
+    cmd = "systemctl restart explicit-approval"
+    for answer in (None, "", "no", "拒绝", "还需要检查", "false"):
+        core.approve(cmd)
+        out = agent_tools.dispatch("ops_approve", {"command": cmd},
+            agent_tools.ToolContext(ask_user=lambda q, answer=answer: answer))
+        assert "未明确批准" in out and not core.check_stamp(cmd), out
+    questions = []
+    def approve(question):
+        questions.append(question)
+        return "确认执行"
+    out = agent_tools.dispatch("ops_approve", {"command": cmd},
+                               agent_tools.ToolContext(ask_user=approve))
+    assert "审批戳已创建" in out and core.check_stamp(cmd)
+    assert cmd in questions[0] and "本机" in questions[0] and "R1" in questions[0]
     core.revoke(cmd)
 
 
@@ -1655,6 +2128,46 @@ def test_goal_tool_and_repl_continuation():
     assert "不可用" in agent_tools.dispatch("goal", {"action": "status"},
                                             agent_tools.ToolContext())
     (core.STATE_DIR / "goals.json").unlink(missing_ok=True)
+
+
+def test_goal_concurrent_updates_and_corrupt_budget():
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from agent import goal, session as agent_session
+    p = core.STATE_DIR / "goals.json"
+    p.unlink(missing_ok=True)
+    sessions = [f"goal-concurrent-{i}" for i in range(12)]
+    for sid in sessions:
+        agent_session.Session(sid).append({"role": "user", "content": "开始"})
+    barrier = threading.Barrier(len(sessions))
+
+    def create(sid):
+        barrier.wait()
+        return goal.create(sid, "并发目标", max_rounds=20)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(sessions)) as pool:
+            assert len(list(pool.map(create, sessions))) == len(sessions)
+        assert set(goal._load()) == set(sessions)
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(lambda _: goal.continuation(sessions[0]), range(30)))
+        assert sum(msg is not None for msg in results) == 20
+        assert goal.get(sessions[0])["status"] == "paused"
+        original = goal._load()
+        for bad in ({"rounds_used": -1}, {"rounds_used": "1"}, {"max_rounds": "20"},
+                    {"max_rounds": False}, {"status": "unknown"}):
+            data = json.loads(json.dumps(original))
+            data[sessions[0]].update(bad)
+            p.write_text(json.dumps(data), encoding="utf-8")
+            try:
+                goal.continuation(sessions[0])
+                raise AssertionError(f"应拒绝损坏预算: {bad}")
+            except goal.GoalError:
+                pass
+    finally:
+        p.unlink(missing_ok=True)
+        for sid in sessions:
+            (core.STATE_DIR / "sessions" / f"{sid}.jsonl").unlink(missing_ok=True)
 
 
 def test_workflow_run_and_validation():
@@ -1791,6 +2304,34 @@ def test_memory_store_and_recall():
     p.unlink(missing_ok=True)
 
 
+def test_memory_concurrent_first_write_and_permissions():
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from agent import memory
+    p = memory.path()
+    p.unlink(missing_ok=True)
+    barrier = threading.Barrier(12)
+
+    def add(i):
+        barrier.wait()
+        return memory.add(f"host-{i}: OS = Linux")
+
+    try:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            entries = list(pool.map(add, range(12)))
+        text = p.read_text(encoding="utf-8")
+        assert text.count(memory.HEADER) == 1
+        assert all(text.count(entry + "\n") == 1 for entry in entries)
+        assert p.stat().st_mode & 0o777 == 0o600
+        p.write_text("", encoding="utf-8")
+        p.chmod(0o644)
+        memory.add("复用空文件")
+        assert p.read_text(encoding="utf-8").startswith(memory.HEADER)
+        assert p.stat().st_mode & 0o777 == 0o600
+    finally:
+        p.unlink(missing_ok=True)
+
+
 def test_memory_tool_and_system_injection():
     from agent import loop, tools as agent_tools
     p = core.STATE_DIR / "memory.md"
@@ -1812,6 +2353,227 @@ def test_memory_tool_and_system_injection():
     # 空内容经工具返回可读错误
     assert "不能为空" in agent_tools.dispatch("remember", {"text": " "}, ctx)
     p.unlink(missing_ok=True)
+
+
+def test_guard_shell_separators_and_write_options():
+    for command in (
+        "echo ok\nrm -rf /tmp/x", "echo ok & rm -rf /tmp/x",
+        "env sh -c 'touch /tmp/x'", "env X=1 sh -c 'touch /tmp/x'",
+        "brew services restart nginx", "brew services stop nginx",
+        "git remote -v add surprise https://example.invalid/repo",
+        "git reflog expire --expire=all", "date -s 2026-10-21",
+        "hostname changed", "journalctl --rotate", "journalctl --vacuum-time=1s",
+        "git diff --output=/tmp/x", "git log --output /tmp/x",
+        "docker compose config -o /tmp/x", "docker compose config -o/tmp/x",
+        "find /tmp -fprint /tmp/x", "find /tmp -execdir touch x +",
+        "cat /dev/null 2>/tmp/x", "cat /dev/null 2>/dev/null.other",
+        "cat <(touch /tmp/x)", "echo'custom-executable'", "echo\u00a0custom-executable",
+        "\u00a0echo custom-executable", "echo\vcustom-executable", "echo\rcustom-executable",
+        'ssh -oProxyCommand=touch /tmp/x "uptime"',
+        'ssh -oProxyCommand=evil "uptime"', 'ssh\nrm "uptime"',
+        'ssh host "hostname changed"', 'ssh host "brew services stop nginx"',
+        'ssh host "env"', 'ssh host "uptime" extra',
+    ):
+        assert core.classify(command)[0] != "R0", command
+    for command in ("cat /dev/null 2>/dev/null", "cat /dev/null 2>&1", "env",
+                    "brew services list", "git remote -v", "hostname -f",
+                    'date +"%F %T"', 'ssh host "date; hostname; systemctl --failed"'):
+        assert core.classify(command)[0] == "R0", command
+    for command in ("echo ok\nrm -rf /tmp/x", "rm /tmp/x -rf",
+                    "systemctl --user stop nginx", "kubectl -n prod delete pod x",
+                    "docker --context prod rm x"):
+        assert core.classify(command)[0] == "R3", command
+
+
+def test_guard_stamp_semantics_and_corrupt_shapes():
+    command = "printf 'one  two'"
+    core.approve(command, ttl_seconds=60)
+    assert core.check_stamp(command)
+    assert not core.check_stamp("printf 'one two'")
+    assert core.cmd_hash("printf a\\ ") != core.cmd_hash("printf a\\")
+    assert core.cmd_hash("printf a\vb") != core.cmd_hash("printf a b")
+    assert core.cmd_hash("printf  a") == core.cmd_hash(" printf a ")
+    destructive = "rm -rf /tmp/guard-force-test"
+    p = core.approve(destructive, ttl_seconds=60, force=True)
+    stamp = json.loads(p.read_text())
+    for fields in ({"force": False}, {"target": "another"}, {"cmd_hash": "wrong"},
+                   {"ttl": float("inf")}, {"created": 10 ** 500}):
+        p.write_text(json.dumps(dict(stamp, **fields)))
+        assert not core.check_stamp(destructive), fields
+    for malformed in ([], None, "stamp", {"created": 0, "ttl": "forever"}):
+        p.write_text(json.dumps(malformed))
+        assert not core.check_stamp(destructive)
+        core.collect_state()
+        core.prune_approvals()
+        assert not p.exists()
+    for ttl, force in ((0, False), (-1, False), (True, False), (60, "false")):
+        try:
+            core.approve("printf invalid-stamp", ttl_seconds=ttl, force=force)
+            raise AssertionError("invalid approval must fail")
+        except core.OpsxError:
+            pass
+
+
+def test_guard_snapshot_commands_and_duplicate_outputs():
+    import remote
+    import subprocess
+    _write_targets()
+    with tempfile.TemporaryDirectory() as td:
+        unwanted = Path(td, "unwanted")
+        command = f"touch {unwanted}"
+        for create in (lambda: core.snapshot_cmd(command),
+                       lambda: remote.snapshot_cmd("web1", command)):
+            try:
+                create()
+                raise AssertionError("unapproved capture must fail")
+            except (core.OpsxError, remote.RemoteError):
+                pass
+        assert not unwanted.exists()
+        code, sid, _ = core.exec_change("echo main", snapshot_cmds=[("echo first", ""),
+                                                                      ("echo second", "")])
+        assert code == 0 and sid
+        d, meta = core.load_snapshot(sid)
+        assert [Path(d, item["output"]).read_text().strip() for item in meta["items"]] == ["first", "second"]
+        original = remote._ssh
+        remote._ssh = lambda name, cmd, **kw: subprocess.CompletedProcess([], 0, cmd.encode(), b"")
+        try:
+            code, sid, _ = remote.exec_change("web1", "echo main", snapshot_cmds=[("echo first", "same"),
+                                                                                  ("echo second", "same")])
+            assert code == 0 and sid
+            d, meta = core.load_snapshot(sid)
+            assert [Path(d, item["output"]).read_text() for item in meta["items"]] == ["echo first", "echo second"]
+            for path in ("relative.conf", "~/app.conf", "/tmp/../app.conf"):
+                try:
+                    remote.snapshot_file("web1", path)
+                    raise AssertionError("ambiguous remote path must fail")
+                except remote.RemoteError:
+                    pass
+        finally:
+            remote._ssh = original
+
+
+def test_guard_snapshot_metadata_and_failure_cleanup():
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        source = Path(td, "source")
+        source.write_text("before")
+        source.chmod(0o640)
+        sid = core.snapshot_file(str(source))
+        d, meta = core.load_snapshot(sid)
+        source.write_text("after")
+        original = json.dumps(meta)
+        for value in ([], {}, {"id": sid, "items": [None]},
+                      {"id": sid, "items": [{"type": "file", "src": str(source),
+                                              "mode": 0o640, "dest": "../../outside"}]}):
+            Path(d, "meta.json").write_text(json.dumps(value))
+            for restore in (core.rollback, remote.rollback):
+                try:
+                    restore(sid)
+                    raise AssertionError("corrupt snapshot must fail")
+                except core.OpsxError:
+                    pass
+            assert source.read_text() == "after"
+        Path(d, "meta.json").write_text(original)
+        other = Path(td, "other")
+        other.write_text("untouched")
+        source.unlink()
+        source.symlink_to(other)
+        core.rollback(sid)
+        assert not source.is_symlink() and source.read_text() == "before"
+        assert source.stat().st_mode & 0o777 == 0o640 and other.read_text() == "untouched"
+        sdir = core.STATE_DIR / "snapshots"
+        before = set(sdir.iterdir())
+        try:
+            core.snapshot_file(str(Path(td, "missing")))
+            raise AssertionError("missing snapshot file must fail")
+        except core.OpsxError:
+            pass
+        assert set(sdir.iterdir()) == before
+        write_meta = core._write_meta
+        def fail_meta(*args):
+            raise OSError("test disk failure")
+        core._write_meta = fail_meta
+        try:
+            marker = Path(td, "must-not-run")
+            command = f"touch {marker}"
+            core.approve(command, ttl_seconds=60)
+            assert core.exec_change(command, snapshot_files=[str(source)])[0] == 3
+            assert not marker.exists() and set(sdir.iterdir()) == before
+        finally:
+            core._write_meta = write_meta
+
+
+def test_guard_process_group_timeout_stops_children():
+    import time
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        marker = Path(td, "late-write")
+        try:
+            core.run_shell(f"(sleep 0.3; touch {marker}) & wait", timeout=0.05)
+            raise AssertionError("command must time out")
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.4)
+        assert not marker.exists()
+
+
+def test_guard_fresh_state_private_and_prune_zero():
+    original = core.STATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        core.STATE_DIR = Path(td, "fresh")
+        try:
+            _, d = core.begin_snapshot()
+            assert core.STATE_DIR.stat().st_mode & 0o077 == 0
+            assert d.stat().st_mode & 0o077 == 0
+            core.prune_snapshots(keep=0)
+            assert not list((core.STATE_DIR / "snapshots").iterdir())
+        finally:
+            core.STATE_DIR = original
+
+
+def test_guard_audit_parallel_rotation():
+    from concurrent.futures import ThreadPoolExecutor
+    original, limit = core.STATE_DIR, core.AUDIT_ROTATE_BYTES
+    with tempfile.TemporaryDirectory() as td:
+        core.STATE_DIR = Path(td, "state")
+        try:
+            for rotate_bytes in (10, 10 ** 8):
+                core.AUDIT_ROTATE_BYTES = rotate_bytes
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(lambda i: core.audit("parallel", index=i), range(100)))
+                records = [json.loads(line) for line in
+                           (core.STATE_DIR / "audit.jsonl").read_text().splitlines()]
+                assert all(record["event"] == "parallel" for record in records)
+                assert len(records) == (1 if rotate_bytes == 10 else 101)
+            assert (core.STATE_DIR / "audit.jsonl.1").exists()
+        finally:
+            core.STATE_DIR, core.AUDIT_ROTATE_BYTES = original, limit
+
+
+def test_guard_schema_and_invalid_config_fail_closed():
+    schema = {"type": "object", "required": ["force"], "properties": {
+        "force": {"type": "boolean"}, "ttl": {"type": "integer"},
+        "captures": {"type": "array", "items": {"type": "object", "required": ["command"],
+                    "properties": {"command": {"type": "string"}}}}}}
+    core.validate_arguments({"force": False, "ttl": 60, "captures": [{"command": "uptime"}]}, schema)
+    for value in ({"force": "false"}, {"force": False, "ttl": True},
+                  {"force": True, "captures": ["uptime"]}, {"force": True, "captures": [{}]}, []):
+        try:
+            core.validate_arguments(value, schema)
+            raise AssertionError("schema mismatch must fail")
+        except core.OpsxError:
+            pass
+    override = core.STATE_DIR / "config.override.yaml"
+    for text in ("readonly_patterns:\n  - [\n", "readonly_patterns: []\n", "unknown:\n  - foo\n"):
+        override.write_text(text)
+        try:
+            try:
+                core.classify("echo allowed")
+                raise AssertionError("invalid policy must fail closed")
+            except core.OpsxError:
+                pass
+        finally:
+            override.unlink()
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

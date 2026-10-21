@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +28,27 @@ class OpsxError(Exception):
     pass
 
 
+def validate_arguments(value, schema: dict, path: str = "参数") -> None:
+    types = {"string": str, "integer": int, "boolean": bool,
+             "object": dict, "array": list}
+    kind = schema.get("type")
+    if kind in types and (not isinstance(value, types[kind]) or
+                          (kind == "integer" and isinstance(value, bool))):
+        raise OpsxError(f"{path} 须为 {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise OpsxError(f"{path} 须为 {schema['enum']} 之一")
+    if kind == "object":
+        for key in schema.get("required", []):
+            if key not in value:
+                raise OpsxError(f"缺少参数: {path}.{key}")
+        for key, child in schema.get("properties", {}).items():
+            if key in value:
+                validate_arguments(value[key], child, f"{path}.{key}")
+    elif kind == "array":
+        for i, child in enumerate(value):
+            validate_arguments(child, schema.get("items", {}), f"{path}[{i}]")
+
+
 def load_config() -> dict:
     cfg = {"readonly_patterns": [], "risk_rules": {"R1": [], "R2": [], "R3": []}}
     _parse_config(REPO_DIR / "config.yaml", cfg)
@@ -36,28 +61,47 @@ def load_config() -> dict:
 def _parse_config(path: Path, cfg: dict) -> None:
     """极简行解析：顶层 `key:` 开段，`- value` 为条目，# 为注释。值为原始正则。"""
     section = None
-    for raw in Path(path).read_text().splitlines():
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as e:
+        raise OpsxError(f"配置读取失败 {path}: {e}") from e
+    for lineno, raw in enumerate(lines, 1):
         line = raw.rstrip()
         s = line.strip()
         if not s or s.startswith("#"):
             continue
         if s.endswith(":") and not s.startswith("- "):
             section = s[:-1]
+            if section not in ("readonly_patterns", "risk_rules", "R1", "R2", "R3"):
+                raise OpsxError(f"配置段非法 {path}:{lineno}: {section}")
             continue
         if s.startswith("- ") and section:
             item = s[2:].strip()
+            try:
+                re.compile(item)
+            except re.error as e:
+                raise OpsxError(f"配置正则非法 {path}:{lineno}: {e}") from e
             if section == "readonly_patterns":
                 cfg["readonly_patterns"].append(item)
             elif section in ("R1", "R2", "R3"):
                 cfg["risk_rules"][section].append(item)
+            else:
+                raise OpsxError(f"配置条目位置非法 {path}:{lineno}")
+        else:
+            raise OpsxError(f"配置语法非法 {path}:{lineno}: {s}")
 
 
 def classify(cmd: str) -> tuple[str, str | None]:
     """复合命令分段取最高风险级。返回 (级别, 命中的最高风险分段)。"""
+    if not isinstance(cmd, str) or not cmd.strip(" \t\n"):
+        raise OpsxError("命令须为非空字符串")
     config = load_config()
+    ssh_level = _classify_ssh(cmd.strip(" \t\n"))
+    if ssh_level is not None:
+        return ssh_level, cmd if ssh_level != "R0" else None
     level, matched = "R0", None
-    for seg in re.split(r"&&|\|\||[;|]", cmd):
-        seg = seg.strip()
+    for seg in re.split(r"&&|\|\||[;|\n]|(?<!>)&(?!>)", cmd):
+        seg = seg.strip(" \t")
         if not seg:
             continue
         seg_level = _classify_single(seg, config)
@@ -66,25 +110,42 @@ def classify(cmd: str) -> tuple[str, str | None]:
     return level, matched
 
 
+def _classify_ssh(cmd: str) -> str | None:
+    m = re.fullmatch(r'ssh[ \t]+([A-Za-z0-9_@.\[\]:][A-Za-z0-9_@.\[\]:-]*)[ \t]+"([^"\\]+)"[ \t]*', cmd)
+    if not m:
+        return None
+    inner = m[2]
+    if re.search(r"(?:^|[;&|\n])\s*env\b", inner):
+        return "R2"  # 远程环境可能带生产密钥，不进入只读白名单
+    return classify(inner)[0]
+
+
 def _has_write_marker(seg: str) -> bool:
     """白名单形状但藏写行为时不按只读放行。
 
-    覆盖：重定向（仅 `2>`/`2>>` 豁免，fd1 显式重定向 `1>` 算写）、`&>`全量重定向、
+    覆盖：重定向（仅 stderr 到 /dev/null 或 fd 复制豁免）、`&>`全量重定向、
     tee、find -exec/-delete、命令替换（`$(...)`/反引号，可在只读命令里藏任意写操作）。
     """
-    if re.search(r"\btee\b|-exec\b|-delete\b", seg):
+    if re.search(r"\btee\b|-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", seg):
         return True
-    if "$(" in seg or "`" in seg:
+    if "$(" in seg or "`" in seg or "<(" in seg or ">(" in seg:
         return True
     if re.search(r"&>{1,2}", seg):
         return True
-    for m in re.finditer(r"(\d*)>{1,2}", seg):
-        if m.group(1) != "2":  # 空（裸 >）、1>、3> 等都是写
+    if re.search(r"--(?:output|open-files-in-pager|rotate|vacuum-\S+|flush|sync|relinquish-var|smart-relinquish-var|setup-keys|update-catalog)(?:\s|=|$)", seg):
+        return True
+    if re.search(r"^docker\s+compose\s+config\b.*\s-o(?:\s|\S)", seg):
+        return True
+    for m in re.finditer(r"(\d*)>{1,2}\s*(&[0-9]+|/dev/null(?=\s|$))?", seg):
+        if m.group(1) != "2" or m.group(2) is None:
             return True
     return False
 
 
 def _classify_single(seg: str, config: dict) -> str:
+    ssh_level = _classify_ssh(seg)
+    if ssh_level is not None:
+        return ssh_level
     for pat in config["readonly_patterns"]:
         if re.search(pat, seg):
             if _has_write_marker(seg):
@@ -105,22 +166,27 @@ def _classify_single(seg: str, config: dict) -> str:
 AUDIT_ROTATE_BYTES = 10 * 1024 * 1024  # ponytail: 单备份轮转 audit.jsonl.1，需要多代次再加
 
 
-def audit(event: str, **fields) -> None:
+def _ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(STATE_DIR, 0o700)  # 审计/会话/快照里可能有敏感输出，只留本人可读
-    except OSError:
-        pass
+    os.chmod(STATE_DIR, 0o700)
+
+
+def audit(event: str, **fields) -> None:
+    _ensure_state_dir()
     path = STATE_DIR / "audit.jsonl"
-    if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
-        os.replace(path, STATE_DIR / "audit.jsonl.1")
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with open(STATE_DIR / "audit.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
+            os.replace(path, STATE_DIR / "audit.jsonl.1")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def normalize(cmd: str) -> str:
-    return " ".join(cmd.split())
+    if re.search(r"['\"\\\n\r]", cmd):
+        return cmd  # 引号、转义及换行中的空白会改变 shell 语义
+    return re.sub(r"[ \t]+", " ", cmd.strip(" \t"))
 
 
 def cmd_hash(cmd: str, target: str | None = None) -> str:
@@ -131,6 +197,10 @@ def cmd_hash(cmd: str, target: str | None = None) -> str:
 
 def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
             target: str | None = None) -> Path:
+    if type(ttl_seconds) is not int or ttl_seconds <= 0:
+        raise OpsxError("审批 TTL 须为正整数秒")
+    if type(force) is not bool:
+        raise OpsxError("force 须为布尔值")
     level, _ = classify(cmd)
     if level == "R0":
         raise OpsxError("只读命令无需审批戳")
@@ -147,7 +217,8 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
         "method": "manual",
     }
     p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
-    p.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_state_dir()
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
     prune_approvals()  # 顺带清理过期戳
     audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target)
@@ -160,9 +231,21 @@ def check_stamp(cmd: str, target: str | None = None) -> bool:
         return False
     try:
         s = json.loads(p.read_text(encoding="utf-8"))
-        return time.time() < s["created"] + s["ttl"]
-    except (json.JSONDecodeError, KeyError, TypeError, OSError):
+        return (_stamp_live(s) and s["cmd_hash"] == cmd_hash(cmd, target) and
+                normalize(s["cmd"]) == normalize(cmd) and s.get("target") == target and
+                s["level"] == classify(cmd)[0] and
+                (s["level"] != "R3" or s.get("force") is True))
+    except (json.JSONDecodeError, KeyError, TypeError, OSError, UnicodeError, OverflowError):
         return False  # 损坏的戳按无效处理（安全方向）
+
+
+def _stamp_live(stamp) -> bool:
+    if not isinstance(stamp, dict):
+        return False
+    created, ttl = stamp.get("created"), stamp.get("ttl")
+    return (type(created) in (int, float) and type(ttl) in (int, float) and
+            math.isfinite(created) and math.isfinite(ttl) and ttl > 0 and
+            created <= time.time() < created + ttl)
 
 
 def prune_approvals() -> None:
@@ -170,13 +253,12 @@ def prune_approvals() -> None:
     adir = STATE_DIR / "approvals"
     if not adir.exists():
         return
-    now = time.time()
     for p in adir.glob("*.json"):
         try:
             s = json.loads(p.read_text(encoding="utf-8"))
-            if now >= s["created"] + s["ttl"]:
+            if not _stamp_live(s):
                 p.unlink()
-        except (json.JSONDecodeError, KeyError, TypeError, OSError):
+        except (json.JSONDecodeError, KeyError, TypeError, OSError, UnicodeError, OverflowError):
             p.unlink(missing_ok=True)  # 损坏文件一并清掉
 
 
@@ -199,9 +281,13 @@ def collect_state() -> dict:
         for p in sorted(adir.glob("*.json")):
             try:
                 st = json.loads(p.read_text(encoding="utf-8"))
+                if not _stamp_live(st) or not isinstance(st.get("cmd"), str):
+                    continue
+                if st.get("level") not in _RANK or st.get("target") is not None and not isinstance(st["target"], str):
+                    continue
                 approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"],
                                   "target": st.get("target")})
-            except (json.JSONDecodeError, KeyError, OSError):
+            except (json.JSONDecodeError, KeyError, TypeError, OSError, UnicodeError, OverflowError):
                 continue
     return {"snapshots": snapshots, "approvals": approvals}
 
@@ -240,6 +326,7 @@ def _new_snapshot_id() -> str:
 
 
 def begin_snapshot() -> tuple[str, Path]:
+    _ensure_state_dir()
     sid = _new_snapshot_id()
     d = STATE_DIR / "snapshots" / sid
     d.mkdir(parents=True, exist_ok=True, mode=0o700)  # 快照可能含密钥/配置，仅本人可读
@@ -261,11 +348,37 @@ def _snapshot_file_into(d: Path, path_str: str, items: list) -> None:
     })
 
 
+def run_shell(cmd: str, timeout: int) -> subprocess.CompletedProcess:
+    """超时终止整个进程组，避免 shell 退出后子进程继续变更。"""
+    with subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, encoding="utf-8", errors="replace",
+                          start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def _snapshot_output_name(name: str, items: list) -> str:
+    base = f"cmd-{(name or 'output').replace('/', '_')}"
+    fname, number = base + ".txt", 2
+    while any(item.get("output") == fname for item in items):
+        fname = f"{base}-{number}.txt"
+        number += 1
+    return fname
+
+
 def _snapshot_cmd_into(d: Path, cmd: str, name: str, items: list) -> None:
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+    r = run_shell(cmd, timeout=60)
     if r.returncode != 0:
         raise OpsxError(f"状态抓取命令失败({r.returncode}): {cmd}\n{r.stderr[:500]}")
-    fname = f"cmd-{(name or 'output').replace('/', '_')}.txt"
+    fname = _snapshot_output_name(name, items)
     (d / fname).write_text(r.stdout, encoding="utf-8")
     items.append({"type": "cmd", "cmd": cmd, "name": name, "output": fname})
 
@@ -278,18 +391,31 @@ def _write_meta(d: Path, sid: str, items: list) -> None:
 def snapshot_file(path_str: str) -> str:
     sid, d = begin_snapshot()
     items: list = []
-    _snapshot_file_into(d, path_str, items)
-    _write_meta(d, sid, items)
+    try:
+        _snapshot_file_into(d, path_str, items)
+        _write_meta(d, sid, items)
+    except (OpsxError, OSError) as e:
+        shutil.rmtree(d, ignore_errors=True)
+        raise OpsxError(f"文件快照失败: {e}") from e
     audit("snapshot", id=sid, kind="file", src=path_str)
+    prune_snapshots()
     return sid
 
 
 def snapshot_cmd(cmd: str, name: str = "") -> str:
+    code, msg = check(cmd)
+    if code != 0:
+        raise OpsxError(msg)
     sid, d = begin_snapshot()
     items: list = []
-    _snapshot_cmd_into(d, cmd, name, items)
-    _write_meta(d, sid, items)
+    try:
+        _snapshot_cmd_into(d, cmd, name, items)
+        _write_meta(d, sid, items)
+    except (OpsxError, OSError, subprocess.SubprocessError) as e:
+        shutil.rmtree(d, ignore_errors=True)
+        raise OpsxError(f"命令快照失败: {e}") from e
     audit("snapshot", id=sid, kind="cmd", cmd=cmd)
+    prune_snapshots()
     return sid
 
 
@@ -300,33 +426,77 @@ def snapshot_dir(snapshot_id: str) -> Path:
     """快照目录。id 来自模型/用户：允许路径分隔符就能让 rollback 读写任意目录。"""
     if not isinstance(snapshot_id, str) or not _SNAPSHOT_ID_RE.fullmatch(snapshot_id):
         raise OpsxError(f"非法快照 id: {snapshot_id!r}")
-    return STATE_DIR / "snapshots" / snapshot_id
+    d = STATE_DIR / "snapshots" / snapshot_id
+    if d.is_symlink():
+        raise OpsxError(f"快照目录不能为符号链接: {snapshot_id}")
+    return d
+
+
+def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
+    d = snapshot_dir(snapshot_id)
+    if not d.is_dir():
+        raise OpsxError(f"快照不存在: {snapshot_id}")
+    try:
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        if not isinstance(meta, dict) or meta.get("id") != snapshot_id or not isinstance(meta.get("items"), list):
+            raise ValueError("元数据形状非法")
+        if meta.get("target") is not None and not isinstance(meta["target"], str):
+            raise ValueError("快照目标非法")
+        for item in meta["items"]:
+            if not isinstance(item, dict) or item.get("type") not in ("file", "cmd"):
+                raise ValueError("快照条目非法")
+            key = "dest" if item["type"] == "file" else "output"
+            archived = Path(item[key])
+            if archived.is_absolute() or not (d / archived).is_file():
+                raise ValueError("快照文件不存在或路径非法")
+            (d / archived).resolve().relative_to(d.resolve())
+            if item["type"] == "file":
+                if not isinstance(item["src"], str) or not item["src"].startswith("/") or "\x00" in item["src"]:
+                    raise ValueError("源文件路径须为绝对路径")
+                if not meta.get("target") and (type(item.get("mode")) is not int or not 0 <= item["mode"] <= 0o7777):
+                    raise ValueError("文件权限非法")
+            elif not isinstance(item.get("cmd"), str):
+                raise ValueError("快照命令非法")
+        return d, meta
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise OpsxError(f"快照元数据损坏: {snapshot_id}: {e}") from e
 
 
 def rollback(snapshot_id: str) -> str:
-    d = snapshot_dir(snapshot_id)
-    if not d.exists():
-        raise OpsxError(f"快照不存在: {snapshot_id}")
-    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    d, meta = load_snapshot(snapshot_id)
+    if meta.get("target"):
+        raise OpsxError("远程快照须通过 remote.rollback 恢复")
     report = []
     for item in meta["items"]:
         if item["type"] == "file":
-            shutil.copy2(d / item["dest"], item["src"])
-            os.chmod(item["src"], item["mode"])
+            staged = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent, delete=False) as f:
+                    staged = Path(f.name)
+                shutil.copy2(d / item["dest"], staged)
+                os.chmod(staged, item["mode"])
+                os.replace(staged, item["src"])
+            except OSError as e:
+                raise OpsxError(f"文件回滚失败 {item['src']}: {e}") from e
+            finally:
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
             report.append(f"已恢复文件: {item['src']}")
         else:
-            out = (d / item["output"]).read_text(encoding="utf-8")
+            out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
             report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
     audit("rollback", snapshot_id=snapshot_id)
     return "\n".join(report)
 
 
 def prune_snapshots(keep: int = 200) -> None:
+    if type(keep) is not int or keep < 0:
+        raise OpsxError("快照保留数须为非负整数")
     d = STATE_DIR / "snapshots"
     if not d.exists():
         return
-    ids = sorted(p for p in d.iterdir() if p.is_dir())
-    for p in ids[:-keep]:
+    ids = sorted(p for p in d.iterdir() if p.is_dir() and not p.is_symlink())
+    for p in ids[:-keep] if keep else ids:
         shutil.rmtree(p)
         audit("prune", snapshot_id=p.name)
 
@@ -351,13 +521,14 @@ def exec_change(
     code, msg = check(cmd)
     if code != 0:
         print(msg, file=sys.stderr)
-        return code, None, ""
+        return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = check(c)
         if code != 0:
             audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
-            print(f"[opsx] 快照命令未通过守门，已中止执行: {c}", file=sys.stderr)
-            return 2, None, ""
+            output = f"[opsx] 快照命令未通过守门，已中止执行: {c}"
+            print(output, file=sys.stderr)
+            return 2, None, output
     sid = None
     if snapshot_files or snapshot_cmds:
         sid, d = begin_snapshot()
@@ -367,19 +538,23 @@ def exec_change(
                 _snapshot_file_into(d, f, items)
             for c, name in snapshot_cmds:
                 _snapshot_cmd_into(d, c, name, items)
+            _write_meta(d, sid, items)
         except (OpsxError, subprocess.SubprocessError, OSError) as e:
             shutil.rmtree(d, ignore_errors=True)
-            print(f"[opsx] 快照失败，已中止执行: {e}", file=sys.stderr)
+            output = f"[opsx] 快照失败，已中止执行: {e}"
+            print(output, file=sys.stderr)
             audit("exec-abort", cmd=cmd, reason=str(e))
-            return 3, None, ""
-        _write_meta(d, sid, items)
+            return 3, None, output
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        r = run_shell(cmd, timeout=timeout)
         output = r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
         exit_code = r.returncode
     except subprocess.TimeoutExpired:
         output = f"[opsx] 超时：命令超过 {timeout}s 未结束，已终止"
         exit_code = 4
+    except OSError as e:
+        output = f"[opsx] 执行失败: {e}"
+        exit_code = 1
     audit("exec", cmd=cmd, snapshot_id=sid, exit_code=exit_code,
           output=output[:EXEC_AUDIT_OUTPUT])
     prune_snapshots()

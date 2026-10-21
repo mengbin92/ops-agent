@@ -169,7 +169,7 @@ class StreamPrinter:
         return rows
 
     def _repaint(self) -> None:
-        rendered = markdown.render(self._buf)
+        rendered = markdown.render(self._buf, color=_USE_COLOR)
         if self._printed_rows:
             # 光标上移已打印行数并清到屏幕尾，再重绘
             sys.stdout.write(f"\033[{self._printed_rows}A\033[J")
@@ -179,7 +179,7 @@ class StreamPrinter:
 
     def feed(self, delta: str) -> None:
         self._buf += delta
-        if self._overflow:
+        if self._overflow or not sys.stdout.isatty():
             sys.stdout.write(delta)
             sys.stdout.flush()
             return
@@ -192,7 +192,7 @@ class StreamPrinter:
         self._repaint()
 
     def finish(self) -> str:
-        if self._overflow:
+        if self._overflow or not sys.stdout.isatty():
             sys.stdout.write("\n")
             sys.stdout.flush()
         else:
@@ -211,7 +211,7 @@ class ReplState:
     def emit(self, kind: str, payload) -> None:
         if kind == "text":
             self.last_reply = payload
-            print(f"\n{markdown.render(payload)}\n")
+            print(f"\n{markdown.render(payload, color=_USE_COLOR)}\n")
         elif kind == "stream_end":
             self.last_reply = payload
             self.printer.finish()
@@ -259,9 +259,17 @@ def _pick_session() -> sess_mod.Session | None:
     return sess_mod.Session(sessions[int(choice) - 1]["id"])
 
 
+def _pause_goal(state: ReplState) -> None:
+    try:
+        if (goal_mod.get(state.session.id) or {}).get("status") == "active":
+            goal_mod.update(state.session.id, "pause")
+    except goal_mod.GoalError as e:
+        warn(f"[目标] {e}")
+
+
 def main(model: str | None = None) -> int:
     state = ReplState(model)
-    ctx = tools.ToolContext(ask_user=_terminal_ask, model=model,
+    ctx = tools.ToolContext(ask_user=_terminal_ask if sys.stdin.isatty() else None, model=model,
                             session_id=state.session.id, goal_continuation=True)
     _load_history()
     info(f"ops-agent REPL（会话 {state.session.id}，模型 {model or '默认'}）。")
@@ -303,10 +311,14 @@ def main(model: str | None = None) -> int:
                 elif sub == "resume":
                     goal_mod.update(state.session.id, "resume")
                     ok("目标已恢复（续跑预算已重置）")
+                    _continue_goal(state, ctx)
                 else:
                     info(goal_mod.format_one(goal_mod.get(state.session.id)))
-            except goal_mod.GoalError as e:
+            except (goal_mod.GoalError, loop.llm.LLMError) as e:
                 warn(f"[目标] {e}")
+            except KeyboardInterrupt:
+                _pause_goal(state)
+                warn("\n[已打断当前轮次]")
             continue
 
         if line.startswith("/copy"):
@@ -329,4 +341,5 @@ def main(model: str | None = None) -> int:
         except loop.llm.LLMError as e:
             error(f"[LLM 错误] {e}")
         except KeyboardInterrupt:
+            _pause_goal(state)
             warn("\n[已打断当前轮次]")

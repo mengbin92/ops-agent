@@ -23,7 +23,7 @@ ops-agent/
 ├── core.py                # 核心库：分类/审批戳/快照/回滚/审计（纯函数）
 ├── opsx                   # CLI 薄壳 + hook 入口
 ├── config.yaml            # 只读白名单 + R1/R2/R3 风险规则
-├── selftest.py            # 内置自检（23 项断言）
+├── selftest.py            # 内置隔离自检
 ├── mcp_server.py          # 演进产物：同一能力的 MCP server 形态
 └── README.md
 ```
@@ -148,7 +148,7 @@ except Exception as e:      # hook 异常一律拒绝方向
 先按复合命令分隔符分段，逐段匹配，取最高级。单段的判定顺序：
 
 ```python
-write_marker = re.search(r"(?:^|[^0-9])>{1,2}|\btee\b|-exec\b|-delete\b", seg)
+write_marker = _has_write_marker(seg)
 for pat in config["readonly_patterns"]:
     if re.search(pat, seg):
         if write_marker:
@@ -160,7 +160,8 @@ for pat in config["risk_rules"]["R1"]: ...
 return "R2"                  # 未知命令安全方向默认
 ```
 
-写标记正则里 `[^0-9]` 是为了豁免 fd 重定向（`2>/dev/null` 是纯只读命令的常见尾巴）。
+`_has_write_marker` 同时检查重定向、命令替换与命令自身的写选项。
+只读命令里的 `2>/dev/null` 可豁免，`2>配置文件` 会截断文件，仍须审批；具体规则以 `core.py` 为准。
 
 ### 5.2 审批戳（`approve` / `check_stamp` / `check`）
 
@@ -245,7 +246,7 @@ df -h / | tail -1; docker ps --format '{{.Names}}\t{{.Status}}'
 子代理形态只对仓库目录内的会话生效。要让能力跨项目可用，把同一组 core.py 函数包成 stdio JSON-RPC 的 MCP server（`mcp_server.py`，仍是纯标准库）：
 
 - 协议四件套：`initialize` / `tools/list` / `tools/call` / `ping`，通知类消息无 id 不回。
-- 8 个工具，只读的 `ops_check` / `ops_list` / `ops_audit` 标 `readOnlyHint`。
+- 9 个工具（含撤销审批的 `ops_revoke`），只读的 `ops_check` / `ops_list` / `ops_audit` 标 `readOnlyHint`。
 - 错误码遵守 JSON-RPC 约定；业务错误走 tool 结果的 `isError`，不污染协议层。
 - 因为 core.py 是纯函数库，server 只是"换个入口"，状态目录布局不变——**CLI 批的审批戳，MCP 下同样有效**。
 
@@ -264,7 +265,7 @@ claude mcp add ops-guard -- python3 /Users/neo/vscode/mengbin/ops-agent/mcp_serv
 3. **复合命令按最高级**。`kubectl get pods && kubectl delete pod x` 必须整体按 R3 处理，分段取 max 即可，不需要 shell AST。
 4. **快照失败即中止，不留半提交状态**。变更执行宁可没做成，也不要做成一半。
 5. **未知默认高级别**。分类器是正则不是理解，认不出的命令按 R2 起步。
-6. **审批戳要 TTL + 归一化**。无期限的戳等于永久后门；归一化（压缩空白）防止同一命令因空格差异绕过哈希。
+6. **审批戳要 TTL + 保留命令语义**。简单命令可压缩词间空白；引号、转义、换行里的空白必须保留，否则不同命令可能共用一张戳。
 7. **自检要隔离状态目录**。`selftest.py` 在 import core 前设置 `OPSX_STATE_DIR` 指向临时目录，否则测试会往真实 `~/.ops-agent` 写戳。
 8. **架构上把"库"和"壳"分开**。core.py 不 import argparse/JSON-RPC，才有后面零成本长出 CLI、hook、MCP 三个壳。
 

@@ -24,13 +24,19 @@ import uuid
 from . import loop, session as sess_mod, tools
 
 ASK_USER_TIMEOUT = 600
+_WAITING = object()
+
+
+def _invalid_json_constant(value: str):
+    raise ValueError(f"Invalid JSON constant: {value}")
 
 
 class RpcPeer:
     def __init__(self):
-        self._pending: dict[str, str | None] = {}
+        self._pending: dict[str, object] = {}
         self._cond = threading.Condition()
         self._send_lock = threading.Lock()
+        self._closed = False
 
     def send(self, obj: dict) -> None:
         with self._send_lock:  # 读线程（错误响应）与主线程（正常响应）都会写 stdout
@@ -41,23 +47,35 @@ class RpcPeer:
         """反向请求客户端并阻塞等回答（响应由读线程 resolve() 回填）。"""
         rid = "srv-" + uuid.uuid4().hex[:8]
         with self._cond:
-            self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-            answered = self._cond.wait_for(lambda: rid in self._pending,
-                                           timeout=ASK_USER_TIMEOUT)
-            if answered:
-                return self._pending.pop(rid)
-            return None  # 超时：视为客户端未回答
+            if self._closed:
+                return None
+            self._pending[rid] = _WAITING
+            try:
+                self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+                answered = self._cond.wait_for(
+                    lambda: self._closed or self._pending[rid] is not _WAITING,
+                    timeout=ASK_USER_TIMEOUT)
+                answer = self._pending[rid]
+                return answer if answered and isinstance(answer, str) else None
+            finally:
+                self._pending.pop(rid, None)
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
 
     def resolve(self, msg: dict) -> bool:
         """若 msg 是对反向请求的响应则回填并返回 True。"""
         rid = msg.get("id")
-        if isinstance(rid, str) and rid.startswith("srv-"):
-            result = msg.get("result")
-            with self._cond:
-                self._pending[rid] = result if isinstance(result, str) \
-                    else json.dumps(result, ensure_ascii=False)
+        with self._cond:
+            if isinstance(rid, str) and self._pending.get(rid) is _WAITING \
+                    and "method" not in msg and msg.get("jsonrpc") == "2.0" \
+                    and ("result" in msg or "error" in msg):
+                result = msg.get("result")
+                self._pending[rid] = result if "error" not in msg and isinstance(result, str) else None
                 self._cond.notify_all()
-            return True
+                return True
         return False
 
 
@@ -67,19 +85,33 @@ def serve(model: str | None = None) -> None:
     inbox: queue.Queue = queue.Queue()
 
     def reader() -> None:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                peer.send({"jsonrpc": "2.0", "id": None,
-                           "error": {"code": -32700, "message": "Parse error"}})
-                continue
-            if not peer.resolve(msg):  # 反向请求的响应不入业务队列
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line, parse_constant=_invalid_json_constant)
+                except ValueError:
+                    peer.send({"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32700, "message": "Parse error"}})
+                    continue
+                valid = (isinstance(msg, dict) and msg.get("jsonrpc") == "2.0"
+                         and type(msg.get("id")) in (str, int, float, type(None)))
+                if not valid or ("method" not in msg and "result" not in msg and "error" not in msg) \
+                        or ("method" in msg and not isinstance(msg["method"], str)):
+                    error_id = msg.get("id") if isinstance(msg, dict) \
+                        and type(msg.get("id")) in (str, int, float, type(None)) else None
+                    peer.send({"jsonrpc": "2.0", "id": error_id,
+                               "error": {"code": -32600, "message": "Invalid Request"}})
+                    continue
+                if "method" not in msg:
+                    peer.resolve(msg)  # 只接收在途反向请求的响应，其余响应忽略。
+                    continue
                 inbox.put(msg)
-        inbox.put(None)  # EOF
+        finally:
+            peer.close()  # EOF/读失败时立即拒绝未完成的确认，避免等待十分钟。
+            inbox.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
 
@@ -96,14 +128,24 @@ def serve(model: str | None = None) -> None:
         if "id" not in msg:
             continue  # 通知忽略
         try:
+            if method not in {"ping", "reset", "prompt"}:
+                peer.send({"jsonrpc": "2.0", "id": msg_id,
+                           "error": {"code": -32601, "message": f"未知方法: {method}"}})
+                continue
+            params = msg.get("params", {})
+            if not isinstance(params, dict) or (method == "prompt" and (
+                    not isinstance(params.get("text"), str) or not params["text"].strip()
+                    or ("stream" in params and not isinstance(params["stream"], bool)))):
+                peer.send({"jsonrpc": "2.0", "id": msg_id,
+                           "error": {"code": -32602, "message": "Invalid params"}})
+                continue
             if method == "ping":
                 result = {}
             elif method == "reset":
                 session = sess_mod.Session()
                 result = {"session_id": session.id}
             elif method == "prompt":
-                params = msg.get("params") or {}
-                stream = bool(params.get("stream"))
+                stream = params.get("stream", False)
                 events: list = []
 
                 def push(kind, payload) -> None:
@@ -121,8 +163,6 @@ def serve(model: str | None = None) -> None:
                 result = {"text": text, "session_id": session.id}
                 if not stream:
                     result["events"] = events
-            else:
-                raise ValueError(f"未知方法: {method}")
             peer.send({"jsonrpc": "2.0", "id": msg_id, "result": result})
         except Exception as e:  # noqa: BLE001 —— 单条消息异常不崩循环
             peer.send({"jsonrpc": "2.0", "id": msg_id,

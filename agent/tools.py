@@ -1,7 +1,7 @@
 """工具注册表：{name: {schema, handler, read_only}}。内核只分发，前端只渲染。
 
 守门在内核之内：bash handler 直接调 core.check()——R0 放行；其余要求
-审批戳（模型须先走变更单 + ask_user + ops_approve 流程，戳由 ops_approve 工具创建）。
+审批戳（模型须先提交变更单，ops_approve 工具自行取得用户明确确认后创建戳）。
 带 target 时经 remote.py 下发到已注册的 SSH 目标（bash 仍限 R0，写操作走 ops_exec）；
 审批戳按「目标+命令」绑定，本机戳不能用于远程。
 """
@@ -86,8 +86,9 @@ def _cap(text: str, label: str) -> str:
         SPILL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         name = time.strftime("%Y%m%d-%H%M%S") + f"-{label[:40]}-{uuid.uuid4().hex[:6]}.txt"
         path = SPILL_DIR / name
-        path.write_text(text, encoding="utf-8")
-        os.chmod(path, 0o600)
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                       "w", encoding="utf-8") as f:
+            f.write(text)
     except OSError:
         # 磁盘满/文件名过长/无权限：降级为纯截断，别把"执行成功"变成工具报错
         return text[:OUTPUT_LIMIT] + f"\n...[已截断，共 {len(text)} 字符；落盘失败，无法读取全文]"
@@ -107,8 +108,8 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         core.audit("bash-deny", cmd=cmd, level=level, target=target)
         hit = f"（命中分段：{matched}）" if matched else ""
         return (f"[opsx 拒绝] 该命令判定为 {level}{hit}，bash 仅执行只读命令。\n"
-                "写操作流程：向用户提交变更单（风险说明+回滚计划+目标）→ ask_user 确认 → "
-                "ops_approve 建审批戳 → ops_exec（可带快照参数）执行。")
+                "写操作流程：向用户提交变更单（风险说明+回滚计划+目标）→ "
+                "ops_approve 询问确认并建戳 → ops_exec（可带快照参数）执行。")
     code, msg = core.check(cmd, target=target)  # R0 直接放行（check 内会写审计）
     if code != 0:
         return f"[opsx 拒绝] {msg}"
@@ -116,7 +117,7 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         code, out = remote.run(target, cmd)
         return f"[target={target} exit={code}]\n" + _cap(out, f"bash-{target}")
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
+        r = core.run_shell(cmd, timeout=BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
         return f"[超时] 命令超过 {BASH_TIMEOUT}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
@@ -140,32 +141,39 @@ def _read(args: dict, ctx: ToolContext) -> str:
     path = Path(args["path"]).expanduser()
     if not path.is_file():
         return f"[错误] 文件不存在: {path}"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as e:
-        return f"[错误] 读取失败: {e}"
-    if not lines:
-        return ""
-    try:
-        offset = max(1, int(args.get("offset", 1)))
-        limit = int(args.get("limit", READ_LIMIT))
-    except (TypeError, ValueError):
-        return "[错误] offset/limit 必须是整数"
+    offset = max(1, args.get("offset", 1))
+    limit = args.get("limit", READ_LIMIT)
     if limit <= 0:
         return "[错误] limit 必须是正整数"
-    if offset > len(lines):
-        return f"[错误] offset={offset} 超出文件行数（共 {len(lines)} 行）"
-    chunk = "\n".join(lines[offset - 1:offset - 1 + limit])
-    if len(chunk) > OUTPUT_LIMIT:  # 超长行等：只截断，按实际返回的行给下一页 offset
-        kept = chunk[:OUTPUT_LIMIT]
-        shown = kept.count("\n") + (0 if kept.endswith("\n") else 1)
-        cut = "" if kept.endswith("\n") else "（当前行余下部分未返回）"
-        return kept + (f"\n...[单次读取超过 {OUTPUT_LIMIT} 字符，已截断{cut}；"
-                       f"继续读取 offset={offset + shown}]")
-    end = min(offset - 1 + limit, len(lines))
-    if end < len(lines):
-        chunk += f"\n...[第 {offset}-{end} 行，共 {len(lines)} 行；继续读取 offset={end + 1}]"
-    return chunk
+    lines, size = [], 0
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for _ in range(offset - 1):
+                part = f.readline(OUTPUT_LIMIT + 2)
+                if not part:
+                    return f"[错误] offset={offset} 超出文件行数"
+                while part and not part.endswith("\n"):
+                    part = f.readline(OUTPUT_LIMIT + 2)
+            for _ in range(limit):
+                line = f.readline(OUTPUT_LIMIT - size + 2)
+                if not line:
+                    break
+                line = line.rstrip("\r\n")
+                size += len(line) + bool(lines)
+                lines.append(line)
+                if size > OUTPUT_LIMIT:
+                    kept = "\n".join(lines)[:OUTPUT_LIMIT]
+                    shown = kept.count("\n") + (not kept.endswith("\n"))
+                    return kept + (f"\n...[单次读取超过 {OUTPUT_LIMIT} 字符，已截断"
+                                   f"（当前行余下部分未返回）；继续读取 offset={offset + shown}]")
+            if f.read(1):
+                end = offset + len(lines) - 1
+                return "\n".join(lines) + f"\n...[第 {offset}-{end} 行；继续读取 offset={end + 1}]"
+    except OSError as e:
+        return f"[错误] 读取失败: {e}"
+    if not lines and offset > 1:
+        return f"[错误] offset={offset} 超出文件行数"
+    return "\n".join(lines)
 
 
 def _ask_user(args: dict, ctx: ToolContext) -> str:
@@ -182,8 +190,18 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
     try:
         if target:  # 只允许给注册过的目标建戳
             remote.get_target(target)
-        path = core.approve(args["command"], ttl_seconds=int(args.get("ttl_seconds", 900)),
-                            force=bool(args.get("force", False)), target=target)
+        level, _ = core.classify(args["command"])
+        where = f"目标 {target}" if target else "本机"
+        warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
+        answer = ctx.ask_user(f"批准此变更？\n目标：{where}\n风险级别：{level}{warning}\n"
+                              f"完整命令：\n{args['command']}\n"
+                              "输入“确认执行”或 yes 批准，其他回答均拒绝。")
+        if not isinstance(answer, str) or answer.strip().casefold() not in {"确认执行", "确认", "yes", "y"}:
+            core.revoke(args["command"], target)
+            core.audit("approve-deny", cmd=args["command"], level=level, target=target)
+            return "[opsx 拒绝] 用户未明确批准此命令，不创建审批戳。"
+        path = core.approve(args["command"], ttl_seconds=args.get("ttl_seconds", 900),
+                            force=args.get("force", False), target=target)
     except (core.OpsxError, remote.RemoteError) as e:
         return f"[opsx 错误] {e}"
     stamp = json.loads(path.read_text(encoding="utf-8"))
@@ -220,12 +238,7 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     where = f"目标 {target} " if target else "本机"
     if code == 0:
         return f"[完成] {where}执行成功（exit=0），{sid_text}。\n{out_text}"
-    if code == 2:
-        return (f"[opsx 拒绝] {where}守门未通过：主命令无有效审批戳，或快照抓取命令自身"
-                "未通过守门（R0 免戳，其余需自己的审批戳）。流程：变更单（写明目标）→ "
-                "ask_user 确认 → ops_approve（同一 target）建戳 → 重新 ops_exec。")
-    reason = {3: "快照失败，已中止", 4: "超时终止"}.get(code, "命令非零退出")
-    return f"[失败] {where}{reason}（exit={code}），{sid_text}。\n{out_text}"
+    return f"[失败] {where}执行未完成（exit={code}），{sid_text}。\n{out_text}"
 
 
 def _ops_rollback(args: dict, ctx: ToolContext) -> str:
@@ -366,7 +379,7 @@ def _ops_list(args: dict, ctx: ToolContext) -> str:
 REGISTRY: dict[str, dict] = {
     "bash": {
         "schema": _schema("bash",
-                          "执行 shell 命令。只读命令直接放行；写命令需有效审批戳（走变更单流程）。"
+                          "执行 shell 命令，仅放行 R0 只读命令；写命令必须走 ops_approve / ops_exec。"
                           "带 target 时在已注册的 SSH 目标机上执行（仅 R0）。",
                           {"command": {"type": "string", "description": "完整 shell 命令"},
                            "target": {"type": "string",
@@ -457,7 +470,7 @@ REGISTRY: dict[str, dict] = {
     },
     "ops_approve": {
         "schema": _schema("ops_approve",
-                          "为已获用户确认的命令创建审批戳（R3 需 force=true）。"
+                          "提交变更单后调用：工具向用户确认此命令，明确批准后才创建审批戳（R3 需 force=true）。"
                           "带 target 时戳只对该目标有效。",
                           {"command": {"type": "string"},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
@@ -513,6 +526,7 @@ def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     if tool is None:
         return f"[错误] 未知工具: {name}"
     try:
+        core.validate_arguments(args, tool["schema"]["function"]["parameters"])
         return tool["handler"](args, ctx)
     except (KeyError, TypeError) as e:
         return f"[错误] 工具参数异常: {e}"

@@ -69,7 +69,7 @@ def _render_table(lines: list[str]) -> list[str]:
     return out
 
 
-def render(text: str) -> str:
+def render(text: str, color: bool = True) -> str:
     out: list[str] = []
     lines = text.split("\n")
     i = 0
@@ -96,8 +96,8 @@ def render(text: str) -> str:
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
             level = min(len(m.group(1)), 3)
-            color = _HEAD_COLOR[level]
-            out.append(f"{color}{'▍' if level == 1 else ''}{_inline(m.group(2))}{RESET}")
+            heading_color = _HEAD_COLOR[level]
+            out.append(f"{heading_color}{'▍' if level == 1 else ''}{_inline(m.group(2))}{RESET}")
         elif re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):
             out.append(DIM + "  " + "─" * 40 + RESET)
         elif re.match(r"^\s*>", line):
@@ -110,4 +110,5 @@ def render(text: str) -> str:
         else:
             out.append(_inline(line))
         i += 1
-    return "\n".join(out)
+    result = "\n".join(out)
+    return result if color else re.sub(r"\033\[[0-9;]*m", "", result)

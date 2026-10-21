@@ -14,6 +14,7 @@ chat(on_delta=fn)    → SSE 流式：每个 content 增量回调 fn(text)，
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import urllib.error
 import urllib.request
@@ -35,14 +36,14 @@ def _api_key() -> str:
 
 def _request(url: str, body: dict, headers: dict, timeout: int):
     """POST JSON 并返回响应对象；网络/HTTP 错误统一转 LLMError。"""
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers=headers, method="POST")
     try:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     headers=headers, method="POST")
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
         raise LLMError(f"LLM API HTTP {e.code}: {detail}") from e
-    except (urllib.error.URLError, TimeoutError) as e:
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
         raise LLMError(f"LLM API 请求失败: {e}") from e
 
 
@@ -67,23 +68,59 @@ def _accumulate_tool_call(tools_acc: dict, delta: dict) -> None:
         acc["function"]["arguments"] += fn["arguments"]
 
 
+def _validate_message(msg: dict) -> dict:
+    """模型响应是执行边界；不完整的调用不能进入会话或工具分发。"""
+    if not isinstance(msg, dict) or msg.get("role") != "assistant" \
+            or (msg.get("content") is not None and not isinstance(msg["content"], str)):
+        raise LLMError("LLM 响应格式异常：缺少有效 assistant 消息")
+    calls = msg.get("tool_calls")
+    if calls is None:
+        calls = []
+    if not isinstance(calls, list):
+        raise LLMError("LLM 响应格式异常：tool_calls 必须为数组")
+    ids = set()
+    for call in calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if (not isinstance(call, dict) or not isinstance(call.get("id"), str)
+                or not call["id"] or call["id"] in ids or not isinstance(fn, dict)
+                or call.get("type", "function") != "function"
+                or not isinstance(fn.get("name"), str) or not fn["name"]
+                or not isinstance(fn.get("arguments"), str)):
+            raise LLMError("LLM 响应格式异常：工具调用缺少 id、名称或参数")
+        ids.add(call["id"])
+    if not msg.get("content") and not calls:
+        raise LLMError("LLM 响应为空")
+    return msg
+
+
 def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
     content_parts: list[str] = []
     tools_acc: dict[int, dict] = {}
+    finished = False
     with _post(body, timeout) as resp:
         for raw in resp:
-            line = raw.decode("utf-8", errors="replace").strip()
+            line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
             if payload == "[DONE]":
+                finished = True
                 break
             try:
                 event = json.loads(payload)
-            except json.JSONDecodeError:
-                continue  # 忽略心跳/注释等无法解析的行
-            delta = (event.get("choices") or [{}])[0].get("delta") or {}
+            except json.JSONDecodeError as e:
+                raise LLMError(f"LLM 流式响应解析失败: {e}") from e
+            if not isinstance(event, dict) or event.get("error"):
+                raise LLMError(f"LLM 流式错误: {json.dumps(event)[:500]}")
+            choice = (event.get("choices") or [{}])[0]
+            if choice.get("finish_reason"):
+                if choice["finish_reason"] in {"length", "content_filter"}:
+                    raise LLMError(f"LLM 流式响应未完成: {choice['finish_reason']}")
+                finished = True
+            delta = choice.get("delta") or {}
             piece = delta.get("content")
+            if piece is not None and not isinstance(piece, str):
+                raise LLMError("LLM 流式响应格式异常：content 必须是字符串")
             if piece:
                 content_parts.append(piece)
                 on_delta(piece)
@@ -91,10 +128,12 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
                 _accumulate_tool_call(tools_acc, tc)
     if not content_parts and not tools_acc:
         raise LLMError("流式响应为空（端点可能不支持 stream，或返回了非 SSE 内容）")
+    if not finished:
+        raise LLMError("LLM 流式响应中断，未收到结束标记")
     msg: dict = {"role": "assistant", "content": "".join(content_parts)}
     if tools_acc:
         msg["tool_calls"] = [tools_acc[i] for i in sorted(tools_acc)]
-    return msg
+    return _validate_message(msg)
 
 
 def chat(messages: list[dict], tools: list[dict] | None = None,
@@ -116,14 +155,21 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
     }
     if tools:
         body["tools"] = tools
-    if on_delta is not None:
-        return _chat_stream(body, timeout, on_delta)
     try:
+        if on_delta is not None:
+            return _chat_stream(body, timeout, on_delta)
         with _post(body, timeout) as resp:
             data = json.loads(resp.read().decode())
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise LLMError(f"LLM 响应解析失败: {e}") from e
+    except (OSError, http.client.HTTPException) as e:
+        raise LLMError(f"LLM API 读取失败: {e}") from e
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        raise LLMError(f"LLM 流式响应格式异常: {e}") from e
     try:
-        return data["choices"][0]["message"]
-    except (KeyError, IndexError) as e:
+        choice = data["choices"][0]
+        if choice.get("finish_reason") in {"length", "content_filter"}:
+            raise LLMError(f"LLM 响应未完成: {choice['finish_reason']}")
+        return _validate_message(choice["message"])
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
         raise LLMError(f"LLM 响应格式异常: {json.dumps(data)[:500]}") from e

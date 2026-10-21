@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -58,7 +59,12 @@ def _load() -> list[dict]:
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise ScheduleError(f"调度文件格式异常: {p}")
-    return [it for it in items if isinstance(it, dict) and it.get("id") and it.get("prompt")]
+    if any(not isinstance(it, dict)
+           or not isinstance(it.get("id"), str) or not it["id"]
+           or not isinstance(it.get("prompt"), str) or not it["prompt"].strip()
+           or not isinstance(it.get("enabled", True), bool) for it in items):
+        raise ScheduleError(f"调度文件格式异常: {p}")
+    return items
 
 
 def _save(items: list[dict]) -> None:
@@ -82,7 +88,9 @@ def _locked(name: str, block: bool = True):
     try:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
-        except OSError:
+        except BlockingIOError:
+            if block:
+                raise
             yield False
             return
         yield True
@@ -95,28 +103,59 @@ def _locked(name: str, block: bool = True):
 
 
 def _next_daily(hhmm: str, now: float) -> float:
-    try:
-        hour, minute = (int(part) for part in hhmm.split(":"))
-    except (AttributeError, TypeError, ValueError) as e:
-        raise ScheduleError(f"daily 时间格式错误: {hhmm!r}（应为 HH:MM）") from e
+    if not isinstance(hhmm, str) or not DAILY_RE.fullmatch(hhmm):
+        raise ScheduleError(f"daily 时间格式错误: {hhmm!r}（应为 HH:MM）")
+    hour, minute = (int(part) for part in hhmm.split(":"))
     lt = time.localtime(now)
     target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0, 0, 0, -1))
-    return target + 86400 if target <= now else target
+    if target <= now:
+        # 按本地日历推进；夏令时切换的两天不一定相隔 86400 秒。
+        target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1,
+                              hour, minute, 0, 0, 0, -1))
+    return target
+
+
+def _interval(value) -> int:
+    try:
+        if isinstance(value, (bool, float)):
+            raise ValueError
+        every = int(value)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ScheduleError("every_seconds 必须是整数秒") from e
+    if every < MIN_EVERY:
+        raise ScheduleError(f"间隔不能小于 {MIN_EVERY} 秒（避免打爆端点与主机）")
+    return every
 
 
 def _next_run(entry: dict, now: float) -> float:
-    if entry.get("every_seconds"):
+    every, daily = entry.get("every_seconds"), entry.get("daily")
+    if (every is not None) == (daily is not None):
+        raise ScheduleError("every_seconds 与 daily 必须二选一")
+    if every is not None:
         try:
-            return now + int(entry["every_seconds"])
-        except (TypeError, ValueError) as e:
-            raise ScheduleError(f"任务 {entry.get('id')} 的 every_seconds 损坏") from e
-    return _next_daily(entry.get("daily") or "", now)
+            next_run = now + _interval(every)
+        except OverflowError as e:
+            raise ScheduleError("every_seconds 过大") from e
+        _run_time({"next_run": next_run})
+        return next_run
+    return _next_daily(daily, now)
+
+
+def _run_time(entry: dict) -> float:
+    value = entry.get("next_run", 0)
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError
+        time.localtime(value)
+    except (TypeError, ValueError, OverflowError, OSError) as e:
+        raise ScheduleError(f"任务 {entry.get('id')} 的 next_run 损坏") from e
+    return value
 
 
 def describe(entry: dict) -> str:
     if entry.get("every_seconds"):
         return f"每 {entry['every_seconds']} 秒"
-    return f"每天 {entry['daily']}"
+    return f"每天 {entry.get('daily') or '（时间配置损坏）'}"
 
 
 def fmt_ts(ts: float) -> str:
@@ -127,20 +166,14 @@ def add(prompt: str, every_seconds=None, daily=None) -> dict:
     prompt = (prompt or "").strip()
     if not prompt:
         raise ScheduleError("prompt 不能为空")
-    if bool(every_seconds) == bool(daily):
+    if (every_seconds is not None) == (daily is not None):
         raise ScheduleError("every_seconds 与 daily 必须二选一")
     now = time.time()
     entry = {"id": "sch-" + uuid.uuid4().hex[:6], "prompt": prompt, "enabled": True,
              "every_seconds": None, "daily": None, "created": now, "last_run": None}
-    if every_seconds:
-        try:
-            every = int(every_seconds)
-        except (TypeError, ValueError) as e:
-            raise ScheduleError("every_seconds 必须是整数秒") from e
-        if every < MIN_EVERY:
-            raise ScheduleError(f"间隔不能小于 {MIN_EVERY} 秒（避免打爆端点与主机）")
-        entry["every_seconds"] = every
-        entry["next_run"] = now + every
+    if every_seconds is not None:
+        entry["every_seconds"] = _interval(every_seconds)
+        entry["next_run"] = _next_run(entry, now)
     else:
         if not isinstance(daily, str) or not DAILY_RE.fullmatch(daily):
             raise ScheduleError("daily 格式应为 HH:MM（24 小时制）")
@@ -182,11 +215,19 @@ def format_list() -> str:
     if not items:
         return '(无定时任务；添加：opsagent schedule add --daily 09:00 "检查磁盘占用")'
     lines = []
-    for it in sorted(items, key=lambda x: x["next_run"]
-                     if isinstance(x.get("next_run"), (int, float)) else 0):
+
+    def sort_key(entry):
+        try:
+            return _run_time(entry)
+        except ScheduleError:
+            return 0
+
+    for it in sorted(items, key=sort_key):
         state = "启用" if it.get("enabled", True) else "停用"
-        next_run = it.get("next_run")
-        when = fmt_ts(next_run) if isinstance(next_run, (int, float)) else "待运行"
+        try:
+            when = fmt_ts(_run_time(it))
+        except ScheduleError:
+            when = "时间配置损坏"
         lines.append(f"{it['id']}  {describe(it)}  下次 {when}  {state}  "
                      f"{it['prompt'][:60]}")
     return "\n".join(lines)
@@ -197,7 +238,8 @@ def _run_entry(entry: dict, model: str | None) -> str:
     ctx = tools.ToolContext(ask_user=None, model=model, allowed=tools.SCHEDULED_TOOLS)
     try:
         return loop.run_turn(entry["prompt"], sess_mod.Session(), ctx,
-                             system=SCHEDULE_PROMPT, max_turns=SCHEDULE_MAX_TURNS,
+                             system=loop._default_system(SCHEDULE_PROMPT),
+                             max_turns=SCHEDULE_MAX_TURNS,
                              model=model)
     except Exception as e:  # noqa: BLE001 —— 单次巡检失败不拖垮守护进程
         return f"[schedule 失败] {e}"
@@ -208,20 +250,24 @@ def run_due(model: str | None = None) -> list[tuple[dict, str]]:
     now = time.time()
     with _locked("schedules.mutex"):
         items = _load()
-        candidates = [it for it in items
-                      if it.get("enabled", True) and now >= it.get("next_run", 0)]
-        due = []
-        for it in candidates:
+        due, changed = [], False
+        for it in items:
+            if not it.get("enabled", True):
+                continue
             try:
+                if now < _run_time(it):
+                    continue
                 next_run = _next_run(it, now)
             except ScheduleError:  # 单条任务时间配置损坏：停用它，别卡住其他巡检
                 it["enabled"] = False
+                changed = True
                 core.audit("schedule-disable", id=it["id"], reason="时间配置损坏")
                 continue
             it["last_run"] = now
             it["next_run"] = next_run
             due.append(it)
-        if candidates:
+            changed = True
+        if changed:
             _save(items)
     results = []
     for entry in due:
@@ -235,8 +281,12 @@ def run_due(model: str | None = None) -> list[tuple[dict, str]]:
 def _sleep_seconds() -> float:
     now = time.time()
     items = [it for it in _load() if it.get("enabled", True)]
-    values = [it["next_run"] for it in items
-              if isinstance(it.get("next_run"), (int, float))]
+    values = []
+    for it in items:
+        try:
+            values.append(_run_time(it))
+        except ScheduleError:
+            return 1.0  # 让下一轮 run_due 停用损坏条目。
     if not values:
         return 60.0
     return max(1.0, min(60.0, min(values) - now))

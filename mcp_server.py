@@ -116,6 +116,10 @@ def _require(args, key):
 
 
 def call_tool(name, args):
+    tool = next((t for t in TOOLS if t["name"] == name), None)
+    if tool is None:
+        raise core.OpsxError(f"未知工具: {name}")
+    core.validate_arguments(args, tool["inputSchema"])
     if name == "ops_check":
         cmd = _require(args, "command")
         level, _ = core.classify(cmd)
@@ -130,8 +134,8 @@ def call_tool(name, args):
     if name == "ops_approve":
         path = core.approve(
             _require(args, "command"),
-            ttl_seconds=int(args.get("ttl_seconds", 900)),
-            force=bool(args.get("force", False)),
+            ttl_seconds=args.get("ttl_seconds", 900),
+            force=args.get("force", False),
         )
         stamp = json.loads(path.read_text(encoding="utf-8"))
         return _result({"stamp_file": path.name, "level": stamp["level"], "ttl_seconds": stamp["ttl"]})
@@ -153,14 +157,15 @@ def call_tool(name, args):
     if name == "ops_list":
         return _result(core.collect_state())
     if name == "ops_audit":
-        tail = int(args.get("tail", 20))
+        tail = args.get("tail", 20)
+        if tail < 0:
+            raise core.OpsxError("tail 不能为负数")
         path = core.STATE_DIR / "audit.jsonl"
         events = []
-        if path.exists():
+        if tail and path.exists():
             for line in path.read_text(encoding="utf-8").strip().splitlines()[-tail:]:
                 events.append(json.loads(line))
         return _result({"events": events})
-    raise core.OpsxError(f"未知工具: {name}")
 
 
 def handle_message(msg):
@@ -169,10 +174,18 @@ def handle_message(msg):
         return _err(None, -32600, "请求必须是 JSON 对象")
     method = msg.get("method")
     msg_id = msg.get("id")
+    if (msg.get("jsonrpc") != "2.0" or not isinstance(method, str)
+            or ("id" in msg and msg_id is not None and type(msg_id) not in (str, int))):
+        return _err(None, -32600, "请求格式异常")
     if "id" not in msg:
         return None  # JSON-RPC 通知，一律不响应
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        return _err(msg_id, -32602, "params 必须是对象")
     if method == "initialize":
-        params = msg.get("params") or {}
+        if "protocolVersion" in params and (not isinstance(params["protocolVersion"], str)
+                                              or not params["protocolVersion"]):
+            return _err(msg_id, -32602, "protocolVersion 必须是非空字符串")
         return {"jsonrpc": "2.0", "id": msg_id, "result": {
             "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION_DEFAULT),
             "capabilities": {"tools": {"listChanged": False}},
@@ -183,9 +196,8 @@ def handle_message(msg):
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
     if method == "tools/call":
-        params = msg.get("params") or {}
         tool_name = params.get("name", "")
-        tool_args = params.get("arguments") or {}
+        tool_args = params.get("arguments", {})
         try:
             result = call_tool(tool_name, tool_args)
         except core.OpsxError as e:

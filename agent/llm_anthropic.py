@@ -12,9 +12,10 @@ BASE_URL 末尾带 /v1 时按代理惯例只补 /messages，否则补 /v1/messag
 from __future__ import annotations
 
 import json
+import http.client
 import os
 
-from .llm import LLMError, _api_key, _request
+from .llm import LLMError, _api_key, _request, _validate_message
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -112,11 +113,21 @@ def _body(messages: list[dict], tools: list[dict] | None, model: str | None,
 
 def _message(data: dict) -> dict:
     """Anthropic 响应 → OpenAI 形状 message。"""
+    if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+        raise LLMError("LLM 响应格式异常：缺少 content 数组")
+    if data.get("stop_reason") == "max_tokens":
+        raise LLMError("LLM 响应未完成: max_tokens")
     content_parts, tool_calls = [], []
     for block in data.get("content") or []:
+        if not isinstance(block, dict):
+            raise LLMError("LLM 响应格式异常：无效内容块")
         if block.get("type") == "text":
+            if not isinstance(block.get("text"), str):
+                raise LLMError("LLM 响应格式异常：text 必须是字符串")
             content_parts.append(block.get("text") or "")
         elif block.get("type") == "tool_use":
+            if not isinstance(block.get("input"), dict):
+                raise LLMError("LLM 响应格式异常：工具 input 必须是对象")
             tool_calls.append({"id": block.get("id") or "", "type": "function",
                                "function": {"name": block.get("name") or "",
                                             "arguments": json.dumps(block.get("input") or {},
@@ -126,27 +137,35 @@ def _message(data: dict) -> dict:
         msg["tool_calls"] = tool_calls
     if not msg["content"] and not tool_calls:
         raise LLMError(f"LLM 响应格式异常: {json.dumps(data)[:500]}")
-    return msg
+    return _validate_message(msg)
 
 
 def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
     content_parts: list[str] = []
     tools_acc: dict[int, dict] = {}  # 块 index → 未完成的 tool_use
+    finished = False
     with _request(_endpoint(), body, _headers(), timeout) as resp:
         for raw in resp:
-            line = raw.decode("utf-8", errors="replace").strip()
+            line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):  # event: / ping 等行跳过
                 continue
             try:
                 event = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as e:
+                raise LLMError(f"LLM 流式响应解析失败: {e}") from e
+            if not isinstance(event, dict):
+                raise LLMError("LLM 流式响应格式异常")
             etype = event.get("type")
             if etype == "error":
                 raise LLMError(f"LLM 流式错误: {json.dumps(event)[:500]}")
             if etype == "content_block_start":
                 block = event.get("content_block") or {}
-                if block.get("type") == "tool_use":
+                if block.get("type") == "text" and block.get("text"):
+                    if not isinstance(block["text"], str):
+                        raise LLMError("LLM 流式响应格式异常：text 必须是字符串")
+                    content_parts.append(block["text"])
+                    on_delta(block["text"])
+                elif block.get("type") == "tool_use":
                     tools_acc[event.get("index", 0)] = {
                         "id": block.get("id") or "", "name": block.get("name") or "",
                         "json": "", "input": block.get("input") or {}}
@@ -154,6 +173,8 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
                 delta = event.get("delta") or {}
                 if delta.get("type") == "text_delta":
                     piece = delta.get("text") or ""
+                    if not isinstance(piece, str):
+                        raise LLMError("LLM 流式响应格式异常：text 必须是字符串")
                     if piece:
                         content_parts.append(piece)
                         on_delta(piece)
@@ -161,10 +182,15 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
                     acc = tools_acc.setdefault(event.get("index", 0),
                                                {"id": "", "name": "", "json": "", "input": {}})
                     acc["json"] += delta.get("partial_json") or ""
+            elif etype == "message_delta" and (event.get("delta") or {}).get("stop_reason") == "max_tokens":
+                raise LLMError("LLM 流式响应未完成: max_tokens")
             elif etype == "message_stop":
+                finished = True
                 break
     if not content_parts and not tools_acc:
         raise LLMError("流式响应为空（端点可能不支持 stream，或返回了非 SSE 内容）")
+    if not finished:
+        raise LLMError("LLM 流式响应中断，未收到结束标记")
     msg: dict = {"role": "assistant", "content": "".join(content_parts)}
     if tools_acc:
         msg["tool_calls"] = []
@@ -173,17 +199,21 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
             arguments = acc["json"] or json.dumps(acc["input"], ensure_ascii=False)
             msg["tool_calls"].append({"id": acc["id"], "type": "function",
                                       "function": {"name": acc["name"], "arguments": arguments}})
-    return msg
+    return _validate_message(msg)
 
 
 def chat(messages: list[dict], tools: list[dict] | None = None,
          model: str | None = None, timeout: int = 300, on_delta=None) -> dict:
     body = _body(messages, tools, model, stream=on_delta is not None)
-    if on_delta is not None:
-        return _chat_stream(body, timeout, on_delta)
     try:
+        if on_delta is not None:
+            return _chat_stream(body, timeout, on_delta)
         with _request(_endpoint(), body, _headers(), timeout) as resp:
             data = json.loads(resp.read().decode())
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise LLMError(f"LLM 响应解析失败: {e}") from e
+    except (OSError, http.client.HTTPException) as e:
+        raise LLMError(f"LLM API 读取失败: {e}") from e
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        raise LLMError(f"LLM 流式响应格式异常: {e}") from e
     return _message(data)

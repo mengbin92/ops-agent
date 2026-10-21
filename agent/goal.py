@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
+from .schedule import _locked  # noqa: E402
 
 DEFAULT_MAX_ROUNDS = 6
 MAX_ROUNDS = 20
@@ -39,8 +40,14 @@ def _load() -> dict:
     if not isinstance(data, dict):
         raise GoalError(f"目标文件格式异常: {p}")
     for st in data.values():
-        if not isinstance(st, dict) or not {"id", "objective", "status",
-                                            "rounds_used", "max_rounds"} <= st.keys():
+        if (not isinstance(st, dict)
+                or not isinstance(st.get("id"), str) or not st["id"]
+                or not isinstance(st.get("objective"), str) or not st["objective"].strip()
+                or st.get("status") not in ("active", "paused", "completed", "blocked")
+                or type(st.get("max_rounds")) is not int
+                or not 1 <= st["max_rounds"] <= MAX_ROUNDS
+                or type(st.get("rounds_used")) is not int
+                or not 0 <= st["rounds_used"] <= st["max_rounds"]):
             raise GoalError(f"目标文件格式异常: {p}")
     return data
 
@@ -71,50 +78,52 @@ def create(session_id: str, objective: str, max_rounds: int = DEFAULT_MAX_ROUNDS
     except (TypeError, ValueError) as e:
         raise GoalError("max_rounds 必须是整数") from e
     rounds = max(1, min(rounds, MAX_ROUNDS))
-    state = _load()
-    current = state.get(session_id)
-    if current and current.get("status") in ("active", "paused"):
-        raise GoalError(f"已有进行中的目标 {current['id']}（{current['status']}）："
-                        "先 complete/blocked，或用已有目标继续")
-    now = time.time()
-    st = {"id": "g-" + uuid.uuid4().hex[:6], "objective": objective, "status": "active",
-          "rounds_used": 0, "max_rounds": rounds, "created": now, "updated": now, "reason": ""}
-    state[session_id] = st
-    _save(state)
-    core.audit("goal-create", session=session_id, id=st["id"], objective=objective)
-    return st
+    with _locked("goals.mutex"):
+        state = _load()
+        current = state.get(session_id)
+        if current and current.get("status") in ("active", "paused"):
+            raise GoalError(f"已有进行中的目标 {current['id']}（{current['status']}）："
+                            "先 complete/blocked，或用已有目标继续")
+        now = time.time()
+        st = {"id": "g-" + uuid.uuid4().hex[:6], "objective": objective, "status": "active",
+              "rounds_used": 0, "max_rounds": rounds, "created": now, "updated": now, "reason": ""}
+        state[session_id] = st
+        _save(state)
+        core.audit("goal-create", session=session_id, id=st["id"], objective=objective)
+        return st
 
 
 def update(session_id: str, action: str, reason: str = "") -> dict:
-    state = _load()
-    st = state.get(session_id)
-    if not st:
-        raise GoalError("当前没有目标")
-    reason = (reason or "").strip()
-    if action == "complete":
-        st["status"], st["reason"] = "completed", reason
-    elif action == "blocked":
-        if not reason:
-            raise GoalError("blocked 需要说明原因（reason）")
-        st["status"], st["reason"] = "blocked", reason
-    elif action == "pause":
-        if st["status"] not in ("active", "paused"):
-            raise GoalError(f"目标状态为 {st['status']}，不能暂停")
-        if st["status"] == "active":
-            st["reason"] = ""
-        st["status"] = "paused"
-    elif action == "resume":
-        if st["status"] == "completed":
-            raise GoalError("目标已完成；要开新目标请 create")
-        st["status"], st["reason"] = "active", ""
-        st["rounds_used"] = 0  # 显式恢复给一轮新预算
-    else:
-        raise GoalError(f"未知动作: {action}")
-    st["updated"] = time.time()
-    state[session_id] = st
-    _save(state)
-    core.audit("goal-update", session=session_id, id=st["id"], action=action, status=st["status"])
-    return st
+    with _locked("goals.mutex"):
+        state = _load()
+        st = state.get(session_id)
+        if not st:
+            raise GoalError("当前没有目标")
+        reason = (reason or "").strip()
+        if action == "complete":
+            st["status"], st["reason"] = "completed", reason
+        elif action == "blocked":
+            if not reason:
+                raise GoalError("blocked 需要说明原因（reason）")
+            st["status"], st["reason"] = "blocked", reason
+        elif action == "pause":
+            if st["status"] not in ("active", "paused"):
+                raise GoalError(f"目标状态为 {st['status']}，不能暂停")
+            if st["status"] == "active":
+                st["reason"] = ""
+            st["status"] = "paused"
+        elif action == "resume":
+            if st["status"] == "completed":
+                raise GoalError("目标已完成；要开新目标请 create")
+            st["status"], st["reason"] = "active", ""
+            st["rounds_used"] = 0  # 显式恢复给一轮新预算
+        else:
+            raise GoalError(f"未知动作: {action}")
+        st["updated"] = time.time()
+        state[session_id] = st
+        _save(state)
+        core.audit("goal-update", session=session_id, id=st["id"], action=action, status=st["status"])
+        return st
 
 
 def format_one(st: dict | None) -> str:
@@ -129,18 +138,19 @@ def format_one(st: dict | None) -> str:
 
 def continuation(session_id: str) -> str | None:
     """需要续跑时返回注入文本并消耗一轮预算；否则 None（到上限自动暂停）。"""
-    state = _load()
-    st = state.get(session_id)
-    if not st or st.get("status") != "active":
-        return None
-    if st["rounds_used"] >= st["max_rounds"]:
-        st.update(status="paused", reason="已达续跑上限；/goal resume 可再给一轮预算")
+    with _locked("goals.mutex"):
+        state = _load()
+        st = state.get(session_id)
+        if not st or st.get("status") != "active":
+            return None
+        if st["rounds_used"] >= st["max_rounds"]:
+            st.update(status="paused", reason="已达续跑上限；/goal resume 可再给一轮预算")
+            st["updated"] = time.time()
+            _save(state)
+            return None
+        st["rounds_used"] += 1
         st["updated"] = time.time()
         _save(state)
-        return None
-    st["rounds_used"] += 1
-    st["updated"] = time.time()
-    _save(state)
-    return (f"[目标自动续跑 {st['rounds_used']}/{st['max_rounds']}] 目标：{st['objective']}\n"
-            "继续推进该目标，不要重复已完成的工作；完成后用 goal 工具 action=complete，"
-            "受阻则 action=blocked 并说明原因。")
+        return (f"[目标自动续跑 {st['rounds_used']}/{st['max_rounds']}] 目标：{st['objective']}\n"
+                "继续推进该目标，不要重复已完成的工作；完成后用 goal 工具 action=complete，"
+                "受阻则 action=blocked 并说明原因。")

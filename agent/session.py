@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +37,9 @@ def _prune_sessions() -> None:
 
 class Session:
     def __init__(self, session_id: str | None = None):
+        if session_id is not None and (not isinstance(session_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id)):
+            raise ValueError("无效会话 id")
         self.id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         self.path = core.STATE_DIR / "sessions" / f"{self.id}.jsonl"
         self.messages: list[dict] = []
@@ -43,21 +49,54 @@ class Session:
             _prune_sessions()  # 新会话时顺带修剪
 
     def _load(self) -> None:
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            rec = json.loads(line)
-            if rec.get("format"):
-                continue
-            self.messages.append(rec)
+        with self.path.open("r+b") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            os.fchmod(f.fileno(), 0o600)
+            lines = f.readlines()
+            offset = 0
+            for i, line in enumerate(lines):
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    if i > 0 and i == len(lines) - 1 and not line.endswith(b"\n"):
+                        f.truncate(offset)  # 崩溃留下的未完整写入尾行，保留之前的完整记录。
+                        break
+                    raise ValueError(f"会话文件损坏（第 {i + 1} 行）") from e
+                if not isinstance(rec, dict):
+                    raise ValueError(f"会话记录不是对象（第 {i + 1} 行）")
+                if i == 0:
+                    if type(rec.get("format")) is not int or rec["format"] != FORMAT_VERSION \
+                            or rec.get("id") != self.id:
+                        raise ValueError("不支持的会话格式或会话 id 不匹配")
+                elif rec.get("role") not in {"user", "assistant", "tool", "system"}:
+                    raise ValueError(f"会话消息缺少有效 role（第 {i + 1} 行）")
+                else:
+                    self.messages.append(rec)
+                offset += len(line)
+            else:
+                if lines and not lines[-1].endswith(b"\n"):
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n")
+            if not lines:
+                raise ValueError("会话文件为空")
 
     def append(self, message: dict) -> None:
+        record = json.dumps(message, ensure_ascii=False) + "\n"
+        core.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(core.STATE_DIR, 0o700)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            os.fchmod(f.fileno(), 0o600)
+            new_file = os.fstat(f.fileno()).st_size == 0
+            header = json.dumps({"format": FORMAT_VERSION, "id": self.id,
+                                 "created": time.time()}, ensure_ascii=False) + "\n"
+            f.write((header if new_file else "") + record)
         self.messages.append(message)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.write_text(json.dumps(
-                {"format": FORMAT_VERSION, "id": self.id,
-                 "created": time.time()}, ensure_ascii=False) + "\n", encoding="utf-8")
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+        if new_file:
+            _prune_sessions()
 
 
 def list_sessions() -> list[dict]:
@@ -69,15 +108,12 @@ def list_sessions() -> list[dict]:
     for p in d.glob("*.jsonl"):
         preview, turns = "", 0
         try:
-            for line in p.read_text(encoding="utf-8").splitlines():
-                rec = json.loads(line)
-                if rec.get("format"):
-                    continue
+            for rec in Session(p.stem).messages:
                 if rec.get("role") == "user":
                     turns += 1
                     if not preview:
                         preview = str(rec.get("content", ""))[:60]
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
         try:
             mtime = p.stat().st_mtime

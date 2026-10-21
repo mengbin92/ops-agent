@@ -39,7 +39,8 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
 ## 最高原则
 1. **默认只读**：优先用只读命令查状态、看日志、定位问题。写操作是例外。
 2. **写操作强制流程**：输出变更单（目标环境、完整命令、风险说明、回滚计划、快照计划）→
-   用 ask_user 请用户确认 → 用 ops_approve 创建审批戳 → 用 ops_exec（带快照参数）原子执行。
+   用 ops_approve 请求用户确认并创建审批戳 → 用 ops_exec（带快照参数）原子执行。
+   ops_approve 自带人工确认，不要为同一审批先调用 ask_user；ask_user 用于普通澄清。
    用户取消变更时，用 ops_revoke 立即撤销已建审批戳。
 3. **禁止拆分命令规避审批**、禁止在复合命令里夹带未申报的命令段。
 
@@ -100,12 +101,12 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
 - 只读排查时先给结论再给证据（命令+关键输出摘要）。"""
 
 
-def _default_system() -> str:
-    """主代理 system prompt：拼装长期记忆（子代理等传入独立 system 时不注入）。"""
+def _default_system(system: str = SYSTEM_PROMPT) -> str:
+    """给主代理/定时巡检的提示拼装长期记忆；子代理保留独立上下文。"""
     mem = memory_mod.recall()
     if not mem:
-        return SYSTEM_PROMPT
-    return SYSTEM_PROMPT + "\n\n## 长期记忆（自动加载，可能过时，以现状为准）\n" + mem
+        return system
+    return system + "\n\n## 长期记忆（自动加载，可能过时，以现状为准）\n" + mem
 
 
 SUBAGENT_PROMPT = """你是 ops-agent 的只读排查子代理。主代理把独立检查任务并行下发给你，
@@ -131,12 +132,24 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
     返回最终文本。
     """
     emit = on_event or (lambda kind, payload: None)
+    # 中断后的工具结果未知，补齐协议后让模型核实，不能重放可能已执行的写操作。
+    pending = {}
+    for message in session.messages:
+        if message.get("role") == "assistant":
+            pending.update({call["id"]: call["function"]["name"]
+                            for call in message.get("tool_calls") or []})
+        elif message.get("role") == "tool":
+            pending.pop(message.get("tool_call_id"), None)
+    for call_id, name in pending.items():
+        session.append({"role": "tool", "tool_call_id": call_id, "name": name,
+                        "content": "[中断] 工具调用未记录结果，可能已执行；请先核实状态，勿直接重试写操作。"})
     session.append({"role": "user", "content": user_input})
     final_text = ""
     for _ in range(max_turns):
         messages = compact([{"role": "system", "content": system or _default_system()}]
                            + session.messages)
-        msg = llm.chat(messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta)
+        msg = llm._validate_message(llm.chat(
+            messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta))
         # 规范化为可持久化结构
         record = {"role": "assistant", "content": msg.get("content") or ""}
         if msg.get("tool_calls"):
@@ -152,11 +165,16 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
             name = call["function"]["name"]
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            emit("tool", {"phase": "call", "name": name, "args": args})
-            result = tools.dispatch(name, args, ctx)
-            emit("tool", {"phase": "result", "name": name, "result": result[:500]})
+                if not isinstance(args, dict):
+                    raise ValueError("参数必须是 JSON 对象")
+            except ValueError as e:
+                result = f"[错误] 工具参数不是有效 JSON 对象: {e}"
+            else:
+                emit("tool", {"phase": "call", "name": name, "args": args})
+                result = tools.dispatch(name, args, ctx)
             session.append({"role": "tool", "tool_call_id": call["id"],
                             "name": name, "content": result})
-    return final_text or "[已达最大轮次保护，终止]"
+            emit("tool", {"phase": "result", "name": name, "result": result[:500]})
+    warning = "[已达最大轮次保护，终止]"
+    emit("text", warning)
+    return (final_text + "\n" if final_text else "") + warning

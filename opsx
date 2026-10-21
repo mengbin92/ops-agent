@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,6 +17,23 @@ import remote  # noqa: E402
 
 def _join(parts: list[str]) -> str:
     return " ".join(parts)
+
+
+def _guarded_cli(command: str) -> bool:
+    # 仅豁免无 shell 展开/拼接的本仓库入口；内层命令由 exec/snapshot 自行守门。
+    word = r'''(?:[\w./:=,+@%~-]|'[^']*'|"[^"$`\\]*")+'''
+    if not re.fullmatch(rf"[ \t]*{word}(?:[ \t]+{word})*[ \t]*", command):
+        return False
+    argv = shlex.split(command)
+    if not argv:
+        return False
+    exe = Path(argv[0]).expanduser() if "/" in argv[0] else Path(shutil.which(argv[0]) or "/")
+    if exe.resolve() == Path(sys.executable).resolve() and len(argv) > 1:
+        argv = argv[1:]
+        exe = Path(argv[0]).expanduser()
+    return (exe.resolve() == core.REPO_DIR / "opsx" and len(argv) > 1
+            and argv[1] in {"check", "approve", "revoke", "exec", "snapshot", "rollback",
+                            "list", "targets", "audit", "selftest"})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
                 if not command.strip():
                     print("[opsx] hook: 空命令，拒绝执行", file=sys.stderr)
                     return 2
+                if _guarded_cli(command):
+                    core.audit("hook", cmd=command, result="allow-guarded-cli")
+                    return 0
                 code, msg = core.check(command)
                 if code != 0:
                     print(msg, file=sys.stderr)
@@ -103,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
             snap_cmds = []
             for spec in args.snapshot_cmd:
                 name, _, cmd = spec.partition("::")
+                if not _:
+                    name, cmd = "", spec
+                if not cmd.strip():
+                    raise core.OpsxError("快照命令不能为空")
                 snap_cmds.append((cmd, name))
             cmd = _join(args.command)
             if args.target:
@@ -139,12 +166,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.sub == "audit":
+            if args.tail < 0:
+                raise core.OpsxError("tail 不能为负数")
             f = core.STATE_DIR / "audit.jsonl"
             if not f.exists():
                 print("(无审计日志)")
                 return 0
             lines = f.read_text(encoding="utf-8").strip().splitlines()
-            for line in lines[-args.tail:]:
+            for line in lines[-args.tail:] if args.tail else []:
                 print(line)
             return 0
 
