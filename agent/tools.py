@@ -43,16 +43,18 @@ class ToolContext:
     model：父代理使用的模型，子代理沿用（--model 覆盖时保持一致）。
     session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
     goal_continuation：只有 REPL 会跨轮续跑，-p/RPC/定时任务为 False。
+    deadline：整任务时间预算（time.monotonic 秒），None = 不设限；轮次边界停止。
     """
 
     def __init__(self, ask_user=None, allowed: set[str] | None = None,
                  model: str | None = None, session_id: str | None = None,
-                 goal_continuation: bool = False):
+                 goal_continuation: bool = False, deadline: float | None = None):
         self.ask_user = ask_user
         self.allowed = allowed
         self.model = model
         self.session_id = session_id
         self.goal_continuation = goal_continuation
+        self.deadline = deadline
 
 
 def _schema(name, description, properties, required):
@@ -292,18 +294,17 @@ SUBAGENT_MAX_TURNS = 8
 WORKFLOW_PREV_LIMIT = 6000
 CHECKS_PROMPT_LIMIT = 12000    # 注入 {checks} 的规则报告字符数
 STEP_INDEX_CLIP = 400          # {steps} 里每步摘要的字符数
-MAX_TURNS_MARK = "[已达最大轮次保护"
 
 # 单次替换：替入内容里再出现 {prev} 之类的文本不会被二次替换成别的内容。
 _PLACEHOLDER = re.compile(r"\{(prev|checks|steps)\}")
 
 
 def _run_isolated(task: str, ctx: ToolContext, system: str | None = None) -> str:
-    """跑一个只读子代理（子代理与 workflow 步骤共用）。"""
+    """跑一个只读子代理（子代理与 workflow 步骤共用）。时间预算沿父上下文。"""
     from . import loop  # 延迟导入：loop 依赖本模块
     sub_session = session_mod.Session()
     sub_ctx = ToolContext(ask_user=None, allowed=SUBAGENT_TOOLS, model=ctx.model,
-                          session_id=sub_session.id)
+                          session_id=sub_session.id, deadline=ctx.deadline)
     return loop.run_turn(task, sub_session, sub_ctx,
                          system=system or loop.SUBAGENT_PROMPT,
                          model=ctx.model, max_turns=SUBAGENT_MAX_TURNS)
@@ -311,6 +312,8 @@ def _run_isolated(task: str, ctx: ToolContext, system: str | None = None) -> str
 
 def _subagent(args: dict, ctx: ToolContext) -> str:
     """并行只读排查：每个任务一个受限子代理，返回各自的结论与证据。"""
+    if ctx.deadline is not None and time.monotonic() > ctx.deadline:
+        return "[任务超时] 时间预算耗尽，未派生子代理"
     tasks = [str(t).strip() for t in args.get("tasks") or [] if str(t).strip()]
     if not tasks:
         return "[错误] tasks 不能为空：每个子任务写清目标与要回答的问题"
@@ -339,14 +342,17 @@ def _subagent(args: dict, ctx: ToolContext) -> str:
 def _step_reason(result: str) -> str:
     """步骤没真正完成的原因；空串表示完成。
 
-    只认异常会漏判：模型空回复、以及 run_turn 到 max_turns 后附上的
-    "[已达最大轮次保护，终止]" 都不是完整解读，不能算成功。
+    只认异常会漏判：模型空回复、run_turn 到 max_turns、以及被整任务时间预算
+    截断，都不是完整解读，不能算成功。
     """
+    from . import loop  # 标记常量与 loop 同源，避免两处各写一份字符串
     if not (result or "").strip():
         return "空输出"
     if result.startswith("[失败]"):
         return "异常"
-    if MAX_TURNS_MARK in result:
+    if loop.DEADLINE_MARK in result:
+        return "时间预算耗尽"
+    if loop.MAX_TURNS_MARK in result:
         return "超轮次保护"
     return ""
 
@@ -458,6 +464,15 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
 
     prev, index, failed = "", [], 0
     for i, step in enumerate(wf["steps"], 1):
+        if ctx.deadline is not None and time.monotonic() > ctx.deadline:
+            result = (f"[失败] 时间预算耗尽，本步未执行"
+                      f"（含本步在内剩余 {len(wf['steps']) - i + 1} 步同样不再运行）")
+            sections.append(f"## 步骤 {i}: {step['name']}\n{result}")
+            index.append({"n": i, "name": step["name"], "ok": False,
+                          "reason": "时间预算耗尽", "text": result})
+            prev = result
+            failed += 1
+            continue
         prompt = _fill_prompt(step["prompt"], {
             "prev": prev[:WORKFLOW_PREV_LIMIT] if prev else "（无）",
             "checks": checks_prompt,
@@ -498,14 +513,36 @@ def _schedule(args: dict, ctx: ToolContext) -> str:
         if action == "add":
             entry = schedule_mod.add(args.get("prompt") or "",
                                      every_seconds=args.get("every_seconds"),
-                                     daily=args.get("daily"))
+                                     daily=args.get("daily"),
+                                     timeout_seconds=args.get("timeout_seconds"))
             return (f"[schedule] 已添加 {entry['id']}：{schedule_mod.describe(entry)}，"
                     f"下次 {schedule_mod.fmt_ts(entry['next_run'])}"
                     "（无人值守只读运行，写操作会被拒绝）")
         if action == "remove":
             entry = schedule_mod.remove(args.get("id") or "")
             return f"[schedule] 已删除 {entry['id']}"
-        return "[错误] action 应为 list / add / remove"
+        if action == "pause":
+            entry = schedule_mod.pause(args.get("id") or "")
+            return f"[schedule] 已暂停 {entry['id']}（resume 恢复，暂停期不补跑）"
+        if action == "resume":
+            entry = schedule_mod.resume(args.get("id") or "")
+            return (f"[schedule] 已恢复 {entry['id']}，下次 "
+                    f"{schedule_mod.fmt_ts(schedule_mod._run_time(entry))}")
+        if action == "runs":
+            # 查询前对账：daemon 被 kill 后遗留的 running 记录应显示为中断
+            schedule_mod.reconcile_runs()
+            key = (args.get("id") or "").strip()
+            prefix = False
+            if key:
+                try:
+                    key = schedule_mod.resolve_id(key)
+                except schedule_mod.ScheduleError:
+                    prefix = True  # 任务已删除：按 id 前缀查历史
+            tail = args.get("tail", 20)
+            if type(tail) is not int or tail < 0:
+                return "[错误] tail 须为非负整数"
+            return schedule_mod.format_runs(task_id=key or None, tail=tail, prefix=prefix)
+        return "[错误] action 应为 list / runs / add / remove / pause / resume"
     except schedule_mod.ScheduleError as e:
         return f"[schedule] {e}"
 
@@ -621,13 +658,19 @@ REGISTRY: dict[str, dict] = {
     },
     "schedule": {
         "schema": _schema("schedule",
-                          "定时巡检：action=list 查看；add 添加（every_seconds 或 daily 'HH:MM' 二选一，"
-                          "prompt 要写清只读要求）；remove 删除（id 可用唯一前缀）。",
-                          {"action": {"type": "string", "enum": ["list", "add", "remove"]},
+                          "定时巡检：list 查看；add 添加（every_seconds 或 daily 'HH:MM' 二选一，"
+                          "timeout_seconds 是整任务时间预算，默认 900s）；pause/resume 暂停/恢复"
+                          "（暂停期不补跑）；runs 查看运行历史（含中断/错过的执行）；"
+                          "remove 删除。任务 id 可用唯一前缀。",
+                          {"action": {"type": "string",
+                                      "enum": ["list", "runs", "add", "remove", "pause", "resume"]},
                            "prompt": {"type": "string", "description": "巡检指令（无人值守、只读）"},
                            "every_seconds": {"type": "integer", "description": "每隔多少秒（>= 60）"},
                            "daily": {"type": "string", "description": "每天本地时间 HH:MM"},
-                           "id": {"type": "string", "description": "remove 时的任务 id（可用前缀）"}},
+                           "timeout_seconds": {"type": "integer",
+                                               "description": "整任务时间预算秒数（60-86400，默认 900）"},
+                           "id": {"type": "string", "description": "任务 id（可用唯一前缀）"},
+                           "tail": {"type": "integer", "description": "runs 的条数，默认 20"}},
                           ["action"]),
         "handler": _schedule, "read_only": False,
     },

@@ -1,14 +1,19 @@
 """agent loop：消息装配 → LLM 调用 → 工具分发 → 结果回填，最大轮次保护。
 
 与前端解耦：前端提供 ToolContext（人机回路）与 on_event 回调（渲染）。
+ctx.deadline（monotonic 秒）是整任务时间预算：在轮次边界停止——一次 LLM 调用
+有自身超时（默认 300s），所以超预算的上界是「预算 + 一轮」，不会永久阻塞。
 """
 from __future__ import annotations
 
 import json
+import time
 
 from . import llm, memory as memory_mod, session as sess_mod, tools
 
 MAX_TURNS = 40
+DEADLINE_MARK = "[任务超时]"        # 时间预算耗尽的标记：调度层据此把运行记为 timeout
+MAX_TURNS_MARK = "[已达最大轮次保护"  # 轮次耗尽的标记：调度层据此把结论降级为"不完整"
 
 # basic compaction：发送给 LLM 的消息总字符数超阈值时，把早期 tool result 裁剪为占位符。
 # 只裁剪"发送内容"，session 文件保留完整记录（审计与追溯不受影响）。
@@ -90,8 +95,11 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
 
 ## 定时巡检（schedule）
 - 用户要"每天 / 每 N 分钟检查一次"时，用 `schedule` 工具 action=add（`every_seconds` 或
-  `daily: "HH:MM"` 二选一）；action=list 查看、action=remove 取消。
+  `daily: "HH:MM"` 二选一；`timeout_seconds` 是整任务时间预算，默认 900s）；
+  action=list 查看、runs 查运行历史（含中断/错过）、pause/resume 暂停恢复、remove 取消。
 - 定时任务在无人值守环境只读运行：prompt 要写清"只读检查并报告异常，需要变更只给建议"。
+- 排查"昨天那次巡检跑了吗/为什么没跑"时用 action=runs：status 为 interrupted 表示进程被杀，
+  missed 表示停机错过，failed/timeout 各自有 error 说明。
 
 ## 巡检工作流（workflow）
 - 需要按固定步骤反复巡检时，先 `workflow` 列目录，再 `workflow {"name": "..."}` 运行。
@@ -165,6 +173,11 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
     session.append({"role": "user", "content": user_input})
     final_text = ""
     for _ in range(max_turns):
+        if ctx.deadline is not None and time.monotonic() > ctx.deadline:
+            warning = (f"{DEADLINE_MARK} 已终止：任务时间预算耗尽"
+                       "（在轮次边界停止；已完成部分仍在会话中，可 /resume 回看）")
+            emit("text", warning)
+            return (final_text + "\n" if final_text else "") + warning
         messages = compact([{"role": "system", "content": system or _default_system()}]
                            + session.messages)
         msg = llm._validate_message(llm.chat(
@@ -194,6 +207,6 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
             session.append({"role": "tool", "tool_call_id": call["id"],
                             "name": name, "content": result})
             emit("tool", {"phase": "result", "name": name, "result": result[:500]})
-    warning = "[已达最大轮次保护，终止]"
+    warning = f"{MAX_TURNS_MARK}，终止]"
     emit("text", warning)
     return (final_text + "\n" if final_text else "") + warning

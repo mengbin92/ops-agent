@@ -9,6 +9,7 @@ import io  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
 import sys  # noqa: E402
+import time  # noqa: E402
 
 import core  # noqa: E402
 import importlib
@@ -1852,7 +1853,17 @@ def test_schedule_store_and_due():
     finally:
         loop.run_turn = orig
     assert len(results) == 2
-    assert {result for _, result in results} == {"报告:检查磁盘", "报告:每日巡检"}
+    assert {r["result_preview"] for r in results} == {"报告:检查磁盘", "报告:每日巡检"}
+    assert all(r["status"] == "succeeded" for r in results)
+    assert all(r["run_id"] and r["session_id"] and r["pid"] == os.getpid()
+               for r in results)
+    assert all(r["duration_s"] is not None and r["attempts"] == 1 for r in results)
+    saved = {r["run_id"]: r for r in results}
+    for rec in saved.values():
+        assert (core.STATE_DIR / "runs" / f"{rec['run_id']}.json").is_file()
+    # 任务条目带最后状态，schedule list 可查
+    for it in schedule.list_entries():
+        assert it.get("last_status") == "succeeded" and it.get("last_run_id")
     assert all(ctx.ask_user is None for _, ctx, _ in calls)
     assert all(kw["system"] == schedule.SCHEDULE_PROMPT for _, _, kw in calls)
     assert all(kw["max_turns"] == schedule.SCHEDULE_MAX_TURNS for _, _, kw in calls)
@@ -1909,12 +1920,12 @@ def test_schedule_corrupt_entry_disabled():
                   "every_seconds": None, "daily": None, "next_run": 0})
     schedule._save(items)
     orig = schedule._run_entry
-    schedule._run_entry = lambda entry, model: f"报告:{entry['id']}"
+    schedule._run_entry = lambda entry, model, **kw: f"报告:{entry['id']}"
     try:
         results = schedule.run_due()
     finally:
         schedule._run_entry = orig
-    assert [entry["id"] for entry, _ in results] == [good["id"]]
+    assert [r["task_id"] for r in results] == [good["id"]]
     bad = [it for it in schedule.list_entries() if it["id"] == "sch-bad"][0]
     assert bad["enabled"] is False
     (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
@@ -1938,10 +1949,10 @@ def test_schedule_corrupt_times_and_daily_dst():
                       "every_seconds": 60, "daily": None, **values})
     schedule._save(items)
     original = schedule._run_entry
-    schedule._run_entry = lambda entry, model: "报告"
+    schedule._run_entry = lambda entry, model, **kw: "报告"
     try:
         assert "时间配置损坏" in schedule.format_list()
-        assert [it["id"] for it, _ in schedule.run_due()] == [good["id"]]
+        assert [r["task_id"] for r in schedule.run_due()] == [good["id"]]
         assert all(not it["enabled"] for it in schedule.list_entries()[1:])
         assert schedule.run_due() == []
     finally:
@@ -3647,6 +3658,578 @@ def test_inspect_cli_usage_error_is_not_finding():
         sys.stderr = saved
     assert code == 1, code
     assert "错误" in text
+
+
+def _clean_schedules():
+    (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(core.STATE_DIR / "runs", ignore_errors=True)
+
+
+def test_schedule_run_records_and_query():
+    """每次执行都有运行记录：run/session/pid/耗时/结论可查询，且预览脱敏。"""
+    import shutil
+    from agent import schedule, tools as agent_tools
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=60)
+    items = schedule.list_entries()
+    items[0]["next_run"] = time.time() - 1
+    schedule._save(items)
+    orig = schedule._run_entry
+    schedule._run_entry = lambda e, m, **kw: ("发现正常\n结论：正常\n"
+                                              "key sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    try:
+        records = schedule.run_due()
+    finally:
+        schedule._run_entry = orig
+    rec = records[0]
+    assert rec["status"] == "succeeded" and rec["verdict"] == "正常"
+    assert rec["session_id"] and rec["pid"] == os.getpid()
+    assert rec["attempts"] == 1 and rec["duration_s"] is not None
+    assert "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in rec["result_preview"]  # 预览也脱敏
+    saved = json.loads((core.STATE_DIR / "runs" / f"{rec['run_id']}.json").read_text())
+    assert saved["status"] == "succeeded" and saved["run_id"] == rec["run_id"]
+    # 历史查询：全部 / 按任务过滤 / 文本形态
+    listed = schedule.list_runs()
+    assert listed[0]["run_id"] == rec["run_id"]
+    assert schedule.list_runs(task_id=entry["id"])[0]["run_id"] == rec["run_id"]
+    assert schedule.list_runs(task_id="sch-nope") == []
+    text = schedule.format_runs()
+    assert rec["run_id"] in text and "succeeded 正常" in text
+    # 工具侧可查
+    out = agent_tools.dispatch("schedule", {"action": "runs"}, agent_tools.ToolContext())
+    assert rec["run_id"] in out
+    _clean_schedules()
+
+
+def test_schedule_pause_resume():
+    """暂停后到期不跑；恢复从当前时间重新起算（暂停期不补跑、不记 missed）。"""
+    from agent import schedule, tools as agent_tools
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=3600)
+    ctx = agent_tools.ToolContext()
+    out = agent_tools.dispatch("schedule", {"action": "pause", "id": entry["id"]}, ctx)
+    assert "已暂停" in out
+    items = schedule.list_entries()
+    items[0]["next_run"] = time.time() - 100     # 暂停期间已过期
+    schedule._save(items)
+    assert schedule.run_due() == []               # 暂停的不执行
+    assert "暂停" in schedule.format_list()
+    out = agent_tools.dispatch("schedule", {"action": "resume", "id": entry["id"]}, ctx)
+    assert "已恢复" in out and "下次" in out
+    item = schedule.list_entries()[0]
+    assert item["enabled"] is True
+    assert item["next_run"] > time.time()         # 不补跑暂停期
+    assert schedule.run_due() == []               # 恢复后未到期，不立即跑
+    _clean_schedules()
+
+
+def test_schedule_interrupted_vs_missed():
+    """daemon 中断后可辨别：遗留 running → interrupted；停机错过的时点 → missed。"""
+    from agent import schedule
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=60)
+    # 伪造一条"进程已死但状态还是 running"的记录（比如 daemon 被 kill -9）
+    dead = schedule._begin_run(entry, None)
+    dead["pid"] = 99999999                        # 不存在的 pid
+    schedule._write_run(dead)
+    assert schedule.reconcile_runs() == 1
+    saved = json.loads((core.STATE_DIR / "runs" / f"{dead['run_id']}.json").read_text())
+    assert saved["status"] == "interrupted" and "中断" in saved["error"]
+    # 活着的进程不误标
+    alive = schedule._begin_run(entry, None)
+    assert schedule.reconcile_runs() == 0
+    saved = json.loads((core.STATE_DIR / "runs" / f"{alive['run_id']}.json").read_text())
+    assert saved["status"] == "running"
+    # 停机错过：心跳停在 5 分钟前（daemon 那时还在），next_run 也是 5 分钟前
+    items = schedule.list_entries()
+    anchor = time.time() - 300
+    items[0]["next_run"] = anchor
+    schedule._save(items, {"last_scan": anchor - 1})
+    orig = schedule._run_entry
+    schedule._run_entry = lambda e, m, **kw: "结论：正常"
+    try:
+        records = schedule.run_due()
+    finally:
+        schedule._run_entry = orig
+    assert [r["status"] for r in records] == ["missed", "succeeded"]
+    runs = schedule.list_runs()
+    kinds = {r["status"] for r in runs}
+    assert "missed" in kinds and "interrupted" in kinds and "succeeded" in kinds
+    missed = [r for r in runs if r["status"] == "missed"][0]
+    assert missed["missed_count"] == 5, missed["missed_count"]
+    assert f"错过 {missed['missed_count']} 个" in missed["error"]
+    # 立即重跑（未到期）不重复执行
+    schedule._run_entry = lambda e, m, **kw: "结论：正常"
+    try:
+        assert schedule.run_due() == []
+    finally:
+        schedule._run_entry = orig
+    # 心跳已刷新：把 next_run 再拨回过去也只是"迟到了"，不该重复记 missed
+    items = schedule.list_entries()
+    items[0]["next_run"] = time.time() - 300
+    schedule._save(items)
+    schedule._run_entry = lambda e, m, **kw: "结论：正常"
+    try:
+        assert [r["status"] for r in schedule.run_due()] == ["succeeded"]
+    finally:
+        schedule._run_entry = orig
+    assert sum(1 for r in schedule.list_runs() if r["status"] == "missed") == 1
+    _clean_schedules()
+
+
+def test_schedule_timeout_budget_and_retry():
+    """整任务超时记 timeout（退出码 1）；瞬时失败有限重试后记 attempts。"""
+    from agent import schedule
+    _clean_schedules()
+    schedule.add("巡检", every_seconds=60, timeout_seconds=60)
+    real_sleep = time.sleep
+    time.sleep = lambda s: None
+    orig = schedule._run_entry
+    try:
+        # 重试后成功：每次尝试独立会话，失败信息保留在 attempt_errors
+        state = {"n": 0}
+        sessions, deadlines = [], []
+
+        def flaky(entry, model, **kw):
+            state["n"] += 1
+            sessions.append(kw["session"].id)
+            deadlines.append(kw.get("deadline"))
+            if state["n"] == 1:
+                raise ConnectionError("ssh reset")
+            return "结论：正常"
+
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        schedule._run_entry = flaky
+        rec = schedule.run_due()[0]
+        assert rec["status"] == "succeeded" and rec["attempts"] == 2
+        assert rec["error"] is None
+        assert rec["attempt_errors"] and "ConnectionError" in rec["attempt_errors"][0]
+        assert len(set(sessions)) == 2                 # 不复用半截会话
+        assert all(d and d > time.monotonic() for d in deadlines)  # deadline 真的传下去了
+
+        # 始终失败 → failed
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        schedule._run_entry = lambda e, m, **kw: (_ for _ in ()).throw(RuntimeError("down"))
+        rec = schedule.run_due()[0]
+        assert rec["status"] == "failed" and rec["attempts"] == 2
+        assert "RuntimeError" in rec["error"]
+
+        # 超预算 → timeout
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        schedule._run_entry = lambda e, m, **kw: "[任务超时] 已终止：任务时间预算耗尽"
+        rec = schedule.run_due()[0]
+        assert rec["status"] == "timeout" and "时间预算" in rec["error"]
+    finally:
+        time.sleep = real_sleep
+        schedule._run_entry = orig
+        _clean_schedules()
+    # 退出码：运行失败 > 异常发现 > 不完整 > 正常
+    assert schedule.runs_exit_code([{"status": "succeeded", "verdict": "正常"}]) == 0
+    assert schedule.runs_exit_code([{"status": "succeeded", "verdict": "异常"}]) == 2
+    assert schedule.runs_exit_code([{"status": "succeeded", "verdict": "未判定"}]) == 3
+    assert schedule.runs_exit_code([{"status": "succeeded", "verdict": "异常"},
+                                    {"status": "timeout", "verdict": None}]) == 1
+
+
+def test_schedule_once_exit_codes():
+    """--once 的退出码区分运行失败与检查发现异常。"""
+    from agent import schedule
+    _clean_schedules()
+    schedule.add("巡检", every_seconds=60, timeout_seconds=60)
+
+    def due_now():
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+
+    real_sleep = time.sleep
+    time.sleep = lambda s: None
+    orig = schedule._run_entry
+    try:
+        schedule._run_entry = lambda e, m, **kw: "结论：正常"
+        due_now()
+        assert schedule.daemon(once=True) == 0
+        schedule._run_entry = lambda e, m, **kw: "磁盘 97%\n结论：异常"
+        due_now()
+        assert schedule.daemon(once=True) == 2
+        schedule._run_entry = lambda e, m, **kw: "看起来都还行"
+        due_now()
+        assert schedule.daemon(once=True) == 3   # 无可解析结论 = 未判定，不是正常
+        schedule._run_entry = lambda e, m, **kw: (_ for _ in ()).throw(RuntimeError("x"))
+        due_now()
+        assert schedule.daemon(once=True) == 1
+    finally:
+        time.sleep = real_sleep
+        schedule._run_entry = orig
+        _clean_schedules()
+
+
+def test_run_turn_deadline_stops_at_turn_boundary():
+    """任务时间预算在轮次边界生效：到点不再调用 LLM，结果带超时标记。"""
+    from agent import loop, session as agent_session, tools as agent_tools
+    calls = []
+
+    def fake_chat(*a, **k):
+        calls.append(1)
+        return {"role": "assistant", "content": "结论：正常"}
+
+    orig = loop.llm.chat
+    loop.llm.chat = fake_chat
+    try:
+        ctx = agent_tools.ToolContext(deadline=time.monotonic() - 1)
+        text = loop.run_turn("巡检", agent_session.Session(), ctx)
+        assert loop.DEADLINE_MARK in text and "时间预算" in text
+        assert not calls                       # 预算已尽：一次 LLM 都不该调
+        ctx = agent_tools.ToolContext(deadline=time.monotonic() + 60)
+        text = loop.run_turn("巡检", agent_session.Session(), ctx)
+        assert "结论：正常" in text and len(calls) == 1
+    finally:
+        loop.llm.chat = orig
+
+
+def test_workflow_deadline_marks_remaining_steps():
+    """workflow 在预算耗尽后：剩余步骤记失败（时间预算耗尽），不静默跳过。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-deadline.json"
+    p.write_text(json.dumps({"steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "第二步"}]}), encoding="utf-8")
+    orig = loop.run_turn
+    loop.run_turn = lambda *a, **k: "结论：正常"
+    try:
+        ctx = agent_tools.ToolContext(deadline=time.monotonic() - 1)
+        out = agent_tools.dispatch("workflow", {"name": "wf-deadline"}, ctx)
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert "1「一」失败（时间预算耗尽）" in out
+    assert "2「二」失败（时间预算耗尽）" in out      # 剩余步骤显式记失败，不静默跳过
+    assert "LLM 解读：0/2 步成功" in out and "解读不完整" in out
+
+
+def test_workflow_step_cut_by_deadline_is_not_success():
+    """单步执行到一半被时间预算截断：这一步记失败（不是"完成"）。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-cut.json"
+    p.write_text(json.dumps({"steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "第二步"}]}), encoding="utf-8")
+    results = ["部分结论\n[任务超时] 已终止：任务时间预算耗尽", "结论：正常"]
+    orig = loop.run_turn
+    loop.run_turn = lambda *a, **k: results.pop(0)
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-cut"},
+                                   agent_tools.ToolContext())
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert "1「一」失败（时间预算耗尽）" in out
+    assert "2「二」完成" in out
+    assert "LLM 解读：1/2 步成功" in out
+
+
+def test_schedule_verdict_parsing_is_conservative():
+    """结论只认"单独一行"或"报告头"，日志/引用里的结论不能翻转最终判定。"""
+    from agent import schedule
+    assert schedule._detect_verdict("巡检完成\n结论：正常") == "正常"
+    assert schedule._detect_verdict("结论: **异常**") == "异常"
+    assert schedule._detect_verdict("结论：异常项 3 个") == "未判定"   # 正文不是结论行
+    assert schedule._detect_verdict("日志原文：结论：正常\n实际检查失败\n结论：异常") == "异常"
+    assert schedule._detect_verdict(
+        "- 结论: **异常**｜完整性: 不完整（存在未采集项）") == "异常"
+    assert schedule._detect_verdict("本次不得汇总为正常") == "未判定"
+    assert schedule._detect_verdict("") == "未判定"
+    # 轮次/预算截断与"解读不完整"不能停在正常
+    from agent import loop
+    assert loop.MAX_TURNS_MARK == "[已达最大轮次保护"
+    assert loop.DEADLINE_MARK == "[任务超时]"
+
+
+def test_schedule_truncated_run_is_not_normal():
+    """模型被轮次截断但正文写了"结论：正常" → 记 succeeded 但结论降级为不完整（exit 3）。"""
+    from agent import loop, schedule
+    _clean_schedules()
+    schedule.add("巡检", every_seconds=60)
+    items = schedule.list_entries()
+    items[0]["next_run"] = time.time() - 1
+    schedule._save(items)
+    orig = schedule._run_entry
+    schedule._run_entry = lambda e, m, **kw: f"结论：正常\n{loop.MAX_TURNS_MARK}，终止]"
+    try:
+        rec = schedule.run_due()[0]
+    finally:
+        schedule._run_entry = orig
+        _clean_schedules()
+    assert rec["verdict"] == "不完整"
+    assert schedule.runs_exit_code([rec]) == 3
+
+
+def test_schedule_record_failure_does_not_stop_other_tasks():
+    """运行记录写不进去时仍然执行并返回结果，且不影响后续任务。"""
+    from agent import schedule
+    _clean_schedules()
+    first = schedule.add("巡检A", every_seconds=60)
+    second = schedule.add("巡检B", every_seconds=60)
+    items = schedule.list_entries()
+    for it in items:
+        it["next_run"] = time.time() - 1
+    schedule._save(items)
+    orig_run, orig_write = schedule._run_entry, schedule._write_run
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    schedule._run_entry = lambda e, m, **kw: "结论：正常"
+    schedule._write_run = boom
+    try:
+        records = schedule.run_due()
+    finally:
+        schedule._run_entry, schedule._write_run = orig_run, orig_write
+        _clean_schedules()
+    assert [r["task_id"] for r in records] == [first["id"], second["id"]]
+    assert all(r["status"] == "succeeded" and r.get("unrecorded") for r in records)
+
+
+def test_schedule_corrupt_records_and_settings_are_tolerated():
+    """损坏的运行记录/手工改过的字段不能让查询或整轮调度崩溃。"""
+    from agent import schedule
+    _clean_schedules()
+    runs = core.STATE_DIR / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "x.json").write_text(json.dumps({"run_id": "x", "status": "succeeded"}))
+    (runs / "y.json").write_text(json.dumps({
+        "run_id": "y", "status": "running", "pid": 10 ** 30,
+        "started": "2026-10-21 10:00:00", "started_ts": 1}))
+    assert schedule.list_runs() == []          # 字段不全/pid 越界都跳过
+    assert schedule.reconcile_runs() == 0      # 不因坏记录崩溃
+    assert schedule.format_runs() == "(无运行记录)"
+    # 正向对照：一条合法记录必须仍然可见（否则"全跳过"的断言可能是空转）
+    schedule.add("巡检", every_seconds=60)
+    good_entry = schedule.list_entries()[0]
+    good = schedule._begin_run(good_entry, None)
+    schedule._write_run(dict(good, status="succeeded", finished="2026-10-21 10:00:01",
+                             finished_ts=time.time(), duration_s=1.0, verdict="正常"))
+    assert [r["run_id"] for r in schedule.list_runs()] == [good["run_id"]]
+    assert good["run_id"] in schedule.format_runs()
+    # every_seconds 是数字字符串（手工编辑/旧文件）：归一化后照常执行，不抛 TypeError
+    schedule.add("巡检", every_seconds=60)
+    items = schedule.list_entries()
+    items[0]["every_seconds"] = "60"
+    items[0]["next_run"] = time.time() - 1
+    schedule._save(items, {"last_scan": time.time() - 1})
+    orig = schedule._run_entry
+    schedule._run_entry = lambda e, m, **kw: "结论：正常"
+    try:
+        records = schedule.run_due()
+    finally:
+        schedule._run_entry = orig
+        _clean_schedules()
+    assert [r["status"] for r in records] == ["succeeded"]
+
+
+def test_schedule_missed_ignores_own_slowness():
+    """心跳新鲜时不算停机：长任务/排队不会被记成 missed；无心跳或 next_run 损坏不推断。"""
+    from agent import schedule
+    now = time.time()
+    every = {"every_seconds": 60}
+    # daemon 10 秒前刚心跳过，任务自己跑了 1 小时 → 错过 0
+    assert schedule._missed_count(every, now - 3600, now - 10, now) == 0
+    # 心跳停在 5 分钟前 → 错过 5 次
+    assert schedule._missed_count(every, now - 300, now - 300, now) == 5
+    # 首次运行没有心跳、或 next_run 缺失/为 0：不做推断
+    assert schedule._missed_count(every, now - 300, 0, now) == 0
+    assert schedule._missed_count(every, 0, now - 300, now) == 0
+    assert schedule._missed_count({"daily": "09:00"}, now - 3 * 86400, now - 3 * 86400, now) >= 2
+
+
+def test_schedule_resume_keeps_enabled_schedule_and_pause_cancels():
+    """对已启用任务重复 resume 不动 next_run；暂停后排队中的执行被取消。"""
+    from agent import schedule
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=3600)
+    planned = schedule.list_entries()[0]["next_run"]
+    schedule.resume(entry["id"])                  # 本来就启用：不改排期
+    assert schedule.list_entries()[0]["next_run"] == planned
+    schedule.pause(entry["id"])
+    assert schedule._claim_due(entry["id"], time.time()) is None  # 暂停后不再被认领
+    schedule.resume(entry["id"])
+    items = schedule.list_entries()
+    items[0]["next_run"] = time.time() - 1       # 恢复后到期：可被认领
+    schedule._save(items)
+    assert schedule._claim_due(entry["id"], time.time()) is not None
+    _clean_schedules()
+
+
+def test_schedule_report_path_must_stay_in_reports_dir():
+    """report_path 取自模型文本，只能接受状态目录下 reports/ 里的真实路径。"""
+    from agent import schedule
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=60)
+    reports = core.STATE_DIR / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    real = reports / "20261021-test.md"
+    real.write_text("x", encoding="utf-8")
+    try:
+        rec = schedule._finish_run(schedule._begin_run(entry, None), entry, "succeeded",
+                                   verdict="正常", result_text=f"[全量报告] {real}")
+        assert rec["report_path"] == str(real.resolve())
+        spoof = schedule._finish_run(schedule._begin_run(entry, None), entry, "succeeded",
+                                     verdict="正常", result_text="[全量报告] /etc/passwd")
+        assert spoof["report_path"] is None
+    finally:
+        _clean_schedules()
+
+
+def test_schedule_lock_conflict_reports_not_run():
+    """已有调度进程时 --once 返回 3：cron 不能把它当成"跑完且正常"。"""
+    from agent import schedule
+    _clean_schedules()
+    try:
+        with schedule._locked("schedules.lock", block=False) as held:
+            assert held is True
+            assert schedule.daemon(once=True) == 3
+    finally:
+        _clean_schedules()
+
+
+def test_schedule_queue_survives_kill_and_failed_record_persists():
+    """两阶段认领：执行中被打断时，排队任务仍是到期状态（下轮补上）；兜底失败记录可查。"""
+    from agent import schedule
+    _clean_schedules()
+    try:
+        a = schedule.add("巡检A", every_seconds=60)
+        b = schedule.add("巡检B", every_seconds=60)
+        items = schedule.list_entries()
+        for it in items:
+            it["next_run"] = time.time() - 1
+        schedule._save(items)
+        state = {"n": 0}
+
+        def killed_after_first(entry, model, **kw):
+            state["n"] += 1
+            if entry["id"] == a["id"]:
+                raise KeyboardInterrupt
+            return "结论：正常"
+
+        orig = schedule._run_entry
+        schedule._run_entry = killed_after_first
+        try:
+            try:
+                schedule.run_due()
+                raise AssertionError("KeyboardInterrupt 应向上传播（模拟进程被杀）")
+            except KeyboardInterrupt:
+                pass
+            left = {it["id"]: it for it in schedule.list_entries()}
+            assert left[a["id"]]["next_run"] > time.time()   # A 已认领，不会重复
+            assert left[b["id"]]["next_run"] <= time.time()  # B 未认领，仍是到期状态
+            records = schedule.run_due()                     # 下一轮补上 B
+            assert [r["task_id"] for r in records] == [b["id"]]
+        finally:
+            schedule._run_entry = orig
+
+        # 兜底失败记录：_execute_run 抛非 OSError 异常也要落盘可查
+        items = schedule.list_entries()
+        for it in items:
+            it["next_run"] = time.time() - 1
+        schedule._save(items)
+        orig_exec = schedule._execute_run
+        schedule._execute_run = lambda entry, model: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            records = schedule.run_due()
+        finally:
+            schedule._execute_run = orig_exec
+        assert all(r["status"] == "failed" for r in records)
+        saved = {r["run_id"] for r in schedule.list_runs()}
+        assert {r["run_id"] for r in records} <= saved
+        assert any("boom" in (r.get("error") or "") for r in schedule.list_runs())
+    finally:
+        _clean_schedules()
+
+
+def test_schedule_runs_prefix_after_removal_and_sleep_backoff():
+    """任务删除后仍能按 id 前缀查历史；到期未执行时守护进程退避而不是 1 秒空转。"""
+    from agent import schedule
+    _clean_schedules()
+    try:
+        entry = schedule.add("巡检", every_seconds=60)
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        orig = schedule._run_entry
+        schedule._run_entry = lambda e, m, **kw: "结论：正常"
+        try:
+            rec = schedule.run_due()[-1]
+        finally:
+            schedule._run_entry = orig
+        schedule.remove(entry["id"])
+        assert schedule.format_runs(task_id=entry["id"], prefix=True).count(rec["run_id"]) == 1
+        # 到期未推进（模拟写盘失败）：睡眠退避 ≥ 30s
+        items = schedule.list_entries()
+        if not items:
+            schedule.add("巡检2", every_seconds=60)
+            items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 100
+        schedule._save(items)
+        assert schedule._sleep_seconds() >= 30
+    finally:
+        _clean_schedules()
+
+
+def test_schedule_report_path_requires_existing_file():
+    """报告路径必须是 reports/ 下真实存在的文件（含空格的路径也要能识别）。"""
+    from agent import schedule
+    _clean_schedules()
+    entry = schedule.add("巡检", every_seconds=60)
+    reports = core.STATE_DIR / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    with_space = reports / "a b.md"
+    with_space.write_text("x", encoding="utf-8")
+    try:
+        rec = schedule._finish_run(schedule._begin_run(entry, None), entry, "succeeded",
+                                   verdict="正常", result_text=f"[全量报告] {with_space}")
+        assert rec["report_path"] == str(with_space.resolve())  # 空格不被截断
+        missing = schedule._finish_run(
+            schedule._begin_run(entry, None), entry, "succeeded", verdict="正常",
+            result_text=f"[全量报告] {reports}/does-not-exist.md")
+        assert missing["report_path"] is None                   # 不存在的路径不采信
+    finally:
+        _clean_schedules()
+
+
+def test_schedule_verdict_ignores_quoted_old_reports():
+    """代码围栏/引用块里粘贴的旧结论不能翻转本轮判定；整行加粗仍可识别。"""
+    from agent import schedule
+    assert schedule._detect_verdict("**结论：正常**") == "正常"
+    assert schedule._detect_verdict("  结论：异常") == "异常"
+    text = ("检查完成\n结论：异常\n\n上次报告记录：\n```\n结论: **正常**｜完整性: 完整\n```")
+    assert schedule._detect_verdict(text) == "异常"
+    quoted = "结论：异常\n> 旧报告：\n> 结论：正常"
+    assert schedule._detect_verdict(quoted) == "异常"
+
+
+def test_schedule_interval_accepts_integral_float():
+    """60.0/"60" 可归一化；60.5/59/bool 仍拒绝（不因小类型问题永久停用任务）。"""
+    from agent import schedule
+    assert schedule._interval(60) == 60
+    assert schedule._interval("60") == 60
+    assert schedule._interval(60.0) == 60
+    for bad in (60.5, 59, True, "60s", None):
+        try:
+            schedule._interval(bad)
+            raise AssertionError(f"应拒绝: {bad!r}")
+        except schedule.ScheduleError:
+            pass
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

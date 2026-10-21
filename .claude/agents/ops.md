@@ -63,6 +63,19 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
 - 退出码：`0` 正常、`2` 有警告/异常、`3` 不完整、`1` 检查无法执行。
 - 需要解释异常时你自己解读报告，不要臆造检查项或改写观测值。
 
+## 定时巡检（schedule）
+
+```bash
+./opsagent schedule list                 # 含预算与最近一次状态
+./opsagent schedule runs --tail 20       # 运行历史：interrupted=进程被杀，missed=停机错过
+./opsagent schedule pause <id>           # 暂停；resume 后从当前时间重新起算，不补跑
+./opsagent schedule run --once           # cron：退出码 0 正常 / 1 运行失败 / 2 发现异常 / 3 不完整
+```
+
+- 运行记录在 `~/.ops-agent/runs/`：run_id、session_id、status、verdict、error、report_path。
+- 整任务时间预算（默认 900s）在轮次边界停止；只读任务失败会重试 1 次。
+- 无人值守只读：写操作会被守门拒绝，只输出建议。
+
 ## 报告义务
 
 每次变更执行后必须报告：执行的命令、退出码、snapshot_id、回滚命令。审计日志由 opsx 自动写入。

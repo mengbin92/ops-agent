@@ -148,17 +148,48 @@ agent——没有可回答问题的人，因此只读排查，写操作会被守
 
 ```bash
 ./opsagent schedule add --daily 09:00 "只读巡检磁盘/内存/服务，异常给建议"
-./opsagent schedule add --every 1800 "检查 nginx 错误日志"
-./opsagent schedule list
+./opsagent schedule add --every 1800 --timeout 600 "检查 nginx 错误日志"
+./opsagent schedule list              # 含预算与最近一次状态（成功/失败/超时/中断）
+./opsagent schedule pause <id>        # 暂停：到期不跑；恢复后从当前时间重新起算，不补跑
+./opsagent schedule resume <id>
+./opsagent schedule runs --tail 20    # 运行历史（可按 --id 过滤，含中断与错过的执行）
 ./opsagent schedule remove <id>       # id 可用唯一前缀
 ./opsagent schedule run               # 守护进程（同一时刻只允许一个，flock 防双开）
 ./opsagent schedule run --once        # 适合 cron：*/5 * * * * ... schedule run --once
 ```
 
-agent 里也可以直接说"每天九点巡检一次"，模型用 `schedule` 工具登记（list / add / remove）。
-每次执行写审计（`schedule-run`，含结论摘要）；注册表的增删与 daemon 的推进各有锁，
-不会丢更新。每次巡检的会话也落在 `~/.ops-agent/sessions/`（计入 300 上限），可在
-`/resume` 回看。cron 场景记得在环境里带上 `OPSAGENT_API_KEY` / `OPSAGENT_BASE_URL`。
+agent 里也可以直接说"每天九点巡检一次"，模型用 `schedule` 工具登记（list / runs / add /
+pause / resume / remove）。每次执行写审计（`schedule-run`，含状态与结论摘要），注册表的
+增删与 daemon 的推进各有锁，不会丢更新。每次巡检的会话也落在 `~/.ops-agent/sessions/`
+（计入 300 上限），可在 `/resume` 回看。cron 场景记得在环境里带上 `OPSAGENT_API_KEY` /
+`OPSAGENT_BASE_URL`。
+
+### 运行记录与可追踪性（W3）
+
+每次执行在 `~/.ops-agent/runs/<run_id>.json` 留一条记录（0600，保留最近 200 条）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `run_id` / `task_id` / `session_id` | 定位一次执行；会话 id 可直接 `/resume` 回看 |
+| `status` | `running` / `succeeded` / `failed` / `timeout` / `interrupted` / `missed` |
+| `verdict` | 从结果里解析的结论：正常 / 警告 / 异常 / 不完整 / 未判定 |
+| `started` / `finished` / `duration_s` | 起止与耗时 |
+| `attempts` / `attempt_errors` | 只读巡检的有限重试（1 次）与失败原因 |
+| `error` / `result_preview` / `report_path` | 失败原因、结论摘要（已脱敏）、关联的巡检报告 |
+
+- **整任务时间预算**：`--timeout`（默认 900s，60–86400）。到点在**轮次边界**停止，
+  结果标 `timeout`；workflow 里剩余步骤会显式记为「时间预算耗尽」，不会静默跳过。
+- **只读重试**：执行抛异常时重试 1 次（间隔 3s），每次尝试用新会话（不重复追加 prompt）。
+- **中断 vs 错过**：daemon 被 kill 后遗留的 `running` 记录，在下次启动或
+  `schedule runs` 查询时对账为 `interrupted`；停机期间错过的执行时点记为 `missed`
+  （含错过次数）。判定依据是心跳（`schedules.json` 的 `meta.last_scan`，每次扫描与每个
+  任务结束后刷新），所以**任务自己跑得久或排队不会**被误记为停机错过。
+- **退出码**（`run --once`）：`0` 全部正常；`1` 有任务运行失败/超时，或启动时对账出中断；
+  `2` 检查发现警告/异常；`3` 不完整/未判定/有错过，或本次因已有调度进程而未执行。
+- 执行前会在短锁内复核"仍在且启用、仍到期"再推进 `next_run`：暂停能取消已排队的执行；
+  中途被 kill 时，排队中的任务仍是到期状态，下一轮会补上（不会被静默跳过）。
+- 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
+- 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
 
 **长目标（goal）**：在 REPL 里让 agent 推进多步目标（"排查到定位为止""升级并验证完"）。
 每轮结束后按目标状态自动续跑，默认最多 6 轮（`max_rounds` 可调，上限 20），完成后自动停。
@@ -327,7 +358,11 @@ hook 允许直接调用本仓库的 `opsx`（或 Python + 本仓库脚本），�
 巡检侧的已知边界：探针只覆盖连通性、磁盘/内存/负载与 systemd/Docker 服务，不替代外部监控；
 `unknown` 只说明"没采到"，不说明"坏了"，需要人按报告里的证据命令复核；巡检期间若有人改写
 `targets.json`，同一次报告的不同探针可能打到不同主机（报告按开始时的目标快照展示）。
-调度层面的整任务时间预算、run/session 记录与退出码语义属于下一阶段（W3）。
+
+调度侧的已知边界：任务串行执行，一个长任务会推迟后面的任务（不会并发）；时间预算在轮次
+边界检查，最坏情况是「预算 + 一次 LLM 调用超时」；`interrupted` 判定依赖 pid 存活，pid 被
+复用（重启后同号进程）时可能误判为仍在运行；`missed` 依据心跳推断，写盘失败时会保守地少报；
+通知渠道、事件去重与恢复通知属于下一阶段（W4）；调度日志只写审计与 run 记录，尚未接入 IM。
 
 ## MCP server 形态
 
