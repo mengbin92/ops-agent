@@ -1,0 +1,24 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m compileall -q core.py remote.py opsx mcp_server.py agent selftest.py
+      - name: Selftest
+        run: ./opsx selftest

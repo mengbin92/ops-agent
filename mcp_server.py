@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import core  # noqa: E402
+import remote  # noqa: E402
 
 SERVER_NAME = "ops-guard"
 SERVER_VERSION = "1.0.0"
@@ -28,11 +29,13 @@ def _send(resp):
 
 
 def _result(payload):
-    return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}
+    # MCP 客户端（模型宿主）也是出口：工具结果统一脱敏后再回传。
+    return {"content": [{"type": "text",
+                         "text": json.dumps(core.redact_obj(payload), ensure_ascii=False)}]}
 
 
 def _tool_error(message):
-    return {"isError": True, "content": [{"type": "text", "text": message}]}
+    return {"isError": True, "content": [{"type": "text", "text": core.redact(message)}]}
 
 
 def _tool(name, description, schema, read_only=False):
@@ -94,9 +97,10 @@ TOOLS = [
         },
         "required": ["command"],
     }),
-    _tool("ops_rollback", "按快照回滚", {
+    _tool("ops_rollback", "按快照回滚：先返回目标/文件/差异预览，confirm=true 才执行", {
         "type": "object",
-        "properties": {"snapshot_id": {"type": "string"}},
+        "properties": {"snapshot_id": {"type": "string"},
+                       "confirm": {"type": "boolean", "default": False}},
         "required": ["snapshot_id"],
     }),
     _tool("ops_list", "列出快照与审批戳（只读）", {
@@ -124,7 +128,8 @@ def call_tool(name, args):
         cmd = _require(args, "command")
         level, _ = core.classify(cmd)
         code, message = core.check(cmd)
-        return _result({"level": level, "allowed": code == 0, "message": message})
+        return _result({"level": level, "allowed": code == 0, "message": message,
+                        "env": core.format_env(core.resolve_env(cmd))})
     if name == "ops_snapshot_file":
         sid = core.snapshot_file(_require(args, "path"))
         return _result({"snapshot_id": sid})
@@ -132,13 +137,16 @@ def call_tool(name, args):
         sid = core.snapshot_cmd(_require(args, "command"), args.get("name", ""))
         return _result({"snapshot_id": sid})
     if name == "ops_approve":
+        cmd = _require(args, "command")
         path = core.approve(
-            _require(args, "command"),
+            cmd,
             ttl_seconds=args.get("ttl_seconds", 900),
             force=args.get("force", False),
         )
         stamp = json.loads(path.read_text(encoding="utf-8"))
-        return _result({"stamp_file": path.name, "level": stamp["level"], "ttl_seconds": stamp["ttl"]})
+        return _result({"stamp_file": path.name, "level": stamp["level"],
+                        "ttl_seconds": stamp["ttl"],
+                        "env": core.format_env(stamp.get("env") or core.local_env())})
     if name == "ops_revoke":
         revoked = core.revoke(_require(args, "command"))
         return _result({"revoked": revoked})
@@ -152,8 +160,13 @@ def call_tool(name, args):
         payload = {"exit_code": code, "snapshot_id": sid, "output": output[:4000]}
         return _result(payload)
     if name == "ops_rollback":
-        report = core.rollback(_require(args, "snapshot_id"))
-        return _result({"report": report})
+        sid = _require(args, "snapshot_id")
+        plan = remote.rollback_plan(sid)
+        if plan["files"] and not args.get("confirm", False):
+            return _result({"needs_confirm": True,
+                            "plan": core.format_rollback_plan(plan),
+                            "hint": "回滚会覆盖文件：核对目标与差异后带 confirm=true 重试"})
+        return _result({"report": remote.rollback(sid, confirm=True)})
     if name == "ops_list":
         return _result(core.collect_state())
     if name == "ops_audit":
@@ -200,11 +213,11 @@ def handle_message(msg):
         tool_args = params.get("arguments", {})
         try:
             result = call_tool(tool_name, tool_args)
-        except core.OpsxError as e:
+        except (core.OpsxError, remote.RemoteError) as e:
             result = _tool_error(str(e))
         except Exception as e:  # noqa: BLE001 —— 未预期异常走 JSON-RPC 层
             traceback.print_exc(file=sys.stderr)
-            return _err(msg_id, -32603, f"工具内部错误: {e}")
+            return _err(msg_id, -32603, core.redact(f"工具内部错误: {e}"))
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
     if method is None:
         return _err(msg_id, -32600, "缺少 method 字段")

@@ -11,6 +11,7 @@ import re  # noqa: E402
 import core  # noqa: E402
 import importlib
 importlib.reload(core)  # 经 opsx 调用时 core 可能已导入，重载以应用 OPSX_STATE_DIR
+os.chdir(Path(__file__).resolve().parent)  # 审批绑定 cwd：自检固定在仓库目录运行
 
 
 def test_classify():
@@ -58,7 +59,7 @@ def test_snapshot_file_rollback():
         f.write_text("v1")
         sid = core.snapshot_file(str(f))
         f.write_text("v2")
-        core.rollback(sid)
+        core.rollback(sid, confirm=True)
         assert f.read_text() == "v1"
 
 
@@ -359,7 +360,7 @@ def test_hook_guarded_cli_and_snapshot_command_forms():
                                  env=env, capture_output=True, text=True)
         assert executed.returncode == 0 and f.read_text() == "after\n", executed.stderr
         sid = re.search(r"snapshot_id: ([^（\s]+)", executed.stdout).group(1)
-        restored = subprocess.run([sys.executable, entry, "rollback", sid], env=env,
+        restored = subprocess.run([sys.executable, entry, "rollback", sid, "--yes"], env=env,
                                  capture_output=True, text=True, check=True)
         assert f.read_text() == "before" and "prior-state" in restored.stdout
 
@@ -430,7 +431,11 @@ def test_mcp_write_cycle():
             _, payload = c.call_tool("ops_exec", {"command": cmd, "snapshot_files": [str(f)]})
             assert payload["exit_code"] == 0 and payload["snapshot_id"]
             assert f.read_text() == "v2\n"
-            _, payload = c.call_tool("ops_rollback", {"snapshot_id": payload["snapshot_id"]})
+            sid = payload["snapshot_id"]
+            _, payload = c.call_tool("ops_rollback", {"snapshot_id": sid})  # 未确认：只返回计划
+            assert payload["needs_confirm"] is True and "回滚计划" in payload["plan"]
+            assert f.read_text() == "v2\n"  # 未确认不改文件
+            _, payload = c.call_tool("ops_rollback", {"snapshot_id": sid, "confirm": True})
             assert "已恢复文件" in payload["report"]
             assert f.read_text() == "v1"
             _, payload = c.call_tool("ops_list")
@@ -1121,6 +1126,8 @@ def test_remote_exec_snapshot_and_rollback():
 
     def fake_ssh(name, cmd, stdin=None, timeout=120):
         calls.append((name, cmd, stdin))
+        if "OPSX-EXISTS" in cmd:
+            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nremote-v1\n", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"remote-v1\n", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -1148,8 +1155,9 @@ def test_remote_exec_snapshot_and_rollback():
         archived = Path(core.STATE_DIR, "snapshots", sid, meta["items"][0]["dest"])
         assert archived.read_text() == "remote-v1\n"  # 快照落在本机
 
-        report = remote.rollback(sid)
+        report = remote.rollback(sid, confirm=True)
         assert "web1:/etc/nginx/nginx.conf" in report
+        assert "回滚前副本" in report  # 先存副本再覆盖
         pushed = [c for c in calls if c[1].startswith("cat >")]
         assert pushed and pushed[0][2] == b"remote-v1\n"  # 回滚经 stdin 推回
 
@@ -1165,7 +1173,7 @@ def test_remote_exec_snapshot_and_rollback():
             f.write_text("v1")
             local_sid = core.snapshot_file(str(f))
             f.write_text("v2")
-            assert "已恢复文件" in remote.rollback(local_sid) and f.read_text() == "v1"
+            assert "已恢复文件" in remote.rollback(local_sid, confirm=True) and f.read_text() == "v1"
     finally:
         remote._ssh = orig
 
@@ -1241,6 +1249,7 @@ def test_opsx_cli_remote_end_to_end():
         "#!/bin/sh\n"
         f'echo "$@" >> "{log}"\n'
         'case "$*" in\n'
+        '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\' ;;\n'
         "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
         '  *"cat > "*) cat > "$OPSX_TEST_PUSHED" ;;\n'
         "  *) printf 'remote-ok\\n' ;;\n"
@@ -1265,7 +1274,7 @@ def test_opsx_cli_remote_end_to_end():
     m = re.search(r"snapshot_id: (\S+?)（", r.stdout)
     assert m, r.stdout
     sid = m.group(1)
-    r = run("rollback", sid)
+    r = run("rollback", sid, "--yes")
     assert r.returncode == 0 and "web1:/etc/nginx/nginx.conf" in r.stdout, r.stderr
     assert pushed.read_bytes() == b"remote-v1\n"
     assert "cat > /etc/nginx/nginx.conf" in log.read_text()
@@ -1357,6 +1366,8 @@ def test_remote_rollback_failure_reported():
     core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
 
     def fake_ssh(name, cmd, stdin=None, timeout=120):
+        if "OPSX-EXISTS" in cmd:
+            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nv1", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"v1", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -1370,7 +1381,7 @@ def test_remote_rollback_failure_reported():
                                           snapshot_files=["/etc/nginx/nginx.conf"])
         assert code == 0 and sid
         try:
-            remote.rollback(sid)
+            remote.rollback(sid, confirm=True)
             raise AssertionError("推回失败应报错")
         except remote.RemoteError as e:
             assert "回滚失败" in str(e)
@@ -2292,7 +2303,8 @@ def test_memory_store_and_recall():
     recalled = memory.recall()
     assert "user01-X99" in recalled and "\n  续行缩进" in recalled
     assert "写法约定" not in recalled  # 多行头注释不进入注入内容
-    for bad, needle in (("x" * 501, "太长"), ("   ", "不能为空")):
+    for bad, needle in (("x" * 501, "太长"), ("   ", "不能为空"),
+                        ("api_key=sk-live-abcdefghijklmnop", "密钥")):
         try:
             memory.add(bad)
             raise AssertionError(f"应拒绝：{needle}")
@@ -2478,7 +2490,7 @@ def test_guard_snapshot_metadata_and_failure_cleanup():
         other.write_text("untouched")
         source.unlink()
         source.symlink_to(other)
-        core.rollback(sid)
+        core.rollback(sid, confirm=True)
         assert not source.is_symlink() and source.read_text() == "before"
         assert source.stat().st_mode & 0o777 == 0o640 and other.read_text() == "untouched"
         sdir = core.STATE_DIR / "snapshots"
@@ -2574,6 +2586,411 @@ def test_guard_schema_and_invalid_config_fail_closed():
                 pass
         finally:
             override.unlink()
+
+
+def test_secret_redaction_forms():
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE-secret-material\n-----END RSA PRIVATE KEY-----"
+    text = (f"password=hunter2\nAPI_KEY=sk-{'a' * 20}\n{pem}\n"
+            "Authorization: Bearer abc.def.ghi\naws=AKIAABCDEFGHIJKLMNOP\nnormal=1")
+    out = core.redact(text)
+    for secret in ("hunter2", "sk-aaaa", "MIIE-secret-material", "abc.def.ghi",
+                   "AKIAABCDEFGHIJKLMNOP"):
+        assert secret not in out, secret
+    assert "normal=1" in out and out.count(core.REDACTED) >= 5
+    assert core.redact(out) == out  # 幂等：重复脱敏不破坏占位符
+    assert core.redact("systemctl restart nginx") == "systemctl restart nginx"
+    assert core.redact_obj({"password": "hunter2"})["password"] == core.REDACTED
+    assert core.redact_obj({"note": "hello"})["note"] == "hello"
+    json_text = '{"password": "hunter2", "client_secret":"GOCSPX-abc"}'
+    assert "hunter2" not in core.redact(json_text) and "GOCSPX" not in core.redact(json_text)
+    code, msg = core.check('curl -H "Authorization: Bearer HUNTER2-TOKEN" https://example')  # 拒绝文案也脱敏
+    assert code == 2 and "HUNTER2-TOKEN" not in msg
+
+
+def test_secret_not_reaching_model_session_or_audit():
+    import tempfile as tf
+    from agent import llm, loop
+    from agent import session as agent_session
+    from agent import tools as agent_tools
+    sentinel = "sk-SENTINEL0123456789abcdef"
+    with tf.TemporaryDirectory() as td:
+        f = Path(td, "creds.txt")
+        f.write_text(f"AWS_SECRET_ACCESS_KEY={sentinel}\n")
+        ctx = agent_tools.ToolContext()
+        out = agent_tools.dispatch("bash", {"command": f"cat {f}"}, ctx)
+        assert sentinel not in out and core.REDACTED in out
+        out = agent_tools.dispatch("read", {"path": str(f)}, ctx)  # read 出口同样脱敏
+        assert sentinel not in out
+        assert sentinel in f.read_text()  # 源文件保持原样：快照/恢复需要原始内容
+        sid = core.snapshot_file(str(f))  # 快照保留原始内容供恢复，不脱敏
+        d, meta = core.load_snapshot(sid)
+        assert sentinel in (d / meta["items"][0]["dest"]).read_text()
+        big = Path(td, "big.log")
+        big.write_text("x" * (agent_tools.OUTPUT_LIMIT + 100) + f"\ntoken={sentinel}\n")
+        out = agent_tools.dispatch("bash", {"command": f"cat {big}"}, ctx)
+        assert sentinel not in out
+        spill = re.search(r"完整内容: ([^（\s]+)", out)
+        assert spill, out[-300:]
+        assert sentinel not in Path(spill.group(1)).read_text()  # 落盘全文也脱敏
+        s = agent_session.Session()
+        s.append({"role": "tool", "content": f"key={sentinel}"})
+        assert sentinel not in s.path.read_text()
+        assert sentinel not in s.messages[0]["content"]
+        core.audit("redact-probe", output=f"password={sentinel}")
+        last = json.loads(Path(core.STATE_DIR, "audit.jsonl").read_text().strip().splitlines()[-1])
+        assert sentinel not in last["output"]
+        received = []
+        script = iter([
+            {"role": "assistant", "content": "", "tool_calls": [
+                _tool_call("s1", "bash", {"command": f"cat {f}"})]},
+            {"role": "assistant", "content": "已脱敏"}])
+        orig = llm.chat
+        llm.chat = lambda messages, **kw: (received.extend(messages), next(script))[1]
+        try:
+            loop.run_turn("看凭据", agent_session.Session(), agent_tools.ToolContext())
+        finally:
+            llm.chat = orig
+        assert sentinel not in json.dumps(received, ensure_ascii=False)  # 不进入模型请求
+
+
+def test_sensitive_file_read_restrictions():
+    import tempfile as tf
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext()
+    with tf.TemporaryDirectory() as td:
+        sshdir = Path(td, ".ssh")
+        sshdir.mkdir()
+        key = sshdir / "id_ed25519"
+        key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nKEYMATERIAL\n-----END OPENSSH PRIVATE KEY-----\n")
+        envf = Path(td) / ".env"
+        envf.write_text("TOKEN=abc\n")
+        log = Path(td) / "app.log"
+        log.write_text("mentions id_ed25519 in a log line\n")
+        for path in (key, envf):
+            out = agent_tools.dispatch("read", {"path": str(path)}, ctx)
+            assert "[opsx 拒绝]" in out and "KEYMATERIAL" not in out and "TOKEN=abc" not in out
+        out = agent_tools.dispatch("bash", {"command": f"cat {key}"}, ctx)
+        assert "[opsx 拒绝]" in out and "KEYMATERIAL" not in out
+        link = Path(td) / "innocent-name"
+        link.symlink_to(key)
+        out = agent_tools.dispatch("bash", {"command": f"cat {link}"}, ctx)  # 符号链接同样拒绝
+        assert "[opsx 拒绝]" in out and "KEYMATERIAL" not in out
+        _write_targets()
+        code, msg = core.check("cat id_rsa", target="web1")  # 远程无法 stat：裸文件名也拒绝
+        assert code == 2 and "敏感" in msg
+        for path in ("/etc/kubernetes/admin.conf", "/etc/ssh/ssh_host_ed25519_key",
+                     "/etc/ssl/private/server.pem",
+                     "~/.config/gcloud/application_default_credentials.json"):
+            code, msg = core.check(f"cat {path}")
+            assert code == 2 and "敏感" in msg, path
+        code, msg = core.check('ssh web1 "cat id_rsa"')  # ssh 引号内层命令同样检查
+        assert code == 2 and "敏感" in msg
+        assert core.sensitive_path("/app/.env.example") is False  # 模板不是密钥
+        assert core.check("cat /app/.env.example")[0] == 0
+        # KUBECONFIG 前缀/--kubeconfig 是选集群，不是读文件内容
+        assert core.classify("KUBECONFIG=~/.kube/config kubectl get pods")[0] == "R0"
+        assert core.check("KUBECONFIG=~/.kube/config kubectl get pods")[0] == 0
+        assert core.sensitive_command("kubectl --kubeconfig ~/.kube/config get pods") is None
+        assert core.classify("KUBECONFIG=$(id) kubectl get pods")[0] != "R0"  # 赋值里的命令替换仍拦
+        code, _ = core.check(f"sudo cat {sshdir}/*")  # 前缀命令不能绕过内容读取判断
+        assert code == 2
+        code, _ = core.check("cat ~/.ops-agent/snapshots/x/files/y")  # 快照原件同样不读
+        assert code == 2
+        for dump in ("kubectl get secret db-creds -o yaml",  # Secret 值不算只读排查
+                     "kubectl get secrets -n prod -o jsonpath={.items[*].data}",
+                     "kubectl get secret db-creds --template={{.data.password}}"):
+            code, msg = core.check(dump)
+            assert code == 2 and "敏感" in msg, dump
+        assert core.check("kubectl get secret db-creds -o name")[0] == 0  # 只看名字可以
+        assert core.check("kubectl get secrets -n prod")[0] == 0  # 默认表格不含值
+        assert core.check("kubectl describe secret db-creds")[0] == 0
+        out = agent_tools.dispatch("bash", {"command": f"ls -l {sshdir}"}, ctx)  # 只看权限可以
+        assert "[exit=0]" in out and "id_ed25519" in out
+        out = agent_tools.dispatch("bash", {"command": f"grep id_ed25519 {log}"}, ctx)  # 搜索词不误伤
+        assert "[exit=0]" in out and "mentions" in out
+        out = agent_tools.dispatch("bash", {"command": f"find {td} -name id_ed25519"}, ctx)
+        assert "[exit=0]" in out and "id_ed25519" in out
+        sid = core.snapshot_file(str(log))  # 快照原件不读进模型上下文
+        snap = Path(core.STATE_DIR, "snapshots", sid, "files", str(log).lstrip("/"))
+        out = agent_tools.dispatch("read", {"path": str(snap)}, ctx)
+        assert "[opsx 拒绝]" in out and "mentions" not in out
+
+
+def test_rollback_preview_confirm_and_backup():
+    import tempfile as tf
+    with tf.TemporaryDirectory() as td:
+        f = Path(td) / "svc.conf"
+        f.write_text("v1")
+        sid = core.snapshot_file(str(f))
+        f.write_text("v2")  # 执行后又改过：回滚不能静默覆盖
+        plan = core.rollback_plan(sid)
+        assert plan["files"][0]["exists"] is True
+        assert "v2" in plan["files"][0]["diff"] and "v1" in plan["files"][0]["diff"]
+        assert "回滚计划" in core.format_rollback_plan(plan)
+        try:
+            core.rollback(sid)  # 未确认：不改文件
+            raise AssertionError("未确认的回滚必须拒绝")
+        except core.OpsxError:
+            pass
+        assert f.read_text() == "v2"
+        report = core.rollback(sid, confirm=True)
+        assert f.read_text() == "v1" and "回滚前副本" in report
+        backup = re.search(r"回滚前副本: ([^（\s]+)", report).group(1)
+        meta = json.loads(Path(core.STATE_DIR, "snapshots", backup, "meta.json").read_text())
+        assert meta["rollback_of"] == sid
+        assert Path(core.STATE_DIR, "snapshots", backup, meta["items"][0]["dest"]).read_text() == "v2"
+        assert core.rollback(backup, confirm=True) and f.read_text() == "v2"  # 副本可撤销回滚
+        # 文件已删除：预览标出将新建，回滚前副本不记录不存在的文件
+        f.unlink()
+        plan = core.rollback_plan(sid)
+        assert plan["files"][0]["exists"] is False
+        report = core.rollback(sid, confirm=True)
+        assert f.read_text() == "v1" and "回滚前副本" not in report  # 没有可备份的旧内容
+
+
+def test_rollback_tool_requires_user_confirmation():
+    import tempfile as tf
+    from agent import tools as agent_tools
+    with tf.TemporaryDirectory() as td:
+        f = Path(td) / "app.conf"
+        f.write_text("v1")
+        sid = core.snapshot_file(str(f))
+        f.write_text("v2")
+        asked = []
+        out = agent_tools.dispatch("ops_rollback", {"snapshot_id": sid},
+            agent_tools.ToolContext(ask_user=lambda q: asked.append(q) or "no"))
+        assert "[opsx 拒绝]" in out and f.read_text() == "v2"
+        assert "回滚计划" in asked[0] and str(f) in asked[0] and "v2" in asked[0]
+        out = agent_tools.dispatch("ops_rollback", {"snapshot_id": sid},
+                                   agent_tools.ToolContext())  # 无确认通道
+        assert "[opsx 拒绝]" in out and f.read_text() == "v2"
+        out = agent_tools.dispatch("ops_rollback", {"snapshot_id": sid},
+            agent_tools.ToolContext(ask_user=lambda q: "确认回滚"))
+        assert "已恢复文件" in out and f.read_text() == "v1"
+
+
+def test_approval_bound_to_cwd_host_and_kubeconfig():
+    import tempfile as tf
+    import remote
+    cmd = "systemctl restart env-bound-svc"
+    repo = os.getcwd()
+    with tf.TemporaryDirectory() as td:
+        a, b = Path(td, "a"), Path(td, "b")
+        a.mkdir()
+        b.mkdir()
+        try:
+            os.chdir(a)
+            core.approve(cmd, ttl_seconds=60)
+            assert core.check_stamp(cmd) is True
+            os.chdir(b)
+            assert core.check_stamp(cmd) is False  # cwd 变了：旧授权失效
+            code, msg = core.check(cmd)
+            assert code == 2 and "环境已变化" in msg  # 明确提示重新批准，而不是当成没戳
+            assert "变更单" in core.check("systemctl restart no-such-stamp")[1]
+        finally:
+            os.chdir(repo)
+        # 实际主机变了：目标注册表里的 host 被改写
+        _write_targets()
+        core.approve(cmd, ttl_seconds=60, target="web1")
+        assert core.check_stamp(cmd, "web1") is True
+        p = _write_targets()
+        data = json.loads(p.read_text())
+        data["web1"]["host"] = "10.0.0.99"
+        p.write_text(json.dumps(data))
+        try:
+            assert core.check_stamp(cmd, "web1") is False
+            code, _, _ = remote.exec_change("web1", cmd)
+            assert code == 2  # 换主机不能用旧戳
+        finally:
+            _write_targets()
+        # identity/options 也会改变实际落到哪台机器
+        core.approve(cmd, ttl_seconds=60, target="web1")
+        p = _write_targets()
+        data = json.loads(p.read_text())
+        data["web1"]["options"] = ["-o", "HostName=10.0.0.99"]
+        p.write_text(json.dumps(data))
+        try:
+            assert core.check_stamp(cmd, "web1") is False
+        finally:
+            _write_targets()
+        # KUBECONFIG 变了：不同集群不能复用授权
+        local = "printf kube-bound"
+        old = os.environ.get("KUBECONFIG")
+        try:
+            os.environ["KUBECONFIG"] = str(Path(td, "one.yaml"))
+            core.approve(local, ttl_seconds=60)
+            assert core.check_stamp(local) is True
+            os.environ["KUBECONFIG"] = str(Path(td, "two.yaml"))
+            assert core.check_stamp(local) is False
+        finally:
+            if old is None:
+                os.environ.pop("KUBECONFIG", None)
+            else:
+                os.environ["KUBECONFIG"] = old
+
+
+def test_kubectl_change_requires_explicit_context():
+    cmd = "kubectl apply -f deploy.yaml"
+    try:
+        core.approve(cmd, ttl_seconds=60)
+        raise AssertionError("kubectl 变更没有 --context 必须拒绝发戳")
+    except core.OpsxError as e:
+        assert "--context" in str(e)
+    scoped = "kubectl apply --context=prod -n prod -f deploy.yaml"
+    p = core.approve(scoped, ttl_seconds=60)
+    stamp = json.loads(p.read_text())
+    assert stamp["env"]["k8s"] == {"context": "prod", "namespace": "prod"}
+    assert core.check_stamp(scoped) is True
+    other = "kubectl apply --context=stage -n prod -f deploy.yaml"
+    assert core.check_stamp(other) is False  # 换 context 不能用旧戳
+    assert core.check("kubectl get pods --context=prod")[0] == 0  # 只读不需要审批
+    for bypass in ("kubectl apply -f deploy.yaml && echo --context=prod",  # 别段参数不能冒充
+                   "sudo kubectl apply -f deploy.yaml",
+                   "/usr/local/bin/kubectl apply -f deploy.yaml",  # 全路径同样要认出来
+                   'sh -c "kubectl apply -f deploy.yaml"',
+                   "kubectl apply -f deploy.yaml # --context=prod"):  # 注释不执行
+        try:
+            core.approve(bypass, ttl_seconds=60)
+            raise AssertionError(f"kubectl 变更缺少 --context 必须拒绝: {bypass}")
+        except core.OpsxError:
+            pass
+    core.approve("systemctl restart nginx-check && kubectl get pods -n prod",
+                 ttl_seconds=60)  # 只读 kubectl 段不强制 context
+    try:
+        core.approve("kubectl apply --context=dev -f a.yaml && kubectl delete --context=prod pod x",
+                     ttl_seconds=60, force=True)
+        raise AssertionError("同一命令混用不同 context 必须拒绝")
+    except core.OpsxError as e:
+        assert "不同 --context" in str(e)
+
+
+def test_old_stamp_without_env_is_invalid():
+    cmd = "systemctl restart legacy-stamp"
+    p = core.approve(cmd, ttl_seconds=60)
+    stamp = json.loads(p.read_text())
+    p.write_text(json.dumps({k: v for k, v in stamp.items() if k != "env"}))
+    assert core.check_stamp(cmd) is False  # 旧格式戳安全失效，需重新授权
+    assert not any(a["cmd"] == cmd for a in core.collect_state()["approvals"])  # 也不显示成有效
+    p.write_text(json.dumps(dict(stamp, env=dict(stamp["env"], cwd="/elsewhere"))))
+    assert core.check_stamp(cmd) is False
+
+
+def test_cli_and_mcp_outputs_redacted():
+    import subprocess
+    import sys
+    from agent import tools as agent_tools
+    sentinel = "sk-CLI-SENTINEL0123456789"
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "out.txt"
+        f.write_text(f"TOKEN={sentinel}\n")
+        # CLI 形态的 stdout 也会被模型宿主读取（Claude Code Bash）
+        env = dict(os.environ, OPSX_STATE_DIR=str(Path(td) / "state"))
+        r = subprocess.run([sys.executable, str(core.REPO_DIR / "opsx"), "exec", f"cat {f}"],
+                           env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert sentinel not in r.stdout and core.REDACTED in r.stdout
+        # MCP 工具结果同样过脱敏出口
+        c = McpClient()
+        try:
+            _, payload = c.call_tool("ops_exec", {"command": f"cat {f}"})
+            assert payload["exit_code"] == 0
+            assert sentinel not in payload["output"] and core.REDACTED in payload["output"]
+        finally:
+            c.close()
+        # 工具输出的脱敏在 dispatch 之后仍保持幂等
+        out = agent_tools.dispatch("bash", {"command": f"cat {f}"}, agent_tools.ToolContext())
+        assert core.redact(out) == out and sentinel not in out
+    # opsx list 会把审批命令打印给宿主：展示同样脱敏（戳文件里保留原文供精确匹配）
+    core.approve("setup-env TOKEN=sk-DISPLAY-SENTINEL0123456789", ttl_seconds=60)
+    assert "DISPLAY-SENTINEL" not in "\n".join(core.format_state(core.collect_state()))
+
+
+def test_remote_rollback_target_check_and_backup():
+    import subprocess
+    import remote
+    _write_targets()
+    core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
+    pushed = []
+
+    def fake(name, cmd, stdin=None, timeout=120):
+        if "OPSX-EXISTS" in cmd:
+            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n", stderr=b"")
+        if cmd.startswith("cat --"):
+            return subprocess.CompletedProcess([], 0, stdout=b"archived-v1\n", stderr=b"")
+        if cmd.startswith("cat >"):
+            pushed.append(stdin)
+            return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+    orig = remote._ssh
+    remote._ssh = fake
+    try:
+        code, sid, _ = remote.exec_change("web1", "systemctl restart nginx",
+                                          snapshot_files=["/etc/nginx/nginx.conf"])
+        assert code == 0 and sid
+        report = remote.rollback(sid, confirm=True)
+        backup = re.search(r"回滚前副本: ([^（\s]+)", report).group(1)
+        meta = json.loads(Path(core.STATE_DIR, "snapshots", backup, "meta.json").read_text())
+        assert meta["target"] == "web1" and meta["env"]["host"] == "10.0.0.11"
+        core.load_snapshot(backup)  # 远程副本必须可加载（缺 target/mode 曾报损坏）
+        pushed.clear()
+        assert "已恢复远程文件" in remote.rollback(backup, confirm=True)
+        assert pushed and pushed[-1] == b"current-v2\n"  # 副本存的是回滚前的当前内容
+        # 注册表把 web1 改指向另一台机器：旧快照不能写过去
+        p = _write_targets()
+        data = json.loads(p.read_text())
+        data["web1"]["host"] = "10.0.0.99"
+        p.write_text(json.dumps(data))
+        for call in (lambda: remote.rollback_plan(sid),
+                     lambda: remote.rollback(sid, confirm=True)):
+            try:
+                call()
+                raise AssertionError("目标被改指向后必须拒绝回滚")
+            except remote.RemoteError as e:
+                assert "不一致" in str(e)
+    finally:
+        remote._ssh = orig
+        _write_targets()
+
+
+def test_rollback_partial_failure_reports_backup():
+    import tempfile as tf
+    with tf.TemporaryDirectory() as td:
+        a, b = Path(td, "a.conf"), Path(td, "b.conf")
+        a.write_text("a1")
+        b.write_text("b1")
+        core.approve("printf noop", ttl_seconds=60)
+        code, sid, _ = core.exec_change("printf noop", snapshot_files=[str(a), str(b)])
+        assert code == 0 and sid
+        a.write_text("a2")
+        b.write_text("b2")
+        real_replace = core.os.replace
+
+        def flaky(src, dst):
+            if Path(dst).resolve() == b.resolve():
+                raise OSError("simulated write failure")
+            return real_replace(src, dst)
+
+        core.os.replace = flaky
+        try:
+            try:
+                core.rollback(sid, confirm=True)
+                raise AssertionError("第二个文件写失败应报错")
+            except core.OpsxError as e:
+                msg = str(e)
+        finally:
+            core.os.replace = real_replace
+        assert "simulated write failure" in msg and "回滚前副本" in msg
+        backup = re.search(r"回滚前副本: ([^（\s）]+)", msg).group(1)
+        meta = json.loads(Path(core.STATE_DIR, "snapshots", backup, "meta.json").read_text())
+        assert {Path(i["src"]).resolve() for i in meta["items"]} == {a.resolve(), b.resolve()}
+        assert a.read_text() == "a1"  # 半恢复状态可查，且知道从哪恢复
+
+
+def test_ci_workflow_runs_selftest():
+    workflow = Path(__file__).resolve().parent / ".github" / "workflows" / "selftest.yml"
+    assert workflow.is_file(), "自检必须接入 CI"
+    assert "./opsx selftest" in workflow.read_text(encoding="utf-8")
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -61,6 +62,32 @@ def get_target(name: str) -> dict:
         raise RemoteError(f"未注册的 SSH 目标: {name}（已注册: {known}；"
                           f"在 {_targets_file()} 注册后才可用）")
     return t
+
+
+def target_env(name: str) -> dict:
+    """目标的实际主机指纹（审批绑定用）：host/user/port/identity/options 任一改动旧戳即失效。"""
+    t = get_target(name)
+    ssh_argv(name)  # 复用字段校验：非法主机/端口/选项在发戳时就拒绝，而不是执行时
+    return {"scope": "remote", "target": name, "host": str(t.get("host") or ""),
+            "user": str(t.get("user") or ""), "port": t.get("port") or 22,
+            "identity": str(t.get("identity") or ""),
+            "options": list(t.get("options") or []),
+            "kubeconfig": os.environ.get("KUBECONFIG", "")}
+
+
+def _snapshot_target_env(meta: dict) -> dict:
+    """快照记录的目标指纹 vs 当前注册表：不一致就拒绝回滚（避免写到另一台机器）。"""
+    target = meta["target"]
+    current = target_env(target)
+    recorded = meta.get("env")
+    if not isinstance(recorded, dict):
+        return current  # 旧快照没有指纹：按 target 名解析，兼容历史快照
+    for key in ("host", "user", "port", "identity", "options"):
+        if recorded.get(key) != current.get(key):
+            raise RemoteError(
+                f"快照记录的 {target} 与当前注册表不一致（{key}: {recorded.get(key)!r} → "
+                f"{current.get(key)!r}）：拒绝回滚，请核对 targets.json 或重新快照")
+    return current
 
 
 def _str_field(t: dict, key: str) -> str:
@@ -173,8 +200,8 @@ def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list) -> None:
 
 
 def _write_meta(d: Path, sid: str, name: str, items: list) -> None:
-    meta = {"id": sid, "target": name, "created": datetime.now(timezone.utc).isoformat(),
-            "items": items}
+    meta = {"id": sid, "target": name, "env": target_env(name),
+            "created": datetime.now(timezone.utc).isoformat(), "items": items}
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -224,13 +251,13 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
     get_target(name)  # 先把"打错目标名"报出来，而不是误导用户去建审批戳
     code, msg = core.check(cmd, target=name)
     if code != 0:
-        print(msg, file=sys.stderr)
+        print(core.redact(msg), file=sys.stderr)
         return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = core.check(c, target=name)
         if code != 0:
             core.audit("exec-abort", cmd=cmd, target=name, reason=f"快照命令未通过守门: {c}")
-            output = f"[opsx] 快照命令未通过守门，已中止执行: {c}"
+            output = core.redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
     sid = None
@@ -251,7 +278,7 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
             return 3, None, output
     try:
         r = _ssh(name, cmd, timeout=timeout)
-        output = _text(r)
+        output = core.redact(_text(r))
         exit_code = r.returncode
     except subprocess.TimeoutExpired:
         output = f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认"
@@ -262,28 +289,81 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
     return exit_code, sid, output
 
 
-def rollback(snapshot_id: str) -> str:
-    """回滚：远程快照推回目标机，本机快照交给 core.rollback。"""
+def _remote_read(name: str, path_str: str) -> tuple[bool, bytes]:
+    """读取目标机当前文件内容（回滚预览/回滚前副本用）。返回 (是否存在, 内容)。"""
+    q = shlex.quote(path_str)
+    remote_cmd = (f"if [ -e {q} ]; then printf 'OPSX-EXISTS\\n'; cat -- {q}; "
+                  "else printf 'OPSX-MISSING\\n'; fi")
+    try:
+        r = _ssh(name, remote_cmd, timeout=IO_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise RemoteError(f"读取远程文件超时: {path_str}") from e
+    if r.returncode != 0:
+        raise RemoteError(f"读取远程文件失败({r.returncode}): {path_str}: {_text(r)[:300]}")
+    if r.stdout.startswith(b"OPSX-EXISTS\n"):
+        return True, r.stdout[len(b"OPSX-EXISTS\n"):]
+    if r.stdout.startswith(b"OPSX-MISSING\n"):
+        return False, b""
+    raise RemoteError(f"远程文件状态无法判定: {path_str}")
+
+
+def rollback_plan(snapshot_id: str) -> dict:
+    """远程快照的回滚预览：经 SSH 读取目标机当前内容再比对。"""
     d, meta = core.load_snapshot(snapshot_id)
     target = meta.get("target")
     if not target:
-        return core.rollback(snapshot_id)
+        return core.rollback_plan(snapshot_id)
+    _snapshot_target_env(meta)  # 目标被改指向时不能拿旧快照覆盖新机器
+    return core.rollback_plan(
+        snapshot_id, read_state=lambda src: _remote_read(target, src))
+
+
+def rollback(snapshot_id: str, confirm: bool = False) -> str:
+    """回滚：远程快照推回目标机，本机快照交给 core.rollback。
+
+    回滚是写操作：入口展示 rollback_plan 并由人确认后再传 confirm=True。
+    """
+    d, meta = core.load_snapshot(snapshot_id)
+    target = meta.get("target")
+    if not target:
+        return core.rollback(snapshot_id, confirm=confirm)
+    file_items = [item for item in meta["items"] if item["type"] == "file"]
+    if file_items and not confirm:
+        raise core.OpsxError("回滚会覆盖目标机文件，属于写操作：请先预览并由人确认"
+                            "（CLI: opsx rollback <id>）")
+    env = _snapshot_target_env(meta)
+    backup_sid = None
     report = []
-    for item in meta["items"]:
-        if item["type"] != "file":
-            out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
-            report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
-            continue
-        # 覆盖写保留原 inode/权限；文件已被删除时重建（权限为默认值）。
-        try:
-            r = _ssh(target, f"cat > {shlex.quote(item['src'])}",
-                     stdin=(d / item["dest"]).read_bytes(), timeout=IO_TIMEOUT)
-        except subprocess.TimeoutExpired as e:
-            raise RemoteError(f"远程回滚超时: {item['src']}") from e
-        if r.returncode != 0:
-            raise RemoteError(f"远程回滚失败({r.returncode}): {item['src']}: {_text(r)[:300]}")
-        report.append(f"已恢复远程文件: {target}:{item['src']}")
-    core.audit("rollback", snapshot_id=snapshot_id, target=target)
+    try:
+        if file_items:
+            backup_sid = core._rollback_backup(
+                snapshot_id, target, file_items,
+                lambda src: _remote_read(target, src), meta_extra={"env": env})
+        for item in meta["items"]:
+            if item["type"] != "file":
+                out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
+                report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
+                continue
+            # 覆盖写保留原 inode/权限；文件已被删除时重建（权限为默认值）。
+            try:
+                r = _ssh(target, f"cat > {shlex.quote(item['src'])}",
+                         stdin=(d / item["dest"]).read_bytes(), timeout=IO_TIMEOUT)
+            except subprocess.TimeoutExpired as e:
+                raise RemoteError(f"远程回滚超时: {item['src']}") from e
+            if r.returncode != 0:
+                raise RemoteError(f"远程回滚失败({r.returncode}): {item['src']}: {_text(r)[:300]}")
+            report.append(f"已恢复远程文件: {target}:{item['src']}")
+    except (core.OpsxError, RemoteError) as e:
+        core.audit("rollback-failed", snapshot_id=snapshot_id, target=target,
+                   backup_snapshot_id=backup_sid, error=str(e))
+        if backup_sid:
+            raise RemoteError(f"{e}（回滚前副本: {backup_sid}）") from e
+        raise
+    if backup_sid:
+        report.append(f"回滚前副本: {backup_sid}"
+                      f"（如需撤销本次回滚: opsx rollback {backup_sid}）")
+    core.audit("rollback", snapshot_id=snapshot_id, target=target,
+               backup_snapshot_id=backup_sid, files=[i["src"] for i in file_items])
     return "\n".join(report)
 
 

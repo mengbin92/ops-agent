@@ -1,14 +1,17 @@
 """opsx 核心库：纯函数，CLI 与未来 MCP server 共用。"""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import fcntl
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -26,6 +29,147 @@ _RANK = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 
 class OpsxError(Exception):
     pass
+
+
+# ---- 秘密脱敏与敏感文件：模型请求、会话、审计、输出落盘共用同一出口 ----
+# 只是降低外泄概率的启发式：不宣称能识别所有秘密（加密内容、二进制、自定义格式会漏）。
+
+REDACTED = "[已脱敏]"
+_PEM_KEY = re.compile(r"-----BEGIN[ A-Z0-9]*PRIVATE KEY-----.*?-----END[ A-Z0-9]*PRIVATE KEY-----",
+                      re.S)
+_AUTH_HEADER = re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+")
+_SECRET_NAME = re.compile(
+    r"(?i)(?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
+    r"private[_-]?key|credential|auth)")
+_SECRET_KV = re.compile(
+    r"(?i)([\"']?)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey|"
+    r"access[_-]?key|private[_-]?key|credential|auth)[A-Za-z0-9_.-]*)\1"
+    r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)")
+_TOKEN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[abprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b")
+
+# 命中即视为凭据文件（read 直接拒绝；命令里出现即拒绝，避免内容进模型或落盘）。
+_SENSITIVE_FILE_PATTERNS = [
+    r"(?i)(?:^|/)id_(?:rsa|dsa|ecdsa|ed25519)$",
+    r"(?i)(?:^|/)\.env(?:\.(?!example$|sample$|template$)[^/\s]+)?$",
+    r"(?i)(?:^|/)\.(?:netrc|pgpass|git-credentials|npmrc|pypirc|my\.cnf)$",
+    r"(?i)(?:^|/)[^/\s]+\.(?:key|p12|pfx|jks|keystore)$",
+    r"(?i)(?:^|/)[^/\s]*(?:priv|secret)[^/\s]*\.pem$",
+    r"(?:^|/)\.ssh/(?:id_[^/\s]+|identity)$",
+    r"(?i)(?:^|/)\.kube/config$",
+    r"(?i)(?:^|/)\.aws/credentials$",
+    r"(?i)(?:^|/)\.docker/config\.json$",
+    r"(?:^|/)\.config/gh/hosts\.yml$",
+    r"(?i)(?:^|/)ssh_host_[^/\s]*_key$",
+    r"(?:^|/)etc/kubernetes/[^/\s]*\.conf$",
+    r"(?i)(?:^|/)private/[^/\s]+\.pem$",
+    r"(?:^|/)(?:shadow|gshadow)$",
+]
+# 敏感目录：read 拒绝；命令仅在"会打印内容"时拒绝（ls -l ~/.ssh 仍可用于确认权限）。
+_SENSITIVE_DIR_PATTERNS = [
+    r"(?i)(?:^|/)\.ssh(?:/|$)",
+    r"(?i)(?:^|/)\.aws(?:/|$)",
+    r"(?i)(?:^|/)\.gnupg(?:/|$)",
+    r"(?i)(?:^|/)\.kube(?:/|$)",
+    r"(?i)(?:^|/)\.config/gcloud(?:/|$)",
+    r"(?:^|/)\.ops-agent/snapshots(?:/|$)",  # 默认状态目录：快照原件供恢复，不读进模型
+]
+# k8s Secret 值：默认表格/describe 不输出值，-o yaml/json/jsonpath 等会输出明文（base64）。
+_KUBECTL_GET_SECRET = re.compile(r"\bkubectl\b.*?\bget\b.*?\bsecrets?\b", re.I)
+_KUBECTL_VALUE_OUTPUT = re.compile(
+    r"(?:\s-o|\s--output)(?:=|\s+)(?!name\b)\S+|\s--template(?:=|\s+)\S+"
+    r"|\s--go-template(?:-file)?(?:=|\s+)\S+", re.I)
+_CONTENT_READERS = frozenset({
+    "cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "strings", "xxd",
+    "od", "hexdump", "base64", "base32", "awk", "sed", "cut", "tr", "dd", "cp", "mv",
+    "scp", "rsync", "tar", "zip", "gzip", "gunzip", "openssl", "ssh-keygen", "python",
+    "python3", "perl", "ruby", "node", "bash", "sh", "zsh", "source", "curl", "wget",
+    "vi", "vim", "nano",
+})
+
+
+def redact(text: str) -> str:
+    """把常见凭据/私钥换成占位符；幂等，可重复用于同一段文本。"""
+    if not isinstance(text, str) or not text:
+        return text
+    text = _PEM_KEY.sub(REDACTED + " 私钥", text)
+    text = _AUTH_HEADER.sub(r"\1" + REDACTED, text)
+    text = _SECRET_KV.sub(
+        lambda m: m.group(1) + m.group(2) + m.group(1) + m.group(3) + REDACTED, text)
+    return _TOKEN.sub(REDACTED, text)
+
+
+def redact_obj(value):
+    """会话记录脱敏：字符串脱敏，dict/list 递归复制（不改原对象）。"""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: (REDACTED if isinstance(v, str) and v and _SECRET_NAME.search(str(k))
+                    else redact_obj(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_obj(v) for v in value]
+    return value
+
+
+def sensitive_path(path: str) -> bool:
+    return isinstance(path, str) and any(re.search(p, path) for p in _SENSITIVE_FILE_PATTERNS)
+
+
+def sensitive_dir(path: str) -> bool:
+    return isinstance(path, str) and any(re.search(p, path) for p in _SENSITIVE_DIR_PATTERNS)
+
+
+def sensitive_command(cmd: str, strict: bool = False) -> str | None:
+    """命令入口的敏感文件限制：返回命中的路径，命中则整条命令拒绝。
+
+    保守策略：引用凭据文件一律拒绝；敏感目录只有会打印内容的命令才拒绝。
+    strict=True 用于远程命令：本机无法 stat 目标机文件，裸文件名也按敏感处理。
+    """
+    if not isinstance(cmd, str):
+        return None
+    for seg in _segments(cmd):
+        if _KUBECTL_GET_SECRET.search(seg) and _KUBECTL_VALUE_OUTPUT.search(seg):
+            return "kubectl get secret -o yaml/json（禁止输出 Secret 值）"
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            words = seg.split()
+        if not words:
+            continue
+        if not strict and Path(words[0]).name == "ssh" and len(words) > 1:
+            inner = sensitive_command(words[-1], strict=True)  # ssh host "cat id_rsa"
+            if inner:
+                return inner
+        readers = any(Path(w).name in _CONTENT_READERS for w in words)
+        skip_next = False
+        for w in words:
+            if skip_next:  # find -name id_rsa / --kubeconfig path：参数不是被读取的文件
+                skip_next = False
+                continue
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
+                continue  # 环境变量赋值不是读取文件（KUBECONFIG=... kubectl get）
+            if w.startswith(("--kubeconfig=", "-kubeconfig=")):
+                continue  # kubectl 读 kubeconfig 输出的是集群信息，不是文件内容
+            if w in ("-name", "-iname", "--name", "--kubeconfig", "-kubeconfig"):
+                skip_next = True
+                continue
+            cand = w.split("=", 1)[1] if w.startswith("-") and "=" in w else w
+            cand = cand.strip("'\"")
+            if not cand or cand.startswith("-"):
+                continue
+            # 裸文件名可能是搜索词（grep id_rsa app.log）：只有确实指向当前目录里的
+            # 敏感文件时才拒绝；带路径分隔符/~/点前缀的一律按路径处理。
+            if "/" not in cand and "~" not in cand and not os.path.isfile(
+                    os.path.expanduser(cand)) and not strict:
+                continue
+            if sensitive_path(cand):
+                return cand
+            if not strict and sensitive_path(os.path.realpath(os.path.expanduser(cand))):
+                return cand  # 符号链接指向凭据文件
+            if readers and sensitive_dir(cand):
+                return cand
+    return None
 
 
 def validate_arguments(value, schema: dict, path: str = "参数") -> None:
@@ -100,10 +244,7 @@ def classify(cmd: str) -> tuple[str, str | None]:
     if ssh_level is not None:
         return ssh_level, cmd if ssh_level != "R0" else None
     level, matched = "R0", None
-    for seg in re.split(r"&&|\|\||[;|\n]|(?<!>)&(?!>)", cmd):
-        seg = seg.strip(" \t")
-        if not seg:
-            continue
+    for seg in _segments(cmd):
         seg_level = _classify_single(seg, config)
         if _RANK[seg_level] > _RANK[level]:
             level, matched = seg_level, seg
@@ -146,9 +287,13 @@ def _classify_single(seg: str, config: dict) -> str:
     ssh_level = _classify_ssh(seg)
     if ssh_level is not None:
         return ssh_level
+    # KUBECONFIG=... 只改变选中的集群，不改变执行的二进制：覆盖默认 kubeconfig 的只读排查照常放行。
+    # 写标记仍看原始段：赋值里的 $(...) 不能在剥离后被忘掉。
+    raw = seg
+    seg = re.sub(r"^KUBECONFIG=[^\s]+[ \t]+", "", seg)
     for pat in config["readonly_patterns"]:
         if re.search(pat, seg):
-            if _has_write_marker(seg):
+            if _has_write_marker(raw):
                 break  # 带写标记：跳过只读放行，落入风险规则
             return "R0"
     for pat in config["risk_rules"]["R3"]:
@@ -174,7 +319,9 @@ def _ensure_state_dir() -> None:
 def audit(event: str, **fields) -> None:
     _ensure_state_dir()
     path = STATE_DIR / "audit.jsonl"
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
+    # 常规记录同样脱敏：审计留证据，不长期保存明文密钥/私钥。
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
+           **{k: redact_obj(v) for k, v in fields.items()}}
     with open(STATE_DIR / "audit.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
@@ -189,14 +336,109 @@ def normalize(cmd: str) -> str:
     return re.sub(r"[ \t]+", " ", cmd.strip(" \t"))
 
 
+# ---- 审批绑定的实际执行环境 ----
+# 同一命令在不同主机 / 目录 / k8s context / KUBECONFIG 下语义不同：批准后环境变化即失效。
+
+_SEGMENT_RE = re.compile(r"&&|\|\||[;|\n]|(?<!>)&(?!>)")
+_KUBECTL_SEG_RE = re.compile(r"(?:^|[\s/\"'])kubectl(?=[\s\"']|$)")
+_KUBECTL_CONTEXT = re.compile(r"(?:^|\s)--context(?:=|\s+)(\"[^\"]*\"|'[^']*'|\S+)")
+_KUBECTL_NAMESPACE = re.compile(r"(?:^|\s)(?:--namespace(?:=|\s+)|-n\s+)(\"[^\"]*\"|'[^']*'|\S+)")
+
+
+def _segments(cmd: str) -> list[str]:
+    """复合命令分段（只按 shell 分隔符切，不解析 AST）。"""
+    return [seg.strip(" \t") for seg in _SEGMENT_RE.split(cmd) if seg.strip(" \t")]
+
+
+def _strip_comment(seg: str) -> str:
+    """去掉 shell 注释：`kubectl apply … # --context=prod` 里的 context 不会被执行。"""
+    return re.sub(r"(?:^|\s)#[^\n]*$", "", seg).strip(" \t")
+
+
+def _kubectl_segments(cmd: str) -> list[str]:
+    return [seg for seg in (_strip_comment(s) for s in _segments(cmd or ""))
+            if seg and _KUBECTL_SEG_RE.search(seg)]
+
+
+_KUBECTL_FLAGS_WITH_VALUE = frozenset({
+    "-n", "--namespace", "--context", "--kubeconfig", "-o", "--output", "--cluster",
+    "--user", "--server", "--token", "--as", "--as-group", "--request-timeout", "-s",
+    "--certificate-authority", "--client-certificate", "--client-key", "--cache-dir",
+})
+_KUBECTL_READ_VERBS = frozenset({"get", "describe", "logs", "top", "api-resources",
+                                 "explain", "version", "cluster-info", "auth"})
+
+
+def _kubectl_read_only(seg: str) -> bool:
+    """kubectl 段的动词是否只读（用于 --context 要求与审核展示）。"""
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    for i, w in enumerate(words):
+        if Path(w).name != "kubectl":
+            continue
+        j = i + 1
+        while j < len(words):
+            w = words[j]
+            if w in _KUBECTL_FLAGS_WITH_VALUE:
+                j += 2
+                continue
+            if w.startswith("-"):
+                j += 1
+                continue
+            return w in _KUBECTL_READ_VERBS
+    return False
+
+
+def k8s_scope(cmd: str) -> dict:
+    for seg in _kubectl_segments(cmd):
+        ctx = _KUBECTL_CONTEXT.search(seg)
+        ns = _KUBECTL_NAMESPACE.search(seg)
+        return {"context": ctx.group(1).strip("\"'") if ctx else "",
+                "namespace": ns.group(1).strip("\"'") if ns else ""}
+    return {"context": "", "namespace": ""}
+
+
+def local_env() -> dict:
+    return {"scope": "local", "host": socket.gethostname() or "localhost",
+            "cwd": os.path.realpath(os.getcwd()),
+            "kubeconfig": os.environ.get("KUBECONFIG", "")}
+
+
+def resolve_env(cmd: str, target: str | None = None) -> dict:
+    if target:
+        import remote  # 延迟导入：remote 依赖 core，模块级导入会成环
+        env = remote.target_env(target)
+    else:
+        env = local_env()
+    if _kubectl_segments(cmd or ""):
+        env["k8s"] = k8s_scope(cmd)
+    return env
+
+
+def format_env(env: dict) -> str:
+    if env.get("scope") == "remote":
+        user = f"{env['user']}@" if env.get("user") else ""
+        line = f"目标 {env.get('target')}（{user}{env.get('host')}:{env.get('port')}）"
+    else:
+        line = f"本机 {env.get('host')}，工作目录 {env.get('cwd')}"
+    k8s = env.get("k8s") or {}
+    if k8s.get("context"):
+        line += f"，k8s context={k8s['context']}"
+        if k8s.get("namespace"):
+            line += f" namespace={k8s['namespace']}"
+    return line
+
+
 def cmd_hash(cmd: str, target: str | None = None) -> str:
-    """审批戳键。远程目标参与哈希：在 A 机器批准的命令不能拿到 B 机器执行。"""
+    """审批戳文件名键。远程目标参与哈希：在 A 机器批准的命令不能拿到 B 机器执行。"""
     key = f"{target}\n{normalize(cmd)}" if target else normalize(cmd)
     return hashlib.sha256(key.encode()).hexdigest()
 
 
 def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
-            target: str | None = None) -> Path:
+            target: str | None = None, env: dict | None = None) -> Path:
     if type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise OpsxError("审批 TTL 须为正整数秒")
     if type(force) is not bool:
@@ -206,10 +448,19 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
         raise OpsxError("只读命令无需审批戳")
     if level == "R3" and not force:
         raise OpsxError("R3 命令需 --force 显式确认（不可逆操作）")
+    env = env or resolve_env(cmd, target)
+    kubectl = [seg for seg in _kubectl_segments(cmd) if not _kubectl_read_only(seg)]
+    ctx_matches = [_KUBECTL_CONTEXT.search(seg) for seg in kubectl]
+    if any(m is None for m in ctx_matches):
+        raise OpsxError("kubectl 变更须在命令中显式指定 --context："
+                        "审批绑定实际 context，不能用当前默认 context 执行")
+    if len({m.group(1).strip("\"'") for m in ctx_matches}) > 1:
+        raise OpsxError("同一命令里的 kubectl 段使用了不同 --context：请拆开分别审批执行")
     stamp = {
         "cmd_hash": cmd_hash(cmd, target),
         "cmd": cmd,
         "target": target,
+        "env": env,
         "created": time.time(),
         "ttl": ttl_seconds,
         "force": force,
@@ -221,22 +472,26 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
     prune_approvals()  # 顺带清理过期戳
-    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target)
+    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target,
+          env=env)
     return p
 
 
-def check_stamp(cmd: str, target: str | None = None) -> bool:
+def check_stamp(cmd: str, target: str | None = None, env: dict | None = None) -> bool:
     p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
     if not p.exists():
         return False
     try:
         s = json.loads(p.read_text(encoding="utf-8"))
+        if env is None:
+            env = resolve_env(cmd, target)
         return (_stamp_live(s) and s["cmd_hash"] == cmd_hash(cmd, target) and
                 normalize(s["cmd"]) == normalize(cmd) and s.get("target") == target and
+                s.get("env") == env and
                 s["level"] == classify(cmd)[0] and
                 (s["level"] != "R3" or s.get("force") is True))
-    except (json.JSONDecodeError, KeyError, TypeError, OSError, UnicodeError, OverflowError):
-        return False  # 损坏的戳按无效处理（安全方向）
+    except Exception:  # noqa: BLE001 —— 环境解析或戳内容任何异常都按无效处理（安全方向）
+        return False
 
 
 def _stamp_live(stamp) -> bool:
@@ -281,7 +536,8 @@ def collect_state() -> dict:
         for p in sorted(adir.glob("*.json")):
             try:
                 st = json.loads(p.read_text(encoding="utf-8"))
-                if not _stamp_live(st) or not isinstance(st.get("cmd"), str):
+                if (not _stamp_live(st) or not isinstance(st.get("cmd"), str)
+                        or not isinstance(st.get("env"), dict)):
                     continue
                 if st.get("level") not in _RANK or st.get("target") is not None and not isinstance(st["target"], str):
                     continue
@@ -299,23 +555,48 @@ def format_state(state: dict) -> list[str]:
         lines += ["== snapshots =="] + state["snapshots"]
     if state["approvals"]:
         lines.append("== approvals ==")
-        lines += [f"{a['cmd'][:80]}  (level={a['level']}, ttl={a['ttl']}s, "
+        lines += [f"{redact(a['cmd'])[:80]}  (level={a['level']}, ttl={a['ttl']}s, "
                   f"{'target=' + a['target'] if a.get('target') else '本机'})"
                   for a in state["approvals"]]
     return lines
 
 
-def check(cmd: str, target: str | None = None) -> tuple[int, str]:
+def stamp_env_mismatch(cmd: str, target: str | None = None,
+                       env: dict | None = None) -> bool:
+    """戳存在但执行环境不同：给用户明确的“重新批准”提示，而不是当成没有戳。"""
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
+    if not p.exists():
+        return False
+    try:
+        s = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(s, dict) or not isinstance(s.get("env"), dict):
+            return False
+        return s["env"] != (env if env is not None else resolve_env(cmd, target))
+    except Exception:  # noqa: BLE001 —— 解析失败按无提示处理
+        return False
+
+
+def check(cmd: str, target: str | None = None, env: dict | None = None) -> tuple[int, str]:
     level, matched = classify(cmd)
+    hit = sensitive_command(cmd, strict=bool(target))
+    if hit:
+        audit("check", cmd=cmd, level=level, result="deny-sensitive", target=target, path=hit)
+        return 2, redact(f"[opsx] 拒绝执行：命令涉及敏感凭据/Secret（{hit}），"
+                         "密钥/私钥/Secret 值不读取、不写入。确认文件存在与权限请用 ls -l；"
+                         "确需读取请由人直接操作。")
     if level == "R0":
         audit("check", cmd=cmd, level=level, result="allow", target=target)
         return 0, "只读命令，放行"
-    if check_stamp(cmd, target):
+    if check_stamp(cmd, target, env):
         audit("check", cmd=cmd, level=level, result="allow-stamp", target=target)
         return 0, "有效审批戳，放行"
+    if stamp_env_mismatch(cmd, target, env):
+        audit("check", cmd=cmd, level=level, result="deny-env", target=target)
+        return 2, ("[opsx] 审批戳的执行环境已变化（主机/工作目录/KUBECONFIG/k8s context 不同），"
+                   "请重新批准后再执行。")
     audit("check", cmd=cmd, level=level, result="deny", target=target)
     hit = f"（命中分段：{matched}）" if matched else ""
-    return 2, (
+    return 2, redact(
         f"[opsx] 拒绝执行：该命令判定为 {level}{hit}。"
         "请先向用户提交变更单（风险说明+回滚计划），经确认后使用 opsx exec 执行。"
     )
@@ -383,8 +664,9 @@ def _snapshot_cmd_into(d: Path, cmd: str, name: str, items: list) -> None:
     items.append({"type": "cmd", "cmd": cmd, "name": name, "output": fname})
 
 
-def _write_meta(d: Path, sid: str, items: list) -> None:
-    meta = {"id": sid, "created": datetime.now(timezone.utc).isoformat(), "items": items}
+def _write_meta(d: Path, sid: str, items: list, **extra) -> None:
+    meta = {"id": sid, "created": datetime.now(timezone.utc).isoformat(), "items": items,
+            **extra}
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -462,30 +744,173 @@ def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
         raise OpsxError(f"快照元数据损坏: {snapshot_id}: {e}") from e
 
 
-def rollback(snapshot_id: str) -> str:
+DIFF_LIMIT = 4000  # 回滚预览里的差异展示上限（按字符）
+
+
+def _local_read_state(src: str) -> tuple[bool, bytes]:
+    p = Path(src)
+    try:
+        if not p.is_file():
+            return False, b""
+        return True, p.read_bytes()
+    except OSError as e:
+        raise OpsxError(f"回滚前读取当前文件失败 {src}: {e}") from e
+
+
+def _diff_text(current: bytes, archived: bytes, src: str, snapshot_id: str) -> str:
+    try:
+        cur = current.decode("utf-8")
+        old = archived.decode("utf-8")
+    except UnicodeDecodeError:
+        return "（二进制文件，差异从略）"
+    if "\x00" in cur or "\x00" in old:
+        return "（二进制文件，差异从略）"
+    diff = "\n".join(difflib.unified_diff(
+        cur.splitlines(), old.splitlines(), fromfile=f"当前 {src}",
+        tofile=f"快照 {snapshot_id}", lineterm="", n=2))
+    if not diff:
+        return "（内容与快照一致）"
+    return diff if len(diff) <= DIFF_LIMIT else diff[:DIFF_LIMIT] + "\n...[差异已截断]"
+
+
+def rollback_plan(snapshot_id: str, read_state=None) -> dict:
+    """回滚预览：实际目标、将覆盖的文件、当前内容与快照内容的差异。
+
+    read_state(src) -> (exists, bytes)：远程快照由 remote.rollback_plan 注入 SSH 读取。
+    """
+    d, meta = load_snapshot(snapshot_id)
+    read = read_state or _local_read_state
+    plan = {"snapshot_id": snapshot_id, "target": meta.get("target"),
+            "host": (meta.get("env") or {}).get("host"), "files": [], "commands": []}
+    for item in meta["items"]:
+        if item["type"] == "file":
+            try:
+                archived = (d / item["dest"]).read_bytes()
+            except OSError as e:
+                raise OpsxError(f"回滚预览读取快照失败 {item['src']}: {e}") from e
+            try:
+                exists, current = read(item["src"])
+            except (OpsxError, OSError) as e:
+                raise OpsxError(f"回滚预览读取当前文件失败 {item['src']}: {e}") from e
+            plan["files"].append({
+                "src": item["src"], "exists": exists, "mode": item.get("mode"),
+                "diff": _diff_text(current, archived, item["src"], snapshot_id),
+            })
+        else:
+            out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
+            plan["commands"].append({"name": item.get("name") or item["cmd"],
+                                     "output": out[:DIFF_LIMIT]})
+    return plan
+
+
+def format_rollback_plan(plan: dict) -> str:
+    where = f"目标 {plan['target']}" if plan.get("target") else "本机"
+    if plan.get("target") and plan.get("host"):
+        where += f"（{plan['host']}）"
+    lines = [f"回滚计划：快照 {plan['snapshot_id']}（{where}）"]
+    if plan["files"]:
+        lines.append(f"将恢复 {len(plan['files'])} 个文件（执行前自动保存回滚前副本）：")
+        for i, f in enumerate(plan["files"], 1):
+            if not f["exists"]:
+                state = "当前不存在，回滚将新建"
+            elif f["mode"]:
+                state = f"当前存在，权限 {f['mode']:04o}"
+            else:
+                state = "当前存在"
+            lines.append(f"{i}. {f['src']}（{state}）")
+            lines.extend("   " + line for line in f["diff"].splitlines())
+    if plan["commands"]:
+        lines.append("捕获状态（只读展示）：")
+        lines += [f"[{c['name']}]\n{c['output']}" for c in plan["commands"]]
+    return "\n".join(lines)
+
+
+def _rollback_backup(original_sid: str, target: str | None, file_items: list,
+                     read_state, mode_of=None, meta_extra: dict | None = None) -> str | None:
+    """回滚前副本：把即将被覆盖的当前内容另存为快照，后续修改不会静默丢失。
+
+    没有任何文件被覆盖（当前都不存在）时返回 None，不创建空快照。
+    """
+    sid, d = begin_snapshot()
+    items: list = []
+    try:
+        for item in file_items:
+            exists, data = read_state(item["src"])
+            if not exists:
+                continue  # 当前不存在：回滚是新建，没有可覆盖的内容
+            dest = d / "files" / str(item["src"]).lstrip("/")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            arch = {"type": "file", "src": item["src"],
+                    "dest": str(dest.relative_to(d))}
+            if mode_of is not None:
+                arch["mode"] = mode_of(item["src"])
+            items.append(arch)
+        if not items:
+            shutil.rmtree(d, ignore_errors=True)
+            return None
+        _write_meta(d, sid, items, rollback_of=original_sid, target=target,
+                    **(meta_extra or {}))
+    except OSError as e:
+        shutil.rmtree(d, ignore_errors=True)
+        raise OpsxError(f"回滚前副本保存失败: {e}") from e
+    except BaseException:  # 含 Ctrl-C：清掉半成品目录后原样抛出
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    audit("rollback-backup", id=sid, rollback_of=original_sid, target=target,
+          files=len(items))
+    return sid
+
+
+def rollback(snapshot_id: str, confirm: bool = False) -> str:
+    """恢复本机快照。confirm=False 时只做只读的事（拒绝文件写入，返回捕获状态除外）。
+
+    回滚本身是写操作：入口（CLI/agent/MCP）展示 rollback_plan 并由人确认后再传 confirm。
+    """
     d, meta = load_snapshot(snapshot_id)
     if meta.get("target"):
         raise OpsxError("远程快照须通过 remote.rollback 恢复")
+    file_items = [item for item in meta["items"] if item["type"] == "file"]
+    if file_items and not confirm:
+        raise OpsxError("回滚会覆盖当前文件，属于写操作：请先预览并由人确认"
+                        "（CLI: opsx rollback <id>；agent: ops_rollback 会展示差异并确认）")
+    backup_sid = None
     report = []
-    for item in meta["items"]:
-        if item["type"] == "file":
-            staged = None
-            try:
-                with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent, delete=False) as f:
-                    staged = Path(f.name)
-                shutil.copy2(d / item["dest"], staged)
-                os.chmod(staged, item["mode"])
-                os.replace(staged, item["src"])
-            except OSError as e:
-                raise OpsxError(f"文件回滚失败 {item['src']}: {e}") from e
-            finally:
-                if staged is not None:
-                    staged.unlink(missing_ok=True)
-            report.append(f"已恢复文件: {item['src']}")
-        else:
-            out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
-            report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
-    audit("rollback", snapshot_id=snapshot_id)
+    try:
+        if file_items:
+            backup_sid = _rollback_backup(
+                snapshot_id, None, file_items, _local_read_state,
+                lambda src: stat.S_IMODE(Path(src).stat().st_mode))
+        for item in meta["items"]:
+            if item["type"] == "file":
+                staged = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent,
+                                                     delete=False) as f:
+                        staged = Path(f.name)
+                    shutil.copy2(d / item["dest"], staged)
+                    os.chmod(staged, item["mode"])
+                    os.replace(staged, item["src"])
+                except OSError as e:
+                    raise OpsxError(f"文件回滚失败 {item['src']}: {e}") from e
+                finally:
+                    if staged is not None:
+                        staged.unlink(missing_ok=True)
+                report.append(f"已恢复文件: {item['src']}")
+            else:
+                out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
+                report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
+    except OpsxError as e:
+        audit("rollback-failed", snapshot_id=snapshot_id,
+              backup_snapshot_id=backup_sid, error=str(e))
+        if backup_sid:
+            raise OpsxError(f"{e}（回滚前副本: {backup_sid}）") from e
+        raise
+    if backup_sid:
+        report.append(f"回滚前副本: {backup_sid}"
+                      f"（如需撤销本次回滚: opsx rollback {backup_sid}）")
+    audit("rollback", snapshot_id=snapshot_id, backup_snapshot_id=backup_sid,
+          files=[item["src"] for item in file_items])
     return "\n".join(report)
 
 
@@ -520,13 +945,13 @@ def exec_change(
     snapshot_cmds = snapshot_cmds or []
     code, msg = check(cmd)
     if code != 0:
-        print(msg, file=sys.stderr)
+        print(redact(msg), file=sys.stderr)
         return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = check(c)
         if code != 0:
             audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
-            output = f"[opsx] 快照命令未通过守门，已中止执行: {c}"
+            output = redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
     sid = None
@@ -541,13 +966,13 @@ def exec_change(
             _write_meta(d, sid, items)
         except (OpsxError, subprocess.SubprocessError, OSError) as e:
             shutil.rmtree(d, ignore_errors=True)
-            output = f"[opsx] 快照失败，已中止执行: {e}"
+            output = redact(f"[opsx] 快照失败，已中止执行: {e}")
             print(output, file=sys.stderr)
             audit("exec-abort", cmd=cmd, reason=str(e))
             return 3, None, output
     try:
         r = run_shell(cmd, timeout=timeout)
-        output = r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
+        output = redact(r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else ""))
         exit_code = r.returncode
     except subprocess.TimeoutExpired:
         output = f"[opsx] 超时：命令超过 {timeout}s 未结束，已终止"

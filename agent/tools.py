@@ -79,7 +79,11 @@ def _prune_outputs(keep: int = SPILL_KEEP) -> None:
 
 
 def _cap(text: str, label: str) -> str:
-    """超长输出落盘（日志可能含密钥 → 0600），返回预览 + 路径供 read 分段读取。"""
+    """超长输出落盘（日志可能含密钥 → 0600），返回预览 + 路径供 read 分段读取。
+
+    落盘与回显前统一脱敏：模型、会话、审计、落盘文件都不保存明文密钥。
+    """
+    text = core.redact(text)
     if len(text) <= OUTPUT_LIMIT:
         return text
     try:
@@ -139,6 +143,21 @@ def _skill(args: dict, ctx: ToolContext) -> str:
 
 def _read(args: dict, ctx: ToolContext) -> str:
     path = Path(args["path"]).expanduser()
+    try:
+        real = path.resolve()
+    except OSError:
+        real = path
+    if (core.sensitive_path(str(path)) or core.sensitive_dir(str(path))
+            or core.sensitive_path(str(real))):
+        return ("[opsx 拒绝] 该文件是私钥/凭据/敏感配置，不读取到模型上下文。"
+                "确认存在与权限请用 bash 的 ls -l。")
+    try:
+        snapshots = (core.STATE_DIR / "snapshots").resolve()
+        if real == snapshots or snapshots in real.parents:
+            return ("[opsx 拒绝] 快照保存原始内容用于恢复，不读取到模型上下文；"
+                    "恢复请用 ops_rollback（展示差异并确认）。")
+    except OSError:
+        pass
     if not path.is_file():
         return f"[错误] 文件不存在: {path}"
     offset = max(1, args.get("offset", 1))
@@ -191,9 +210,11 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
         if target:  # 只允许给注册过的目标建戳
             remote.get_target(target)
         level, _ = core.classify(args["command"])
-        where = f"目标 {target}" if target else "本机"
+        # 审批绑定实际执行环境（主机/cwd/k8s context），批准后环境变化即失效。
+        env = core.resolve_env(args["command"], target)
         warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
-        answer = ctx.ask_user(f"批准此变更？\n目标：{where}\n风险级别：{level}{warning}\n"
+        answer = ctx.ask_user(f"批准此变更？\n执行环境：{core.format_env(env)}\n"
+                              f"风险级别：{level}{warning}\n"
                               f"完整命令：\n{args['command']}\n"
                               "输入“确认执行”或 yes 批准，其他回答均拒绝。")
         if not isinstance(answer, str) or answer.strip().casefold() not in {"确认执行", "确认", "yes", "y"}:
@@ -201,13 +222,12 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
             core.audit("approve-deny", cmd=args["command"], level=level, target=target)
             return "[opsx 拒绝] 用户未明确批准此命令，不创建审批戳。"
         path = core.approve(args["command"], ttl_seconds=args.get("ttl_seconds", 900),
-                            force=args.get("force", False), target=target)
+                            force=args.get("force", False), target=target, env=env)
     except (core.OpsxError, remote.RemoteError) as e:
         return f"[opsx 错误] {e}"
     stamp = json.loads(path.read_text(encoding="utf-8"))
-    where = f"目标 {target}" if target else "本机"
-    return (f"审批戳已创建（级别 {stamp['level']}，TTL {stamp['ttl']}s，{where}），"
-            "现在可重新执行该命令。")
+    return (f"审批戳已创建（级别 {stamp['level']}，TTL {stamp['ttl']}s，"
+            f"{core.format_env(env)}）。现在可重新执行该命令；环境变化后旧戳失效。")
 
 
 def _ops_revoke(args: dict, ctx: ToolContext) -> str:
@@ -242,8 +262,20 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
 
 
 def _ops_rollback(args: dict, ctx: ToolContext) -> str:
+    sid = args["snapshot_id"]
     try:
-        return remote.rollback(args["snapshot_id"])  # 远程快照推回，本机走 core
+        plan = remote.rollback_plan(sid)
+        if plan["files"]:
+            preview = core.format_rollback_plan(plan)
+            if ctx.ask_user is None:
+                return ("[opsx 拒绝] 回滚是写操作，当前形态没有可确认的用户通道，未改动任何文件。\n"
+                        + preview)
+            answer = ctx.ask_user(preview + "\n\n输入“确认回滚”或 yes 执行，其他回答均拒绝。")
+            if not isinstance(answer, str) or answer.strip().casefold() not in {
+                    "确认回滚", "确认", "yes", "y"}:
+                core.audit("rollback-deny", snapshot_id=sid)
+                return "[opsx 拒绝] 用户未批准回滚，文件未改动。"
+        return remote.rollback(sid, confirm=True)  # 远程快照推回，本机走 core
     except (core.OpsxError, remote.RemoteError) as e:
         return f"[opsx 错误] {e}"
 
@@ -389,7 +421,8 @@ REGISTRY: dict[str, dict] = {
     },
     "read": {
         "schema": _schema("read",
-                          f"读取本地文本文件（默认前 {READ_LIMIT} 行）；大文件用 offset/limit 分段读取。",
+                          f"读取本地文本文件（默认前 {READ_LIMIT} 行）；大文件用 offset/limit 分段读取。"
+                          "私钥/凭据/敏感配置与快照原件不读取到模型上下文。",
                           {"path": {"type": "string"},
                            "offset": {"type": "integer", "description": "起始行号（1-based），默认 1"},
                            "limit": {"type": "integer", "description": f"最多读取行数，默认 {READ_LIMIT}"}},
@@ -471,7 +504,8 @@ REGISTRY: dict[str, dict] = {
     "ops_approve": {
         "schema": _schema("ops_approve",
                           "提交变更单后调用：工具向用户确认此命令，明确批准后才创建审批戳（R3 需 force=true）。"
-                          "带 target 时戳只对该目标有效。",
+                          "戳绑定实际主机、工作目录、k8s context（kubectl 变更须在命令中写 --context）；"
+                          "带 target 时只对该目标有效。环境变化后旧戳失效。",
                           {"command": {"type": "string"},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
                            "ttl_seconds": {"type": "integer", "default": 900},
@@ -500,7 +534,9 @@ REGISTRY: dict[str, dict] = {
         "handler": _ops_exec, "read_only": False,
     },
     "ops_rollback": {
-        "schema": _schema("ops_rollback", "按 snapshot_id 回滚（本机快照恢复文件，远程快照推回目标机）。",
+        "schema": _schema("ops_rollback",
+                          "按 snapshot_id 回滚：先展示实际目标、影响文件与差异并请求用户确认，"
+                          "执行前自动保存回滚前副本（本机快照恢复文件，远程快照推回目标机）。",
                           {"snapshot_id": {"type": "string"}}, ["snapshot_id"]),
         "handler": _ops_rollback, "read_only": False,
     },
@@ -519,6 +555,11 @@ def tool_schemas(ctx: ToolContext | None = None) -> list[dict]:
 
 
 def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
+    """工具出口统一脱敏：模型收到的工具结果与会话记录都不含明文密钥。"""
+    return core.redact(_dispatch(name, args, ctx))
+
+
+def _dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     if ctx.allowed is not None and name not in ctx.allowed:
         return (f"[opsx 拒绝] 当前为只读上下文（子代理 / 定时任务），不能使用 {name}；"
                 "需要变更请把建议写进结论，由人走变更单流程。")

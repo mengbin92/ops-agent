@@ -38,6 +38,8 @@ def add(text: str) -> str:
         raise MemoryError("记忆内容不能为空")
     if len(text) > ENTRY_LIMIT:
         raise MemoryError(f"单条记忆太长（上限 {ENTRY_LIMIT} 字符）：只记结论，不贴输出")
+    if core.redact(text) != text:
+        raise MemoryError("记忆内容包含密钥/凭据，已拒绝写入：只记结论，不记秘密")
     p = path()
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     entry = f"- [{time.strftime('%Y-%m-%d')}] " + "\n  ".join(text.splitlines())

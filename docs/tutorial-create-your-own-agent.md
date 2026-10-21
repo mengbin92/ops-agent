@@ -165,10 +165,12 @@ return "R2"                  # 未知命令安全方向默认
 
 ### 5.2 审批戳（`approve` / `check_stamp` / `check`）
 
-审批戳 = 归一化命令的 sha256 + TTL + 级别，存 `~/.ops-agent/approvals/<hash>.json`：
+审批戳 = 归一化命令的 sha256 + TTL + 级别 + 实际执行环境（主机/目录/`KUBECONFIG`/k8s context），
+存 `~/.ops-agent/approvals/<hash>.json`；环境变化后旧戳失效：
 
 - R0 拒绝建戳（只读不需要授权，建了反而是漏洞）。
 - R3 必须 `force=True`。
+- kubectl 变更须在命令里显式写 `--context`。
 - `check` 每次调用都写审计，无论放行还是拒绝。
 
 ### 5.3 审计（`audit`）
@@ -177,7 +179,7 @@ JSONL 追加写，单文件超 10MB 轮转为 `audit.jsonl.1`。字段带 UTC �
 
 ### 5.4 快照（`snapshot_file` / `snapshot_cmd` / `rollback`）
 
-每次快照一个目录：`~/.ops-agent/snapshots/<id>/`，内含 `meta.json` + 文件副本（保留权限位）+ 状态命令输出。`rollback` 按 meta 逐项恢复，默认保留最近 200 个快照（`prune_snapshots`）。
+每次快照一个目录：`~/.ops-agent/snapshots/<id>/`，内含 `meta.json` + 文件副本（保留权限位）+ 状态命令输出。`rollback_plan` 生成目标/文件/差异预览，`rollback(..., confirm=True)` 才按 meta 逐项恢复，并先把当前内容存成「回滚前副本」；默认保留最近 200 个快照（`prune_snapshots`）。
 
 ### 5.5 原子执行（`exec_change`）
 

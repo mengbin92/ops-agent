@@ -81,6 +81,7 @@ class Session:
                 raise ValueError("会话文件为空")
 
     def append(self, message: dict) -> None:
+        message = core.redact_obj(message)  # 会话落盘与后续模型请求都不带明文密钥
         record = json.dumps(message, ensure_ascii=False) + "\n"
         core.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(core.STATE_DIR, 0o700)

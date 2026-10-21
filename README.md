@@ -78,7 +78,8 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 # 查看审计 / 快照 / 审批戳
 ./opsx audit --tail 20
 ./opsx list
-./opsx rollback <snapshot_id>
+./opsx rollback <snapshot_id>          # 先展示目标/影响文件/差异，确认后才改写
+./opsx rollback <snapshot_id> --yes    # 已核对计划（非交互环境必须显式加）
 ```
 
 ## 远程执行（SSH 目标）
@@ -98,7 +99,7 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 ./opsx targets                                            # 列出已注册目标
 ./opsx approve --target web1 'systemctl restart nginx'    # 戳按「目标+命令」绑定
 ./opsx exec --target web1 --snapshot-file /etc/nginx/nginx.conf 'systemctl restart nginx'
-./opsx rollback <snapshot_id>                             # 远程快照自动推回目标机
+./opsx rollback <snapshot_id>                             # 预览+确认后远程快照推回目标机
 ```
 
 - agent 内：只读排查用 `bash` 带 `target`（仍要求 R0）；写操作 `ops_approve` 与 `ops_exec`
@@ -183,6 +184,51 @@ agent 里先 `workflow`（不带 name）列目录，再 `workflow {"name": "dail
 过时条目直接编辑该文件删除即可；记忆与现状冲突时 agent 以现状为准并记录更正。
 定时巡检等只读形态不可用 `remember`（无人值守不积累噪声），但能读到已有记忆。
 
+## 安全边界（W1）
+
+**秘密输出保护**：命令/工具输出在进入模型、写入会话、写入审计、落盘长输出之前统一脱敏
+（`core.redact`：PEM 私钥、`password=/token=/api_key=` 等键值、`Authorization: Bearer …`、
+常见 token 形状）。快照保留原始内容供恢复，不脱敏；目录 `0700`，`read` 工具不允许把快照原件
+读进模型上下文。工具结果（agent / CLI / MCP）、会话落盘、审计、长输出落盘和审批列表展示
+都走同一套脱敏；用户消息与 `remember` 写入同样处理（含密钥的记忆条目直接拒绝）。
+`selftest` 用哨兵密钥验证各出口都不出现明文。
+
+**敏感文件读取限制**：`read` 直接拒绝私钥（`id_rsa`/`id_ed25519`/`*.key`/`*.p12` 等）、
+`.env`（`.example`/`.sample`/`.template` 除外）、`.netrc`、`.kube/config`、
+`/etc/kubernetes/*.conf`、`/etc/ssh/ssh_host_*_key`、`/etc/ssl/private/*.pem`、
+`.aws/credentials`、`.docker/config.json`、`.config/gcloud/`、`/etc/shadow`
+与 `.ssh`/`.aws`/`.kube`/`.gnupg` 目录；命令入口（`opsx check`、hook、bash 工具、`opsx exec`）
+对引用这些文件或读取敏感目录内容的命令一律拒绝（`cat ~/.ssh/id_rsa`、经符号链接指向的私钥、
+`ssh host "cat id_rsa"` 的内层命令、远程命令里的裸 `id_rsa` 都覆盖）；`kubectl get secret
+-o yaml/json/jsonpath`（会把 Secret 值输出成明文）同样拒绝，`-o name` 与默认表格、`describe`
+不受影响。`ls -l ~/.ssh`、`grep id_rsa app.log`、`find -name id_rsa`、
+`KUBECONFIG=~/.kube/config kubectl get pods` 不受影响。
+边界：正则识别不保证覆盖所有秘密格式（加密内容、二进制、自定义字段会漏报），
+偏保守地拒绝，可能挡住合法的密钥操作（改密钥请由人直接执行）。
+
+**审批绑定实际执行环境**：审批戳除命令与目标名外，还绑定实际主机/用户/端口、
+`identity`/`options`、工作目录、`KUBECONFIG` 以及 kubectl 的 `--context`/`--namespace`。
+批准后换个目录、目标注册表里改了 host 或 SSH 选项、切了 kubeconfig 或 context，旧授权立即
+失效，需要重新批准（`opsx list` 不再把旧格式戳显示成有效）。kubectl 变更必须在命令里显式写
+`--context`（否则拒绝发戳，全路径、`sh -c`、注释里的假 `--context` 都不算），同一命令混用
+不同 context 直接拒绝，不会用当前默认 context 悄悄执行；只读的 `kubectl get` 段不强制。
+
+**回滚确认与回滚前副本**：回滚是写操作。入口先展示实际目标（含远程主机名）、影响文件、
+当前内容与快照的差异，由人确认后才改写：CLI 交互确认（非交互需 `--yes`）、agent
+`ops_rollback` 再问一次、MCP `ops_rollback` 返回预览且只有 `confirm=true` 才执行。执行前
+自动把当前内容另存为「回滚前副本」快照并在报告里给出 id，后续修改不会被静默覆盖，且可再
+回滚副本撤销（远程快照记录采集时的主机/用户/端口/identity/options，`targets.json` 改指向
+后拒绝回滚，避免写到另一台机器）。没有旧内容可备份（文件原本不存在）时不创建空副本、也不
+承诺可撤销。用户拒绝时文件不发生任何改动；多文件回滚中途失败会在错误里带上副本 id。
+边界：本机回滚原子替换会改变 inode、符号链接路径会变成普通文件；快照只能恢复文件，
+不能替代数据库/卷/部署回退。
+
+**CI**：`.github/workflows/selftest.yml` 在 push/PR 上跑 `python -m compileall` 与
+`./opsx selftest`（Ubuntu/macOS × Python 3.9/3.12）。
+
+迁移提示：W1 之前的审批戳不含执行环境信息，按安全方向一律失效，需要重新授权；
+旧会话/审计里已存在的明文密钥不会自动回溯清理。
+
 ## 防线说明
 
 两层防线：① Agent 流程纪律（变更单 → AskUserQuestion → opsx exec）；
@@ -237,6 +283,7 @@ hook 允许直接调用本仓库的 `opsx`（或 Python + 本仓库脚本），�
 ```
 
 确认流与 CLI 形态一致：变更单 → `ops_approve`（弹窗=授权，建戳）→ `ops_exec`（再弹窗=双保险，校验戳）→ 报告 snapshot_id 与回滚。R3 仍需 `force=true` + 会话内显式确认。
+`ops_rollback` 先返回目标/文件/差异预览，核对后带 `confirm=true` 重试才真正回滚（执行前自动保存回滚前副本）。
 
 ## 演进
 

@@ -27,13 +27,19 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
 2. 用 AskUserQuestion 请用户确认。用户拒绝则终止并解释。
 3. 用户批准后，Agent 先创建审批戳：
    `opsx approve '<命令>'`（远程：`opsx approve --target <目标名> '<命令>'`）
+   审批绑定实际主机、工作目录、`KUBECONFIG` 与 kubectl 的 `--context`：批准后换了目录、
+   目标 host/SSH 选项、kubeconfig 或 context 需要重新批准。kubectl 变更必须在命令里写
+   `--context`（全路径/`sh -c`/注释都不算），同一命令不能混用不同 context。
+   私钥/凭据文件不读取（`read` 与命令入口会拒绝）；命令输出会被自动脱敏。
 4. 再原子执行（快照参数随命令一次传入，保证原子性）：
    `opsx exec '<命令>' --snapshot-file <路径> --snapshot-cmd 'name::<抓取当前状态的命令>'`
    远程：`opsx exec --target <目标名> '<命令>' --snapshot-file <远程路径>`
    ——目标必须已在 `~/.ops-agent/targets.json` 注册（`opsx targets` 可查）；审批戳按「目标+命令」
    绑定，本机戳与别的目标的戳都不能复用。
 5. 执行后报告：结果、snapshot_id、`opsx rollback <snapshot_id>` 回滚命令。
-   服务/部署类回滚：先 `opsx rollback <id>` 取回执行前状态，再按回滚计划执行逆操作。
+   回滚是写操作：`opsx rollback <id>` 先展示目标/影响文件/差异并要求确认（非交互加 `--yes`），
+   执行前自动保存「回滚前副本」；用户拒绝时文件不变。服务/部署类回滚：先回滚文件，
+   再按回滚计划执行逆操作。
 6. 用户建戳后取消变更：`opsx revoke '<命令>'`（远程加 `--target <目标名>`）立即作废审批戳，
    不必等 TTL 过期。
 
