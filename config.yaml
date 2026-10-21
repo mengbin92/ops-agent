@@ -24,6 +24,10 @@ readonly_patterns:
   - ^git[ \t]+tag[ \t]+(-l|--list)(?=[ \t]|$)
   - ^git[ \t]+config[ \t]+--get(?=[ \t]|$)
   - ^vm_stat(?=[ \t]|$)
+  # 只读取值形态：sysctl -n 读取、-a 列举。写形态（-w/NAME=VALUE）不匹配，落入风险规则。
+  - ^nproc[ \t]*$
+  - ^sysctl[ \t]+-n[ \t]+[A-Za-z0-9_.]+(?:[ \t]+[A-Za-z0-9_.]+)*[ \t]*$
+  - ^sysctl[ \t]+(-a|--all)[ \t]*$
   - ^(brew[ \t]+(list|info|outdated)|launchctl[ \t]+list)(?=[ \t]|$)
   - ^brew[ \t]+services(?:[ \t]+(list|info)(?=[ \t]|$)|[ \t]*$)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 import remote  # noqa: E402
+from . import checks  # noqa: E402
 from . import goal as goal_mod  # noqa: E402
 from . import memory as memory_mod  # noqa: E402
 from . import schedule as schedule_mod  # noqa: E402
@@ -281,11 +283,19 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
 
 
 SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list"})
-# 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见
-SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent", "ops_list"})
+# 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见。
+# inspect 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
+SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent",
+                             "inspect", "ops_list"})
 SUBAGENT_MAX_TASKS = 4
 SUBAGENT_MAX_TURNS = 8
 WORKFLOW_PREV_LIMIT = 6000
+CHECKS_PROMPT_LIMIT = 12000    # 注入 {checks} 的规则报告字符数
+STEP_INDEX_CLIP = 400          # {steps} 里每步摘要的字符数
+MAX_TURNS_MARK = "[已达最大轮次保护"
+
+# 单次替换：替入内容里再出现 {prev} 之类的文本不会被二次替换成别的内容。
+_PLACEHOLDER = re.compile(r"\{(prev|checks|steps)\}")
 
 
 def _run_isolated(task: str, ctx: ToolContext, system: str | None = None) -> str:
@@ -326,6 +336,89 @@ def _subagent(args: dict, ctx: ToolContext) -> str:
     return _cap(report, "subagent")
 
 
+def _step_reason(result: str) -> str:
+    """步骤没真正完成的原因；空串表示完成。
+
+    只认异常会漏判：模型空回复、以及 run_turn 到 max_turns 后附上的
+    "[已达最大轮次保护，终止]" 都不是完整解读，不能算成功。
+    """
+    if not (result or "").strip():
+        return "空输出"
+    if result.startswith("[失败]"):
+        return "异常"
+    if MAX_TURNS_MARK in result:
+        return "超轮次保护"
+    return ""
+
+
+def _fill_prompt(template: str, values: dict) -> str:
+    return _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def _steps_index(index: list) -> str:
+    """前序步骤索引：名称、状态与摘要——汇总时显式引用所有步骤，而不是只看最后一步。"""
+    if not index:
+        return "（无）"
+    lines = []
+    for entry in index:
+        summary = re.sub(r"\s+", " ", entry["text"]).strip()[:STEP_INDEX_CLIP]
+        lines.append(f"- 步骤 {entry['n']}「{entry['name']}」："
+                     f"{'完成' if entry['ok'] else '失败'}；{summary or '（无输出）'}")
+    return "\n".join(lines)
+
+
+def _workflow_footer(report: dict | None, index: list, failed: int,
+                     checks_note: str) -> str:
+    """汇总完整性由程序生成：规则结论、全部异常、每步状态都不经模型改写。"""
+    lines = ["## 汇总完整性（程序生成，未经模型改写）"]
+    if report is not None:
+        s = report["summary"]
+        lines.append(f"- 规则检查：{s['checks']} 项，异常 {s['critical']} / 警告 {s['warn']} / "
+                     f"未知 {s['unknown']} / 错误 {s['error']}；结论 **{report['verdict']}**；"
+                     f"完整性 {'完整' if report['complete'] else '不完整'}")
+        anomalies = report["anomalies"]
+        if anomalies:
+            lines.append(f"- 异常与未采集项（规则检查，共 {len(anomalies)} 项，全部列出）：")
+            lines += [f"  {i}. {item['line']}" for i, item in enumerate(anomalies, 1)]
+        else:
+            lines.append("- 异常与未采集项（规则检查）：无")
+    elif checks_note:
+        lines.append(f"- 规则检查：未执行（{checks_note}）")
+        lines.append("- 结论：没有规则结论，本次不得汇总为正常")
+    else:
+        lines.append("- 规则检查：本 workflow 未配置 checks 块（只有模型解读，无确定性结论）")
+    ok_steps = sum(1 for entry in index if entry["ok"])
+    if index:
+        lines.append("- 步骤状态：" + "｜".join(
+            f"{entry['n']}「{entry['name']}」"
+            + ("完成" if entry["ok"] else f"失败（{entry['reason']}）")
+            for entry in index))
+    lines.append(f"- LLM 解读：{ok_steps}/{len(index)} 步成功"
+                 + ("；**解读不完整，需人工核对**" if failed else ""))
+    if report is not None and report["verdict"] != "正常":
+        lines.append("- 结论：本次巡检存在异常、未采集项或未检查分组，不得汇总为正常")
+    elif report is not None and failed:
+        lines.append("- 结论：规则检查通过；模型解读不完整，不影响规则结论")
+    return "\n".join(lines)
+
+
+def _inspect(args: dict, ctx: ToolContext) -> str:
+    """确定性检查工具：规则结论不依赖模型，报告全文落盘。"""
+    try:
+        report = checks.run_checks(targets=args.get("targets") or "all",
+                                   groups=args.get("groups") or None)
+    except checks.CheckError as e:
+        return f"[检查错误] {e}"
+    text = checks.format_report(report)
+    path = checks.save_report("inspect", text)
+    if len(text) > OUTPUT_LIMIT:
+        tail = (f"\n...[报告共 {len(text)} 字符，已截断；完整内容: {path}"
+                "（用 read 的 offset/limit 分段读取）]" if path else
+                f"\n...[报告共 {len(text)} 字符，已截断；报告未能落盘]")
+        return text[:OUTPUT_LIMIT] + tail
+    return f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
+
+
 def _workflow(args: dict, ctx: ToolContext) -> str:
     name = (args.get("name") or "").strip()
     if not name:
@@ -340,17 +433,61 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
         wf = workflow.load(name)
     except workflow.WorkflowError as e:
         return f"[错误] {e}"
-    prev, sections = "", []
+
+    sections: list[str] = []
+    report, checks_text, checks_note = None, "", ""
+    if wf.get("checks"):
+        # 固定检查先跑：不调用模型，API 完全不可用时报告仍然成立。
+        try:
+            report = checks.run_checks(targets=wf["checks"]["targets"],
+                                       groups=wf["checks"]["groups"])
+            checks_text = checks.format_report(report)
+        except checks.CheckError as e:
+            checks_note = str(e)
+            checks_text = ""
+        sections.append("## 规则检查（确定性探针，模型未参与）\n"
+                        + (checks_text or f"[规则检查未执行] {checks_note}"))
+
+    if checks_text:
+        checks_prompt = checks_text[:CHECKS_PROMPT_LIMIT]
+    elif checks_note:
+        checks_prompt = (f"（规则检查未能执行：{checks_note}）"
+                         "没有规则结论，本次不得给出「正常」结论。")
+    else:
+        checks_prompt = "（本 workflow 未配置规则检查，没有规则结论，不得据此宣称正常）"
+
+    prev, index, failed = "", [], 0
     for i, step in enumerate(wf["steps"], 1):
-        prompt = step["prompt"].replace(
-            "{prev}", prev[:WORKFLOW_PREV_LIMIT] if prev else "（无）")
+        prompt = _fill_prompt(step["prompt"], {
+            "prev": prev[:WORKFLOW_PREV_LIMIT] if prev else "（无）",
+            "checks": checks_prompt,
+            "steps": _steps_index(index),
+        })
         try:
             result = _run_isolated(prompt, ctx)
-        except Exception as e:  # noqa: BLE001 —— 单步失败仍保留前面结果
+        except Exception as e:  # noqa: BLE001 —— 单步失败仍保留前述结果（API 不可用即此路径）
             result = f"[失败] {e}"
+        reason = _step_reason(result)
+        if reason:
+            failed += 1
+        # 步骤原文完整保留：报告文件是证据，不能在这里先截断
         sections.append(f"## 步骤 {i}: {step['name']}\n{result}")
+        index.append({"n": i, "name": step["name"], "ok": not reason,
+                      "reason": reason, "text": result})
         prev = result
-    return _cap("\n\n".join(sections), f"workflow-{name}")
+
+    footer = _workflow_footer(report, index, failed, checks_note)
+    body = "\n\n".join(sections)
+    full = f"{body}\n\n{footer}"
+    path = checks.save_report(f"workflow-{name}", full)
+    pointer = f"[全量报告] {path}" if path else "[报告未能落盘，以上为可见内容]"
+    if len(full) <= OUTPUT_LIMIT:
+        return f"{full}\n\n{pointer}"
+    # 截断时必须保住尾部汇总：它是"不得谎报正常"的最后一道程序约束，
+    # 不能被步骤正文挤出可见范围。
+    keep = max(1000, OUTPUT_LIMIT - len(footer) - 500)
+    return (body[:keep] + f"\n...[中段已截断，原文 {len(body)} 字符]...\n\n"
+            + footer + f"\n\n{pointer}")
 
 
 def _schedule(args: dict, ctx: ToolContext) -> str:
@@ -442,11 +579,29 @@ REGISTRY: dict[str, dict] = {
     "workflow": {
         "schema": _schema("workflow",
                           "巡检工作流：不带 name 列目录，带 name 按 JSON 定义的步骤顺序执行。"
-                          "每步是只读子代理，后一步可用 {prev} 引用前一步结论。",
+                          "workflow 若配置了 checks 块，会先跑确定性规则检查（连通性/资源/服务，"
+                          "不依赖模型），再逐步由只读子代理解读；"
+                          "占位符 {checks} 规则报告、{prev} 上一步结论、{steps} 前序步骤索引。"
+                          "汇总完整性由程序生成，全部异常都会列出。",
                           {"name": {"type": "string",
                                     "description": "workflow 名（workflows/*.json，可不带 .json）；省略=列目录"}},
                           []),
         "handler": _workflow, "read_only": True,
+    },
+    "inspect": {
+        "schema": _schema("inspect",
+                          "确定性巡检：对已配置目标跑连通性/资源（磁盘·内存·负载）/服务三组固定探针，"
+                          "返回结构化结果（观测值、阈值、采样时间、证据）。"
+                          "规则结论由代码判定，不依赖模型；不可达或解析失败标 unknown/error，"
+                          "不会汇总成正常。需要解释异常时你自己解读，或看返回的报告文件。",
+                          {"targets": {"type": "string",
+                                       "description": "\"all\"（本机+全部已注册目标）或单个目标名；默认 all"},
+                           "groups": {"type": "array",
+                                      "items": {"type": "string",
+                                                "enum": ["connectivity", "resources", "services"]},
+                                      "description": "只跑指定分组；省略=三组全跑"}},
+                          []),
+        "handler": _inspect, "read_only": True,
     },
     "ask_user": {
         "schema": _schema("ask_user", "向用户提问并等待回答。写操作审批、歧义澄清时使用。",

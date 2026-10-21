@@ -6,6 +6,7 @@
   opsagent chat                 同上
   opsagent -p "查看 nginx 状态"  单发非交互（可进脚本/CI）
   opsagent rpc                  stdio JSON-RPC 长驻进程
+  opsagent inspect ...          确定性巡检（连通性/资源/服务，规则检查不依赖 LLM）
   opsagent schedule ...         定时巡检：list / add / remove / run（--once 适合 cron）
 """
 from __future__ import annotations
@@ -42,8 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["schedule"]:  # 子命令有自己的参数解析，先分流
         from agent import schedule
         return schedule.cli(argv[1:])
+    if argv[:1] == ["inspect"]:
+        from agent import checks
+        return checks.cli(argv[1:])
     p = argparse.ArgumentParser(prog="opsagent", description="ops-agent 独立运维智能体",
-                                epilog="定时巡检：opsagent schedule [list|add|remove|run]")
+                                epilog="巡检：opsagent inspect [--target all]；"
+                                       "定时：opsagent schedule [list|add|remove|run]")
     p.add_argument("--model", help="覆盖默认模型（或设 OPSAGENT_MODEL）")
     p.add_argument("-p", "--print", dest="oneshot", metavar="PROMPT", help="单发非交互模式")
     p.add_argument("mode", nargs="?", default="chat", choices=["chat", "rpc"], help="运行形态")

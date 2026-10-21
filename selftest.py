@@ -5,8 +5,10 @@ import tempfile
 os.environ["OPSX_STATE_DIR"] = tempfile.mkdtemp(prefix="opsx-test-")
 
 from pathlib import Path  # noqa: E402
+import io  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
+import sys  # noqa: E402
 
 import core  # noqa: E402
 import importlib
@@ -2185,7 +2187,10 @@ def test_workflow_run_and_validation():
     from agent import loop, tools as agent_tools, workflow
     ctx = agent_tools.ToolContext()
     assert "daily-inspection" in agent_tools.dispatch("workflow", {}, ctx)
-    assert len(workflow.load("daily-inspection")["steps"]) == 4
+    daily = workflow.load("daily-inspection")
+    assert len(daily["steps"]) == 3
+    assert daily["checks"] == {"targets": "all",
+                               "groups": ["connectivity", "resources", "services"]}
     assert workflow.load("daily-inspection.json")["name"] == "daily-inspection"
     user_dir = Path(core.STATE_DIR, "workflows")
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -2993,6 +2998,657 @@ def test_ci_workflow_runs_selftest():
     assert "./opsx selftest" in workflow.read_text(encoding="utf-8")
 
 
+def _with_targets(payload) -> callable:
+    """临时替换 targets.json，返回还原函数（自检不碰用户真实状态目录）。"""
+    path = Path(core.STATE_DIR).resolve()
+    # 用 raise 而不是 assert：python -O 会剥离 assert，保护就失效了。
+    if (not path.name.startswith("opsx-test-")
+            or path.parent != Path(tempfile.gettempdir()).resolve()):
+        raise RuntimeError(f"自检状态目录不是临时目录，拒绝改写 targets.json: {path}")
+    p = Path(core.STATE_DIR, "targets.json")
+    old = p.read_text(encoding="utf-8") if p.exists() else None
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def restore():
+        if old is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_text(old, encoding="utf-8")
+    return restore
+
+
+def test_checks_parsers():
+    """探针解析：df/meminfo/vm_stat/loadavg/systemd/docker 真实格式与无法解析路径。"""
+    from agent import checks
+    pct, mount, why = checks.parse_df(
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        "/dev/vdb 1000 970 30 97% /data\n")
+    assert pct == 97.0 and mount == "/data" and why == ""
+    # 表头被 locale 翻译（zh_CN 的 df）也要能解析：只看数据行里的百分比列
+    pct, mount, why = checks.parse_df(
+        "文件系统 1024块 已用 可用 已用% 挂载点\n/dev/vda 1000 900 100 90% /data\n")
+    assert pct == 90.0 and mount == "/data" and why == ""
+    # 挂载点含空格时不能把挂载点截成半截
+    pct, mount, why = checks.parse_df(
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        "/dev/disk4s1 1000 950 50 95% /Volumes/My Disk\n")
+    assert pct == 95.0 and mount == "/Volumes/My Disk", (pct, mount)
+    assert checks.parse_df("Filesystem x\n")[0] is None
+    assert checks.parse_df("garbage")[0] is None
+    # /proc/meminfo 的键名固定英文，不受 locale 影响
+    assert checks.parse_meminfo(
+        "MemTotal:       1000000 kB\nMemFree:          100000 kB\n"
+        "MemAvailable:    500000 kB\n")[0] == 50.0
+    assert checks.parse_meminfo("MemTotal: 1000 kB\nMemFree: 100 kB\n"
+                                "Buffers: 100 kB\nCached: 300 kB\n")[0] == 50.0
+    assert checks.parse_meminfo("MemTotal: 1 2\n")[0] is None
+    assert checks.parse_meminfo("<html>502 Bad Gateway</html>")[0] is None
+    vm = ("Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+          "Pages free: 1000.\nPages active: 2000.\nPages wired down: 1000.\n"
+          "Pages stored in compressor: 3000.\n")
+    pct, why = checks.parse_vm_stat(vm, 4096 * 10000)
+    assert abs(pct - 30.0) < 0.01, (pct, why)   # 压缩内存已含在 wired，不重复计数
+    assert checks.parse_vm_stat(vm, 0)[0] is None
+    assert checks.parse_load("0.10 0.20 0.30 1/123 4567") == (0.10, 0.20, 0.30)  # /proc/loadavg
+    assert checks.parse_load("{ 2.46 2.51 3.09 }")[0] == 2.46                  # vm.loadavg
+    assert checks.parse_load("18:04 up 12 days, load averages: 2.46 2.51 3.09") == \
+        (2.46, 2.51, 3.09)
+    assert checks.parse_load("18:04 up 1 day, load average: 0.10, 0.20, 0.30")[0] == 0.10
+    assert checks.parse_load("nothing here") is None
+    assert checks.parse_load("Mem: 1000 400 100") is None   # 非负载文本不能误判
+    assert checks.parse_systemd_show("LoadState=loaded\nActiveState=failed\n"
+                                     "SubState=dead\n")["active"] == "failed"
+    assert checks.parse_docker_inspect("running,healthy,3\n") == {
+        "status": "running", "health": "healthy", "restarts": 3}
+    assert checks.parse_docker_inspect("[stderr]\nno such object") is None
+
+
+def test_checks_inventory_validation():
+    """目标配置校验：拼错字段/非法值必须报错，不能静默退化成"没有这项检查"。"""
+    from agent import checks
+    cases = [
+        ({"a": {"host": "h", "checks": {"disk_paths": []}}}, "disk_paths"),
+        ({"a": {"host": "h", "checks": {"disk_paths": ["rel/path"]}}}, "非法路径"),
+        ({"a": {"host": "h", "checks": {"disk_paths": ["/data/../etc"]}}}, "非法路径"),
+        ({"a": {"host": "h", "checks": {"disk_warn_pct": 101}}}, "disk_warn_pct"),
+        ({"a": {"host": "h", "checks": {"disk_crit_pct": 80}}}, "不能小于"),
+        ({"a": {"host": "h", "checks": {"timeout": 1}}}, "timeout"),
+        ({"a": {"host": "h", "checks": {"no_such": 1}}}, "未知字段"),
+        ({"a": {"host": "h", "services": [{"type": "runit", "name": "x"}]}},
+         "services[1].type"),
+        ({"a": {"host": "h", "services": [{"type": "docker", "name": "-rf"}]}}, "非法"),
+        ({"a": {"host": "h", "enabled": "yes"}}, "enabled"),
+        ({"a": {"host": "h", "disk_paths": ["/data"]}}, "未知字段"),  # 阈值写错层级
+        ({"local": {"host": "h"}}, "不能"),
+        ({"_local": {"host": "h"}}, "不能写 host"),
+    ]
+    orig = checks._exec
+    checks._exec = lambda target, cmd, timeout: (0, "")
+    try:
+        for payload, needle in cases:
+            restore = _with_targets(payload)
+            try:
+                checks.load_inventory()
+                raise AssertionError(f"应拒绝非法配置: {payload}")
+            except checks.CheckError as e:
+                assert needle in str(e), (payload, str(e))
+            finally:
+                restore()
+        restore = _with_targets({"skipme": {"host": "h", "enabled": False,
+                                            "checks": {}}})
+        try:
+            inventory = checks.load_inventory()
+            assert "skipme" in [t["name"] for t in inventory]
+            assert "skipme" not in [t["name"] for t in checks._select(inventory, "all")]
+            assert [t["name"] for t in checks._select(inventory, "skipme")] == ["skipme"]
+            try:
+                checks._select(inventory, "nope")
+                raise AssertionError("未注册目标应报错")
+            except checks.CheckError as e:
+                assert "未注册的检查目标" in str(e)
+        finally:
+            restore()
+    finally:
+        checks._exec = orig
+
+
+def test_checks_three_hosts_report():
+    """W2 验收：一台正常、一台磁盘超阈值、一台不可达——报告保留全部异常且不谎报正常。"""
+    from agent import checks
+    restore = _with_targets({
+        "web1": {"host": "10.0.0.1", "user": "deploy", "tags": ["prod", "web"],
+                 "env": {"role": "nginx"},
+                 "services": [{"type": "systemd", "name": "nginx"},
+                              {"type": "docker", "name": "api"}]},
+        "web2": {"host": "10.0.0.2", "user": "deploy",
+                 "services": [{"type": "systemd", "name": "nginx"}],
+                 "checks": {"disk_paths": ["/", "/data"]}},
+        "db1": {"host": "10.0.0.3", "user": "root",
+                "services": [{"type": "systemd", "name": "postgresql"}]},
+    })
+    orig = checks._exec
+
+    def fake(target, cmd, timeout):
+        if target == "db1":
+            return 255, "\n[stderr]\nssh: connect to host 10.0.0.3 port 22: Operation timed out"
+        if cmd == "uname -s":
+            return 0, "Linux\n"
+        if cmd.startswith("df "):
+            if target == "web2" and "/data" in cmd:
+                return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                           "/dev/vdb 100000 97000 3000 97% /data\n")
+            return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                       "/dev/vda 100000 40000 60000 40% /\n")
+        if cmd == "cat /proc/meminfo":
+            return 0, ("MemTotal:       1000000 kB\nMemFree:          100000 kB\n"
+                       "MemAvailable:    500000 kB\n")
+        if cmd == "cat /proc/loadavg":
+            return 0, "0.10 0.20 0.30 1/123 4567\n"
+        if cmd == "nproc":
+            return 0, "4\n"
+        if cmd.startswith("systemctl show"):
+            return 0, "LoadState=loaded\nActiveState=active\nSubState=running\n"
+        if cmd.startswith("docker inspect"):
+            return 0, "running,healthy,0\n"
+        return 127, f"unexpected command: {cmd}"
+
+    checks._exec = fake
+    try:
+        report = checks.run_checks(targets=["web1", "web2", "db1"])
+        text = checks.format_report(report)
+    finally:
+        checks._exec = orig
+        restore()
+
+    assert report["verdict"] == "异常"
+    assert report["complete"] is False
+    summary = report["summary"]
+    assert summary["checks"] == sum(summary[k] for k in
+                                    ("ok", "warn", "critical", "unknown", "error"))
+    by_name = {t["name"]: t for t in report["targets"]}
+    assert by_name["web1"]["verdict"] == "正常"
+    assert by_name["web2"]["verdict"] == "异常"
+    assert by_name["db1"]["verdict"] == "不完整"
+    lines = [a["line"] for a in report["anomalies"]]
+    assert any("97.0%" in line for line in lines)
+    assert any("[error]" in line and "db1" in line for line in lines)
+    assert any("[unknown]" in line and "db1" in line for line in lines)
+    for line in lines:  # 全部异常都必须出现在报告正文（不许被后文覆盖）
+        assert line in text, line
+    assert "97.0%" in text and "Operation timed out" in text
+    assert "不完整（存在未采集项）" in text
+    assert "## 全部异常与未采集项" in text
+
+
+def test_checks_unknown_never_healthy():
+    """采不到就标 unknown：解析失败/单元不存在/核数未知都不能被汇总成正常。"""
+    from agent import checks
+    restore = _with_targets({"web1": {"host": "10.0.0.1", "user": "deploy",
+                                      "services": [{"type": "systemd", "name": "nginx"}]}})
+    orig = checks._exec
+
+    def fake(target, cmd, timeout):
+        if cmd == "uname -s":
+            return 0, "Linux\n"
+        if cmd.startswith("df "):
+            return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                       "/dev/vda 100 1 99 1% /\n")
+        if cmd == "cat /proc/meminfo":
+            return 0, "<html>502 Bad Gateway</html>\n"
+        if cmd == "cat /proc/loadavg":
+            return 0, "0.10 0.20 0.30 1/123 4567\n"
+        if cmd == "nproc":
+            return 3, "nproc: not found\n"
+        if cmd.startswith("systemctl show"):
+            return 0, "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        return 127, "unexpected"
+
+    checks._exec = fake
+    try:
+        report = checks.run_checks(targets=["web1"])
+        text = checks.format_report(report)
+    finally:
+        checks._exec = orig
+        restore()
+    assert report["verdict"] == "不完整"
+    assert report["complete"] is False
+    status = {c["name"]: c["status"] for c in report["targets"][0]["checks"]}
+    assert status["内存"] == "unknown"
+    assert status["负载"] == "unknown"
+    assert status["服务 systemd:nginx"] == "unknown"
+    assert "无法解析" in text and "单元不存在" in text
+
+
+def test_inspect_tool_and_readonly_context():
+    """inspect 工具：全部 ok 才报正常，报告落盘 0600；无人值守可用、子代理仍不放开写。"""
+    from agent import checks, tools as agent_tools
+    restore = _with_targets({"_local": {"services": [{"type": "docker", "name": "api"}]}})
+    orig = checks._exec
+
+    def fake(target, cmd, timeout):
+        if cmd == "uname -s":
+            return 0, "Linux\n"
+        if cmd.startswith("df "):
+            return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                       "/dev/vda 100 50 50 50% /\n")
+        if cmd == "cat /proc/meminfo":
+            return 0, ("MemTotal: 1000 kB\nMemAvailable: 600 kB\n")
+        if cmd == "cat /proc/loadavg":
+            return 0, "0.5 0.5 0.5 1/100 1000\n"
+        if cmd == "nproc":
+            return 0, "2\n"
+        if cmd.startswith("docker inspect"):
+            return 0, "running,none,0\n"
+        return 127, "unexpected"
+
+    checks._exec = fake
+    try:
+        out = agent_tools.dispatch("inspect", {}, agent_tools.ToolContext())
+        bad = agent_tools.dispatch("inspect", {"groups": ["nope"]},
+                                   agent_tools.ToolContext())
+    finally:
+        checks._exec = orig
+        restore()
+    assert "巡检报告" in out and "结论: **正常**" in out
+    path = Path(re.search(r"\[全量报告\] (\S+)", out).group(1))
+    assert path.is_file() and path.stat().st_mode & 0o777 == 0o600
+    assert "结论: **正常**" in path.read_text(encoding="utf-8")
+    assert "须为" in bad                      # 非法分组被 schema 拒绝
+    assert "inspect" in agent_tools.SCHEDULED_TOOLS
+    assert "inspect" not in agent_tools.SUBAGENT_TOOLS
+    for name in ("remember", "ops_approve", "ops_exec", "ops_rollback"):
+        assert name not in agent_tools.SCHEDULED_TOOLS
+
+
+def test_workflow_checks_first_and_llm_down():
+    """API 完全不可用时仍产出规则检查结果，且规则异常逐项列出。"""
+    from agent import checks, loop, tools as agent_tools
+    restore = _with_targets({"web1": {"host": "10.0.0.1", "user": "deploy",
+                                      "services": [{"type": "systemd", "name": "nginx"}],
+                                      "checks": {"disk_paths": ["/data"]}}})
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-checks.json"
+    p.write_text(json.dumps({
+        "description": "规则先行",
+        "checks": {"targets": ["web1"],
+                   "groups": ["connectivity", "resources", "services"]},
+        "steps": [{"name": "解读", "prompt": "规则结果：{checks}"},
+                  {"name": "建议", "prompt": "前面：{prev}"}]}), encoding="utf-8")
+    orig_exec, orig_turn = checks._exec, loop.run_turn
+
+    def fake_exec(target, cmd, timeout):
+        if cmd == "uname -s":
+            return 0, "Linux\n"
+        if cmd.startswith("df "):
+            return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                       "/dev/vdb 100 98 2 98% /data\n")
+        if cmd == "cat /proc/meminfo":
+            return 0, ("MemTotal: 1000 kB\nMemAvailable: 600 kB\n")
+        if cmd == "cat /proc/loadavg":
+            return 0, "0.5 0.5 0.5 1/100 1000\n"
+        if cmd == "nproc":
+            return 0, "2\n"
+        if cmd.startswith("systemctl show"):
+            return 0, "LoadState=loaded\nActiveState=active\nSubState=running\n"
+        return 127, "unexpected"
+
+    def broken_llm(*args, **kwargs):
+        raise RuntimeError("API 401 unauthorized")
+
+    checks._exec, loop.run_turn = fake_exec, broken_llm
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-checks"},
+                                   agent_tools.ToolContext())
+    finally:
+        checks._exec, loop.run_turn = orig_exec, orig_turn
+        p.unlink(missing_ok=True)
+        restore()
+    assert "## 规则检查（确定性探针，模型未参与）" in out
+    assert "98.0%" in out and "结论 **异常**" in out
+    assert "全部列出" in out
+    assert "[失败] API 401 unauthorized" in out
+    assert "LLM 解读：0/2 步成功" in out and "解读不完整" in out
+    assert "不得汇总为正常" in out
+    saved = Path(re.search(r"\[全量报告\] (\S+)", out).group(1)).read_text(encoding="utf-8")
+    assert "98.0%" in saved and "LLM 解读：0/2 步成功" in saved
+
+
+def test_workflow_summary_keeps_all_steps():
+    """汇总保留每步结果与状态；早期异常不被最后一步覆盖；占位符只替换一次。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-agg.json"
+    p.write_text(json.dumps({"steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "上一步：{prev}"},
+        {"name": "三", "prompt": "全部步骤：{steps}"}]}), encoding="utf-8")
+    calls = []
+    orig = loop.run_turn
+
+    def fake(task, session, ctx, **kwargs):
+        calls.append(task)
+        if task == "第一步":
+            return "早期异常A：磁盘 96%"
+        if "上一步" in task:
+            return "含 {prev} 字面量"   # 替换一次后不再二次展开
+        return "正常"
+
+    loop.run_turn = fake
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-agg"},
+                                   agent_tools.ToolContext())
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert "早期异常A：磁盘 96%" in out
+    assert out.count("## 步骤") == 3
+    assert "步骤状态：1「一」完成｜2「二」完成｜3「三」完成" in out
+    assert "早期异常A：磁盘 96%" in calls[2]     # {steps} 索引带到第三步
+    assert "上一步：早期异常A：磁盘 96%" in calls[1]   # {prev} 拿到上一步结论
+    assert "含 {prev} 字面量" in calls[2]              # 替入内容不会被二次展开
+    assert "本 workflow 未配置 checks 块" in out
+
+
+def test_workflow_checks_config_validation():
+    """checks 块写错要报错：静默退化成"没有检查"会让报告谎报正常。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-bad.json"
+    steps = [{"name": "x", "prompt": "y"}]
+    cases = [
+        ({"checks": [], "steps": steps}, "checks 须为对象"),
+        ({"checks": {"targets": []}, "steps": steps}, "checks.targets"),
+        ({"checks": {"groups": ["disk"]}, "steps": steps}, "checks.groups"),
+        ({"checks": {"nope": 1}, "steps": steps}, "未知字段"),
+    ]
+    orig = loop.run_turn
+    loop.run_turn = lambda *a, **k: "ok"
+    try:
+        for payload, needle in cases:
+            p.write_text(json.dumps(payload), encoding="utf-8")
+            result = agent_tools.dispatch("workflow", {"name": "wf-bad"},
+                                          agent_tools.ToolContext())
+            assert needle in result, (payload, result)
+        p.write_text(json.dumps({"checks": {"targets": ["ghost"]}, "steps": steps}),
+                     encoding="utf-8")
+        result = agent_tools.dispatch("workflow", {"name": "wf-bad"},
+                                      agent_tools.ToolContext())
+        assert "未注册的检查目标" in result      # 目标名写错必须显式暴露
+        assert "规则检查：未执行" in result
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+
+
+def test_readonly_whitelist_nproc_sysctl():
+    """资源探针新增的只读取值命令进白名单；sysctl 写形态仍不是 R0。"""
+    assert core.classify("nproc")[0] == "R0"
+    assert core.classify("sysctl -n hw.memsize")[0] == "R0"
+    assert core.classify("sysctl -n hw.memsize hw.ncpu")[0] == "R0"
+    assert core.classify("sysctl -a")[0] == "R0"
+    for cmd in ("sysctl -w kern.maxfiles=1", "sysctl kern.maxfiles=1",
+                "sysctl -n hw.memsize; sysctl -w kern.maxfiles=1"):
+        assert core.classify(cmd)[0] != "R0", cmd
+
+
+def _linux_fake(extra=None):
+    """构造一个只覆盖 Linux 探针的假执行器，避免每个用例重复同一堆分支。"""
+    routes = {
+        "uname -s": (0, "Linux\n"),
+        "cat /proc/meminfo": (0, "MemTotal: 1000 kB\nMemAvailable: 600 kB\n"),
+        "cat /proc/loadavg": (0, "0.1 0.1 0.1 1/100 1000\n"),
+        "nproc": (0, "4\n"),
+    }
+    routes.update(extra or {})
+
+    def fake(target, cmd, timeout):
+        if cmd in routes:
+            return routes[cmd]
+        if cmd.startswith("df "):
+            return 0, ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                       "/dev/vda 100 40 60 40% /\n")
+        if cmd.startswith("systemctl show"):
+            return 0, "LoadState=loaded\nActiveState=active\nSubState=running\n"
+        if cmd.startswith("docker inspect"):
+            return 0, "running,none,0\n"
+        return 127, f"unexpected command: {cmd}"
+    return fake
+
+
+def test_checks_partial_groups_cannot_claim_ok():
+    """只跑部分分组时结论最高"不完整"：单看连通性不能宣称主机正常。"""
+    from agent import checks
+    restore = _with_targets({"web1": {"host": "10.0.0.1"}})
+    orig = checks._exec
+    checks._exec = _linux_fake()
+    try:
+        partial = checks.run_checks(targets=["web1"], groups=["connectivity"])
+        full = checks.run_checks(targets=["web1"], groups=["connectivity", "resources"])
+    finally:
+        checks._exec = orig
+        restore()
+    assert partial["coverage"]["groups_skipped"] == ["resources", "services"]
+    assert partial["complete"] is False
+    assert partial["verdict"] == "不完整"
+    # 目标级也不能写"正常"：只跑了连通性不等于这台主机健康
+    assert partial["targets"][0]["verdict"] == "未完整检查"
+    assert "未检查分组 resources/services" in checks.format_report(partial)
+    # 漏了 services 分组：即使已跑的项全 ok，也不能说正常
+    assert full["summary"][checks.CRITICAL] == 0
+    assert full["verdict"] == "不完整"
+
+
+def test_checks_skipped_target_is_visible():
+    """enabled=false 的目标在 all 里跳过，但必须在报告里点名，不能凭空消失。"""
+    from agent import checks
+    restore = _with_targets({"offline": {"host": "10.0.0.2", "enabled": False},
+                             "web1": {"host": "10.0.0.1"}})
+    orig = checks._exec
+    checks._exec = _linux_fake()
+    try:
+        report = checks.run_checks()
+    finally:
+        checks._exec = orig
+        restore()
+    assert report["coverage"]["targets_skipped"] == ["offline"]
+    assert "offline" in checks.format_report(report)
+    assert "offline" not in report["target_names"]
+
+
+def test_checks_probe_budget_bounds_work():
+    """单目标探针有界：时间预算与次数上限各自生效，超预算标 unknown 而不是漏项。"""
+    from agent import checks
+    import time as _t
+    assert checks._budget_state({"left": 5, "deadline": _t.monotonic() + 30}) == ""
+    assert "时间预算" in checks._budget_state({"left": 5, "deadline": _t.monotonic() - 1})
+    assert "次数" in checks._budget_state({"left": 0, "deadline": _t.monotonic() + 30})
+    services = [{"type": "docker", "name": f"c{i}"} for i in range(5)]
+    restore = _with_targets({"web1": {"host": "10.0.0.1", "services": services}})
+    orig_exec, orig_budget = checks._exec, checks.PROBE_BUDGET
+    checks._exec, checks.PROBE_BUDGET = _linux_fake(), 4
+    try:
+        report = checks.run_checks(targets=["web1"])
+    finally:
+        checks._exec, checks.PROBE_BUDGET = orig_exec, orig_budget
+        restore()
+    details = [c["detail"] for c in report["targets"][0]["checks"]]
+    assert any("预算" in d for d in details), details
+    assert report["verdict"] == "不完整"
+    # 每个非 ok 项都在异常清单里，没有被"预算"吃掉
+    assert len(report["anomalies"]) >= 5
+
+
+def test_checks_underscore_target_still_usable():
+    """除 _local 外，下划线开头的目标名保持原样（历史配置不能因新增保留条目失效）。"""
+    from agent import checks
+    import remote
+    restore = _with_targets({"_db": {"host": "10.0.0.9", "user": "root"}})
+    orig = checks._exec
+    checks._exec = _linux_fake()
+    try:
+        names = [t["name"] for t in checks.load_inventory()]
+        assert "_db" in names
+        assert remote.get_target("_db")["host"] == "10.0.0.9"
+        try:
+            remote.get_target("_local")
+            raise AssertionError("_local 不能当 SSH 目标")
+        except remote.RemoteError as e:
+            assert "本机检查配置" in str(e)
+        assert "_db" in "\n".join(remote.describe())
+    finally:
+        checks._exec = orig
+        restore()
+
+
+def test_report_save_failure_degrades():
+    """报告落盘失败不能让已跑完的检查结果丢失。"""
+    from agent import checks, tools as agent_tools
+    restore = _with_targets({"_local": {"services": [{"type": "docker", "name": "api"}]}})
+    orig_exec, orig_dir = checks._exec, checks._report_dir
+    checks._exec = _linux_fake()
+    checks._report_dir = lambda: Path("/dev/null/reports")  # 落盘必然失败
+    try:
+        assert checks.save_report("x", "body") is None
+        out = agent_tools.dispatch("inspect", {}, agent_tools.ToolContext())
+    finally:
+        checks._exec, checks._report_dir = orig_exec, orig_dir
+        restore()
+    assert "巡检报告" in out and "结论: **正常**" in out
+    assert "报告未能落盘" in out
+
+
+def test_inspect_exit_codes():
+    """退出码可被脚本判定：0 正常 / 2 有异常 / 3 不完整。"""
+    from agent import checks
+    assert checks.exit_code({"verdict": "正常"}) == 0
+    assert checks.exit_code({"verdict": "警告"}) == 2
+    assert checks.exit_code({"verdict": "异常"}) == 2
+    assert checks.exit_code({"verdict": "不完整"}) == 3
+    restore = _with_targets({"_local": {"services": [{"type": "docker", "name": "api"}]}})
+    orig = checks._exec
+    checks._exec = _linux_fake()
+    try:
+        ok_code = checks.cli(["--target", "local", "--json"])
+    finally:
+        checks._exec = orig
+        restore()
+    assert ok_code == 0
+
+
+def test_checks_parsers_ignore_stderr_and_paths_with_spaces():
+    """df 的 stderr 告警不能被当成容量列；带空格/中文的挂载点要能配置。"""
+    from agent import checks
+    pct, mount, why = checks.parse_df(
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        "/dev/vda 100 90 10 90% /data\n"
+        "[stderr]\ndf: warning: 90% of inodes used\n")
+    assert pct == 90.0 and mount == "/data", (pct, mount)
+    assert checks.parse_df("[stderr]\ndf: warning: 90% used\n")[0] is None
+    # 路径允许空格与非 ASCII（shlex.quote 负责安全传递）
+    cfg = checks._norm_checks("web1", {"disk_paths": ["/Volumes/My Disk", "/数据/盘"]})
+    assert cfg["disk_paths"] == ["/Volumes/My Disk", "/数据/盘"]
+    for bad in ("/data/../etc", "relative/path", "/tmp\nx"):
+        try:
+            checks._norm_checks("web1", {"disk_paths": [bad]})
+            raise AssertionError(f"应拒绝非法路径: {bad!r}")
+        except checks.CheckError:
+            pass
+
+
+def test_workflow_keeps_footer_when_truncated():
+    """输出超长被截断时，末尾「汇总完整性」必须仍在可见范围内。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-big.json"
+    p.write_text(json.dumps({"steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "第二步"},
+        {"name": "三", "prompt": "第三步"}]}), encoding="utf-8")
+    orig = loop.run_turn
+    loop.run_turn = lambda task, *a, **k: "X" * 12000
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-big"},
+                                   agent_tools.ToolContext())
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert len(out) <= agent_tools.OUTPUT_LIMIT + 2000, len(out)
+    assert "汇总完整性" in out          # 尾部没被截掉
+    assert "LLM 解读：3/3 步成功" in out
+    assert "中段已截断" in out
+    saved = Path(re.search(r"\[全量报告\] (\S+)", out).group(1)).read_text(encoding="utf-8")
+    assert saved.count("X") == 36000    # 报告文件保留完整步骤原文
+
+
+def test_workflow_step_not_done_is_not_success():
+    """空回复与超轮次保护都不算"解读完成"，不能在汇总里写全成功。"""
+    from agent import loop, tools as agent_tools
+    user_dir = Path(core.STATE_DIR, "workflows")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    p = user_dir / "wf-partial.json"
+    p.write_text(json.dumps({"steps": [
+        {"name": "一", "prompt": "第一步"},
+        {"name": "二", "prompt": "第二步"},
+        {"name": "三", "prompt": "第三步"}]}), encoding="utf-8")
+    results = ["正常结论", "", "分析中\n[已达最大轮次保护，终止]"]
+    orig = loop.run_turn
+    loop.run_turn = lambda task, *a, **k: results.pop(0)
+    try:
+        out = agent_tools.dispatch("workflow", {"name": "wf-partial"},
+                                   agent_tools.ToolContext())
+    finally:
+        loop.run_turn = orig
+        p.unlink(missing_ok=True)
+    assert "1/3 步成功" in out and "解读不完整" in out
+    assert "2「二」失败（空输出）" in out
+    assert "3「三」失败（超轮次保护）" in out
+
+
+def test_inspect_cli_json_stays_valid_with_explain():
+    """--json 时解读写 stderr，stdout 必须仍是可解析的 JSON。"""
+    from agent import checks
+    restore = _with_targets({"_local": {"services": [{"type": "docker", "name": "api"}]}})
+    orig_exec, orig_explain = checks._exec, checks._explain
+    checks._exec = _linux_fake()
+    checks._explain = lambda text, model: "解读正文"
+    stdout, stderr = io.StringIO(), io.StringIO()
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = stdout, stderr
+    try:
+        code = checks.cli(["--target", "local", "--json", "--explain"])
+    finally:
+        sys.stdout, sys.stderr = saved
+        checks._exec, checks._explain = orig_exec, orig_explain
+        restore()
+    assert code == 0
+    payload = json.loads(stdout.getvalue())      # stdout 只能是 JSON
+    assert payload["verdict"] == "正常"
+    assert "解读正文" in stderr.getvalue()
+
+
+def test_inspect_cli_usage_error_is_not_finding():
+    """用法错误退出 1，不能与"发现异常"的 2 混淆。"""
+    from agent import checks
+    saved = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        try:
+            checks.cli(["--group", "nope"])
+            raise AssertionError("非法分组应被 argparse 拒绝")
+        except SystemExit as e:
+            code = e.code
+        text = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved
+    assert code == 1, code
+    assert "错误" in text
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
@@ -3002,7 +3658,7 @@ def main():
         try:
             fn()
             print(f"PASS {fn.__name__}")
-        except Exception as e:  # noqa: BLE001
+        except (Exception, SystemExit) as e:  # noqa: BLE001 —— SystemExit 也不能终止整轮自检
             failed += 1
             print(f"FAIL {fn.__name__}: {e}")
     print(f"{len(ALL) - failed}/{len(ALL)} passed")

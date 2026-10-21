@@ -80,6 +80,10 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 ./opsx list
 ./opsx rollback <snapshot_id>          # 先展示目标/影响文件/差异，确认后才改写
 ./opsx rollback <snapshot_id> --yes    # 已核对计划（非交互环境必须显式加）
+
+# 确定性巡检（规则检查不依赖模型，退出码 0/2/3/1）
+./opsagent inspect
+./opsagent inspect --target web1 --json
 ```
 
 ## 远程执行（SSH 目标）
@@ -109,6 +113,9 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
   目标机不需要安装任何东西。
 - 认证：`BatchMode=yes`，要求密钥/ssh-agent 免密——agent 无人值守，不能停在密码提示上。
 - 目标字段（host/user/port/identity）含空白或前导 `-` 一律拒绝，避免配置值被 ssh 当成选项。
+- 同一份注册表也是**巡检清单**：可选字段 `tags` / `env` / `services` / `checks` / `enabled`
+  用于描述资产与检查阈值（见「确定性巡检」）。本机检查项写在保留条目 `_local` 里，
+  它不是 SSH 目标（`_local` 不能用于 `--target` 执行命令）。
 - 边界：`ssh` 只是传输通道，目标机上的命令不受目标机本地 opsx 约束；
   MCP 形态仍只支持本机执行（MCP 宿主可直接调 `opsx exec --target` 获得同样能力）。
 
@@ -160,20 +167,84 @@ agent 里也可以直接说"每天九点巡检一次"，模型用 `schedule` 工
 形态下拒绝创建，避免留下永远不推进的目标。
 
 **巡检工作流（workflow）**：把固定巡检步骤写成 JSON——仓库 [workflows/](workflows/) 自带
-`daily-inspection`，`~/.ops-agent/workflows/*.json` 同名覆盖。每步起一个只读子代理顺序执行，
-后一步用 `{prev}` 引用前一步结论：
+`daily-inspection`，`~/.ops-agent/workflows/*.json` 同名覆盖。`checks` 块先跑确定性规则检查
+（不调用模型），再由只读子代理逐步解读：
 
 ```json
-{"description": "每日巡检", "steps": [
-  {"name": "资源", "prompt": "只读检查磁盘/内存/负载"},
-  {"name": "汇总", "prompt": "基于前序结论写报告：{prev}"}
+{"description": "每日巡检",
+ "checks": {"targets": "all", "groups": ["connectivity", "resources", "services"]},
+ "steps": [
+  {"name": "解读", "prompt": "规则结果：{checks}"},
+  {"name": "取证", "prompt": "针对异常做只读取证：{prev}"},
+  {"name": "汇总", "prompt": "规则结果：{checks}\n前序步骤：{steps}"}
 ]}
 ```
+
+占位符单次替换：`{checks}` 规则报告、`{prev}` 上一步结论、`{steps}` 前序步骤索引。
+末尾「汇总完整性」由程序生成——列出规则检查的全部异常与每步状态，模型不能改写；
+输出过长被截断时也会保留这一段，避免「早期异常被最后一步的总结覆盖」。
 
 agent 里先 `workflow`（不带 name）列目录，再 `workflow {"name": "daily-inspection"}` 运行；
 定时任务的 prompt 也可以写"运行 workflow daily-inspection 并报告异常"。
 `opsagent schedule add --daily 09:00 "运行 workflow daily-inspection 并报告异常"` 就是一套
 完整的每日巡检。
+
+## 确定性巡检（W2）
+
+检查项固定写在代码里，模型只做解读：`opsagent inspect` 不需要 API Key 也能出结论，
+API 完全不可用时 workflow 的规则结果照常产出。
+
+```bash
+./opsagent inspect                                   # 本机 + 全部已注册目标，三组全跑
+./opsagent inspect --target web1                     # 单个目标
+./opsagent inspect --group resources                 # 只跑资源组（结论最高为「不完整」）
+./opsagent inspect --json                            # 结构化报告到 stdout
+./opsagent inspect --explain                         # 追加 LLM 解读（可选，失败不影响结论）
+```
+
+三组检查（默认全跑，缺任一组都不算完整）：
+
+| 分组 | 采集内容 | 判定依据 |
+| --- | --- | --- |
+| `connectivity` | `uname -s`（同时确定探针平台） | 命令失败即 `error`；输出解析不出平台记 `unknown` |
+| `resources` | `df -P -k`（磁盘）、`/proc/meminfo` 或 `vm_stat`（内存）、`/proc/loadavg` 或 `sysctl -n vm.loadavg`（负载，除以核数） | 与阈值比较：≥ 警告为 `warn`、≥ 异常为 `critical` |
+| `services` | `systemctl show`（systemd）、`docker inspect --format`（容器） | 期望运行的单元 `failed/inactive` 为 `critical`；单元/容器不存在、命令不可用为 `unknown` |
+
+状态只有五种：`ok` / `warn` / `critical` / `unknown` / `error`。**采不到不等于健康**——
+目标不可达、权限不足、输出无法解析都记 `unknown`/`error`，报告结论只有
+「无异常 + 三组全跑 + 无未采集项」才可能是「正常」，否则分别是「警告」「异常」「不完整」。
+
+配置写在 `~/.ops-agent/targets.json`（与 SSH 目标同一份，新字段全部可选）：
+
+```json
+{
+  "_local": {"tags": ["workstation"],
+             "services": [{"type": "docker", "name": "redis"}],
+             "checks": {"disk_paths": ["/", "/Users"]}},
+  "web1": {"host": "10.0.0.11", "user": "ops", "tags": ["prod", "web"],
+           "env": {"role": "nginx", "os": "ubuntu-24.04"},
+           "services": [{"type": "systemd", "name": "nginx"},
+                        {"type": "docker", "name": "api", "expect": "running"}],
+           "checks": {"disk_paths": ["/", "/data"], "disk_warn_pct": 85,
+                      "disk_crit_pct": 95, "mem_warn_pct": 90, "mem_crit_pct": 95,
+                      "load_warn_per_core": 2.0, "load_crit_per_core": 4.0,
+                      "timeout": 20, "budget_seconds": 120}},
+  "cold-standby": {"host": "10.0.0.30", "enabled": false}
+}
+```
+
+- `services[].type` 只能是 `systemd` / `docker`；名称只允许字母数字与 `@ . _ : -`。
+- `checks` 未知字段、非法阈值、非法目标顶层字段一律报错（拼错不该静默生效）。
+- `disk_paths` 允许空格与非 ASCII（如 `/Volumes/My Disk`），拒绝控制字符与 `..`。
+- `budget_seconds` 是单目标的检查时间预算（默认 120s），另有 60 次探针的硬上界；
+  超预算的检查项记 `unknown`，不会静默漏项，也不会让一台卡死的主机拖住整轮巡检。
+- `enabled: false` 的目标在 `--target all` 时跳过，并在报告的「覆盖」行点名。
+- 完整性口径是**已启用目标**：被显式停用的目标不计入「不完整」，但会列在覆盖行里。
+- 报告全文落盘 `~/.ops-agent/reports/*.md`（0600，保留最近 100 份，落盘前已脱敏）；
+  工具/终端只回显摘要，异常清单无论多少条都会完整列出。
+
+退出码（脚本/cron 可判定）：`0` 正常、`2` 有警告或异常、`3` 不完整（未采集/漏分组）、
+`1` 检查无法执行（配置错误、参数错误）。
 
 **长期记忆（remember）**：排查中确认的主机事实（OS/服务清单/已排除的告警项）、用户偏好、
 环境约定，agent 用 `remember` 工具记入 `~/.ops-agent/memory.md`（0600，单条 ≤500 字符），
@@ -252,6 +323,11 @@ hook 允许直接调用本仓库的 `opsx`（或 Python + 本仓库脚本），�
 命令分类为线性正则匹配，不解析 shell AST（复合命令按 `;` `&&` `||` `|`、换行与后台 `&`
 分段取最高级）。命令超时会停止本地进程组；远程超时只保证本地 SSH 已停止，
 目标机上的进程是否退出须另行检查。
+
+巡检侧的已知边界：探针只覆盖连通性、磁盘/内存/负载与 systemd/Docker 服务，不替代外部监控；
+`unknown` 只说明"没采到"，不说明"坏了"，需要人按报告里的证据命令复核；巡检期间若有人改写
+`targets.json`，同一次报告的不同探针可能打到不同主机（报告按开始时的目标快照展示）。
+调度层面的整任务时间预算、run/session 记录与退出码语义属于下一阶段（W3）。
 
 ## MCP server 形态
 

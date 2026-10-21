@@ -1,13 +1,20 @@
-"""workflow 编排：JSON 定义的只读多步编排（后一步用 {prev} 引用前一步结论）。
+"""workflow 编排：JSON 定义的只读多步编排。
 
 位置：仓库 `workflows/*.json` + `~/.ops-agent/workflows/*.json`（同名后者覆盖）。
 格式：
 
     {"description": "一句话说明",
-     "steps": [{"name": "资源水位", "prompt": "只读检查……"},
-               {"name": "汇总", "prompt": "基于前序结论……：{prev}"}]}
+     "checks": {"targets": "all", "groups": ["connectivity", "resources", "services"]},
+     "steps": [{"name": "资源解读", "prompt": "基于规则结果……：{checks}"},
+               {"name": "汇总", "prompt": "汇总前面所有步骤……：{steps}"}]}
 
-每步由 tools._run_isolated 起一个只读子代理；步骤顺序执行，最多 MAX_STEPS 步。
+执行顺序固定为「先规则、后解释」：
+1. `checks` 块（可选）由 agent/checks.py 确定性执行——不调用模型，API 不可用也有结果；
+2. 每步由 tools._run_isolated 起一个只读子代理，顺序执行，最多 MAX_STEPS 步；
+3. 汇总由程序生成（见 tools._workflow_footer）：列出全部异常与每步状态，不经模型改写。
+
+占位符（单次替换，替入内容里再出现同名占位符不会被二次替换）：
+{checks} 规则检查报告；{prev} 上一步结论；{steps} 前序步骤索引（名称/状态/摘要）。
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
+from . import checks  # noqa: E402
 
 MAX_STEPS = 8
 MAX_FILE_BYTES = 1_000_000
@@ -39,6 +47,31 @@ def _load_json(path: Path) -> dict:
     if not isinstance(data, dict):
         raise WorkflowError(f"workflow 文件格式异常: {path}")
     return data
+
+
+def _normalize_checks(name: str, raw) -> dict | None:
+    """校验 checks 块。写错了要报错，不能静默退化成"没有检查"。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise WorkflowError(f"workflow {name} 的 checks 须为对象")
+    extra = sorted(set(raw) - {"targets", "groups"})
+    if extra:
+        raise WorkflowError(f"workflow {name} 的 checks 含未知字段: {', '.join(extra)}")
+    targets = raw.get("targets", "all")
+    if targets != "all":
+        if (not isinstance(targets, list) or not targets
+                or not all(isinstance(t, str) and t.strip() for t in targets)):
+            raise WorkflowError(
+                f'workflow {name} 的 checks.targets 须为 "all" 或非空目标名数组')
+        targets = [t.strip() for t in targets]
+    groups = raw.get("groups", list(checks.GROUPS))
+    if (not isinstance(groups, list) or not groups
+            or any(g not in checks.GROUPS for g in groups)):
+        raise WorkflowError(
+            f"workflow {name} 的 checks.groups 须为 {list(checks.GROUPS)} 的非空子集")
+    deduped = list(dict.fromkeys(groups))
+    return {"targets": targets, "groups": deduped}
 
 
 def catalog() -> list[dict]:
@@ -81,6 +114,7 @@ def load(name: str) -> dict:
             normalized.append({"name": str(step.get("name") or f"步骤 {i}"),
                                "prompt": prompt.strip()})
         return {"name": name, "description": data.get("description") or "",
+                "checks": _normalize_checks(name, data.get("checks")),
                 "steps": normalized}
     names = ", ".join(m["name"] for m in catalog()) or "（无）"
     raise WorkflowError(f"未找到 workflow: {name}（可用: {names}）")

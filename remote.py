@@ -55,10 +55,14 @@ def load_targets() -> dict[str, dict]:
 
 def get_target(name: str) -> dict:
     _check_name(name)
+    if name == "_local":
+        # 只保留这一个名字：它是本机检查配置（agent/checks.py），不是 SSH 目标。
+        # 其他下划线开头的名字历史上就允许，保持可用。
+        raise RemoteError("'_local' 是本机检查配置条目，不能作为 SSH 目标")
     targets = load_targets()
     t = targets.get(name)
     if not isinstance(t, dict):
-        known = ", ".join(sorted(targets)) or "无"
+        known = ", ".join(sorted(n for n in targets if n != "_local")) or "无"
         raise RemoteError(f"未注册的 SSH 目标: {name}（已注册: {known}；"
                           f"在 {_targets_file()} 注册后才可用）")
     return t
@@ -375,8 +379,19 @@ def describe() -> list[str]:
         return [f"[opsx 错误] {e}"]  # 注册表坏了，不应连带隐藏快照/审批戳
     out = []
     for name in sorted(targets):
+        if name == "_local":
+            continue  # 本机检查配置，不是 SSH 目标
         t = targets[name] if isinstance(targets[name], dict) else {}
         user = f"{t['user']}@" if t.get("user") else ""
         port = f":{t['port']}" if t.get("port") else ""
-        out.append(f"{name}  {user}{t.get('host', '?')}{port}")
+        line = f"{name}  {user}{t.get('host', '?')}{port}"
+        tags = t.get("tags")
+        if isinstance(tags, list) and tags:
+            line += "  [" + ",".join(str(x) for x in tags) + "]"
+        services = t.get("services")
+        if isinstance(services, list) and services:
+            line += f"  服务 {len(services)} 项"
+        if t.get("enabled") is False:
+            line += "  （enabled=false，巡检跳过）"
+        out.append(line)
     return out
