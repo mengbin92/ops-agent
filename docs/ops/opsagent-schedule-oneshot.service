@@ -1,0 +1,15 @@
+# 与 opsagent-schedule.timer 配套的 one-shot 服务（不要和常驻 service 混用）
+[Unit]
+Description=ops-agent scheduled inspection (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/opsagent schedule run --once
+EnvironmentFile=-/etc/ops-agent/env
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=%h/.ops-agent

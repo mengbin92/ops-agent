@@ -201,8 +201,10 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
             return (final_text + "\n" if final_text else "") + warning
         messages = compact([{"role": "system", "content": system or _default_system()}]
                            + session.messages)
+        chat_kwargs = {"deadline": ctx.deadline} if ctx.deadline is not None else {}
         msg = llm._validate_message(llm.chat(
-            messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta))
+            messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta,
+            **chat_kwargs))
         # 规范化为可持久化结构
         record = {"role": "assistant", "content": msg.get("content") or ""}
         if msg.get("tool_calls"):

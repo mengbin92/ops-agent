@@ -1,0 +1,12 @@
+# systemd timer 替代方案（不常驻，适合 cron 心智）：
+#   ExecStart 用 --once，OnCalendar 每 5 分钟
+[Unit]
+Description=ops-agent scheduled inspection (one-shot)
+
+# 与 opsagent-schedule-oneshot.service 配套安装
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

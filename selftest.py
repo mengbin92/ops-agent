@@ -8022,6 +8022,336 @@ def test_scenario_gate_codes_have_distinct_verdicts():
     assert "opsx approve" not in result["suggestion"]
 
 
+def test_usage_records_and_budget_blocks_llm():
+    """预算记账：成功后计数；超限后 llm.chat 立即抛 BudgetExhausted，不再发请求。"""
+    import usage
+    from agent import llm
+    (core.STATE_DIR / "usage.jsonl").unlink(missing_ok=True)
+    (core.STATE_DIR / "usage-state.json").unlink(missing_ok=True)
+    usage.save_budget({"enabled": True, "daily_calls": 2, "daily_tokens": None})
+    calls = []
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"role": "assistant",
+                                                        "content": "ok"}}],
+                               "usage": {"prompt_tokens": 10,
+                                         "completion_tokens": 5}}).encode()
+
+    orig_post = llm._post
+    llm._post = lambda body, timeout: (calls.append(1), FakeResp())[1]
+    try:
+        msg = llm.chat([{"role": "user", "content": "hi"}])
+        assert msg["content"] == "ok"
+        used = usage.today()
+        assert used["calls"] == 1 and used["tokens"] == 15, used
+        llm.chat([{"role": "user", "content": "hi"}])
+        assert usage.today()["calls"] == 2
+        try:
+            llm.chat([{"role": "user", "content": "hi"}])
+            raise AssertionError("超限应抛 BudgetExhausted")
+        except llm.BudgetExhausted as e:
+            assert "预算已耗尽" in str(e) and "2/2" in str(e)
+        assert len(calls) == 2, "超限后不应再发请求"
+        assert llm.is_budget_exhausted(llm.BudgetExhausted("x"))
+        assert not llm.is_transient(llm.BudgetExhausted("x")), "预算错误不能按瞬时错误重试"
+    finally:
+        llm._post = orig_post
+        (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+
+
+def test_llm_transient_backoff_and_permanent_no_retry():
+    """provider 临时错误（429/网络）按指数退避重试；永久错误（401）绝不重试。"""
+    import usage
+    usage.save_budget({"enabled": True, "daily_calls": None, "daily_tokens": None})
+    from agent import llm
+    sleeps = []
+    orig_sleep, orig_post = llm.time.sleep, llm._post
+    llm.time.sleep = lambda s: sleeps.append(s)
+    attempts = {"n": 0}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"role": "assistant",
+                                                        "content": "ok"}}],
+                               "usage": {"prompt_tokens": 1,
+                                         "completion_tokens": 1}}).encode()
+
+    def flaky(body, timeout):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise llm.LLMError("LLM API HTTP 429: too many requests")
+        return FakeResp()
+
+    try:
+        llm._post = flaky
+        msg = llm.chat([{"role": "user", "content": "hi"}])
+        assert msg["content"] == "ok" and attempts["n"] == 3
+        assert len(sleeps) == 2, "两次瞬时错误各退避一次"
+        assert sleeps[0] < sleeps[1] <= llm.TRANSIENT_CAP + llm.TRANSIENT_BASE
+        attempts["n"] = 0
+        sleeps.clear()
+
+        def denied(body, timeout):
+            attempts["n"] += 1
+            raise llm.LLMError("LLM API HTTP 401: invalid api key")
+
+        llm._post = denied
+        try:
+            llm.chat([{"role": "user", "content": "hi"}])
+            raise AssertionError("401 应直接失败")
+        except llm.LLMError as e:
+            assert "401" in str(e)
+        assert attempts["n"] == 1, "401 不能重试"
+        assert not sleeps, "永久错误不退避"
+    finally:
+        llm.time.sleep, llm._post = orig_sleep, orig_post
+        (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+
+
+def test_schedule_budget_exhausted_keeps_rules():
+    """验收核心：预算耗尽时 LLM 调用被停且报告；规则检查照常运行并留证。"""
+    from agent import checks, llm, notify, schedule
+    _clean_schedules()
+    _clean_notify()
+    report = _report_with([_anomaly()])
+    orig_checks, orig_entry = checks.run_checks, schedule._run_entry
+    checks.run_checks = lambda targets=None, groups=None, timeout=None, deadline=None: report
+    schedule._run_entry = lambda *a, **k: (_ for _ in ()).throw(
+        llm.BudgetExhausted("LLM 调用预算已耗尽（调用次数 500/500）"))
+    sent = _FakePost()
+    orig_post = notify._post
+    notify._post = sent
+    try:
+        _notify_setup()
+        schedule.add("每日巡检", every_seconds=60, checks_target="all")
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        records = schedule.run_due()
+    finally:
+        checks.run_checks, schedule._run_entry = orig_checks, orig_entry
+        notify._post = orig_post
+    rec = records[0]
+    assert rec["status"] == "failed", rec["status"]
+    assert "预算已耗尽" in rec["error"], rec["error"]
+    assert rec["attempts"] == 1, "预算耗尽不重试"
+    assert rec.get("signal_path") and rec.get("anomalies"), "规则检查必须照常运行并留证"
+    assert sent.calls and "磁盘 /data" in sent.calls[-1]["text"], "规则异常仍要通知出去"
+    _clean_schedules()
+    _clean_notify()
+
+
+def test_doctor_clear_diagnoses():
+    """doctor：API key 缺失/SSH 失败/鉴权失败各有明确诊断与修复建议。"""
+    import subprocess
+    import urllib.error
+    import urllib.request
+    import doctor
+    import remote
+    saved_key = os.environ.pop("OPSAGENT_API_KEY", None)
+    targets_path = core.STATE_DIR / "targets.json"
+    saved_targets = targets_path.read_text(encoding="utf-8") \
+        if targets_path.exists() else None
+    targets_path.write_text(json.dumps({
+        "bad1": {"host": "10.255.255.1", "connect_timeout": 2}}), encoding="utf-8")
+    orig_ssh = remote._ssh
+    remote._ssh = lambda name, cmd, stdin=None, timeout=120: \
+        subprocess.CompletedProcess([], 255, b"", b"ssh: connect to host x port 22: Operation timed out")
+    try:
+        sections, counts = doctor.run()
+        report = doctor.format_report(sections, counts)
+    finally:
+        remote._ssh = orig_ssh
+        if saved_targets is None:
+            targets_path.unlink(missing_ok=True)
+        else:
+            targets_path.write_text(saved_targets, encoding="utf-8")
+        if saved_key is not None:
+            os.environ["OPSAGENT_API_KEY"] = saved_key
+    assert counts["fail"] >= 2, report
+    assert "llm-config" in report and "API key 未设置" in report
+    assert "ssh:bad1" in report and "连接失败" in report and "timed out" in report
+    assert "## 需要处理" in report
+    # 有 key 但探活 401：鉴权失败分支（含修复建议）。env 放进 finally：
+    # 中途断言失败也不能把测试 key 留给后续用例。
+    saved_open = urllib.request.urlopen
+    had_key = os.environ.pop("OPSAGENT_API_KEY", None)
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    urllib.request.urlopen = fake_urlopen
+    os.environ["OPSAGENT_API_KEY"] = "sk-test-w7"
+    try:
+        items = doctor._probe_llm_api()
+    finally:
+        urllib.request.urlopen = saved_open
+        os.environ.pop("OPSAGENT_API_KEY", None)
+        if had_key is not None:
+            os.environ["OPSAGENT_API_KEY"] = had_key
+    assert items[0]["status"] == "fail" and "鉴权失败" in items[0]["detail"]
+
+
+def test_schedule_heartbeat_health_and_alert():
+    """心跳三态：fresh/stale/never；stale 启动时经通知状态机告警，fresh 自动恢复。"""
+    from agent import notify, schedule
+    _clean_schedules()
+    _clean_notify()
+    # never：没有 meta
+    assert schedule.daemon_health()["state"] == "never"
+    # fresh：meta.last_scan 是刚才
+    schedule._save([], {"last_scan": time.time()})
+    assert schedule.daemon_health()["state"] == "fresh"
+    # stale：30 分钟前
+    schedule._save([], {"last_scan": time.time() - 1800})
+    health = schedule.daemon_health()
+    assert health["state"] == "stale" and health["age_seconds"] >= 1800
+    sent = _FakePost()
+    orig_post = notify._post
+    notify._post = sent
+    try:
+        _notify_setup()
+        schedule.alert_heartbeat_if_stale()
+        assert sent.calls and "心跳中断" in sent.calls[-1]["text"], sent.calls
+        # fresh：恢复通知（run:schedule-daemon 指纹恢复）
+        schedule._save([], {"last_scan": time.time()})
+        schedule.alert_heartbeat_if_stale()
+        assert "恢复" in sent.calls[-1]["text"], sent.calls[-1]
+    finally:
+        notify._post = orig_post
+    _clean_schedules()
+    _clean_notify()
+
+
+def test_w7_service_files_and_budget_cli():
+    """systemd/launchd 示例文件存在且含关键指令；budget CLI 的 set/status/recent。"""
+    ops_dir = Path(__file__).resolve().parent / "docs" / "ops"
+    service = (ops_dir / "opsagent-schedule.service").read_text(encoding="utf-8")
+    assert "schedule run" in service and "Restart=always" in service
+    assert "EnvironmentFile" in service
+    oneshot = (ops_dir / "opsagent-schedule-oneshot.service").read_text(encoding="utf-8")
+    assert "Type=oneshot" in oneshot and "--once" in oneshot
+    plist = (ops_dir / "com.ops-agent.schedule.plist").read_text(encoding="utf-8")
+    assert "KeepAlive" in plist and "schedule" in plist
+    timer = (ops_dir / "opsagent-schedule.timer").read_text(encoding="utf-8")
+    assert "OnCalendar" in timer
+    # budget CLI（直接调 usage 层等价路径，不经过子进程）
+    import usage
+    for name in ("usage.jsonl", "usage-state.json"):
+        (core.STATE_DIR / name).unlink(missing_ok=True)  # 前序用例可能已记账
+    usage.save_budget({"enabled": True, "daily_calls": 42, "daily_tokens": None})
+    status = usage.format_status()
+    assert "0 / 42" in status
+    usage.save_budget({"enabled": True, "daily_calls": None, "daily_tokens": None})
+    (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+
+
+def test_budget_cli_error_paths_not_nameerror():
+    """S1 回归：budget CLI 错误参数返回 1 与错误文案，不能是 NameError traceback。"""
+    import subprocess
+    import sys as sys_mod
+    state = tempfile.mkdtemp(prefix="opsx-w7-cli-")
+    env = dict(os.environ, OPSX_STATE_DIR=state)
+    opsagent = str(core.REPO_DIR / "opsagent")
+    for args in (["budget", "set", "--calls", "-1"],
+                 ["budget", "set", "--enable", "--disable"]):
+        r = subprocess.run([sys_mod.executable, opsagent, *args],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 1, (args, r.returncode, r.stdout, r.stderr)
+        assert "NameError" not in r.stderr and "Traceback" not in r.stderr, r.stderr
+        assert "错误" in r.stderr, r.stderr
+
+
+def test_budget_corrupt_files_fail_closed():
+    """M2/M4 回归：budget.json 损坏 → llm.chat 抛 LLMError（可行动文案）；
+    usage-state.json 损坏 → check_budget 抛 OpsxError，文件备份，事件留痕。"""
+    import usage
+    from agent import llm
+    # budget.json 损坏：包成 LLMError，不能 OpsxError 逃逸到交互入口
+    (core.STATE_DIR / "budget.json").write_text("{broken", encoding="utf-8")
+    try:
+        llm.chat([{"role": "user", "content": "hi"}])
+        raise AssertionError("损坏的 budget.json 必须阻断调用")
+    except llm.LLMError as e:
+        assert "budget.json" in str(e) and "重建" in str(e)
+    except core.OpsxError:
+        raise AssertionError("OpsxError 不能逃逸到 llm.chat 的调用方")
+    finally:
+        (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+    # usage-state.json 损坏：fail-closed + 备份 + 事件
+    state_file = core.STATE_DIR / "usage-state.json"
+    state_file.write_text("not-json{", encoding="utf-8")
+    usage.save_budget({"enabled": True, "daily_calls": 5, "daily_tokens": None})
+    try:
+        usage.check_budget()
+        raise AssertionError("损坏的 usage-state 必须 fail-closed")
+    except core.OpsxError as e:
+        assert "损坏" in str(e) and "备份" in str(e)
+    assert list(core.STATE_DIR.glob("usage-state.json.corrupt-*")), "损坏文件必须备份"
+    from agent import events
+    hits = [e for e in events.tail(20) if e["kind"] == "usage-state-corrupt"]
+    assert hits, "损坏必须有事件留痕"
+    # 备份后重建：record 重新记账（空状态），budget 判定恢复可用
+    usage.record("test-model", 1, 1)
+    assert usage.today()["calls"] == 1
+    (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+    for f in core.STATE_DIR.glob("usage-state.json.corrupt-*"):
+        f.unlink()
+
+
+def test_llm_retry_respects_deadline():
+    """M7 回归：deadline 裁剪单次超时与退避，累计等待不突破任务预算。"""
+    import usage
+    usage.save_budget({"enabled": True, "daily_calls": None, "daily_tokens": None})
+    from agent import llm
+    # deadline 已过：立即抛时间预算错误，不发起请求
+    called = []
+    orig_post = llm._post
+    llm._post = lambda body, timeout: (called.append(timeout), None)[1]
+    try:
+        try:
+            llm.chat([{"role": "user", "content": "hi"}],
+                     deadline=time.monotonic() - 1)
+            raise AssertionError("deadline 已过应立即失败")
+        except llm.LLMError as e:
+            assert "时间预算" in str(e)
+        assert not called, "deadline 已过时不能发起请求"
+        # deadline 只剩 5s：超时裁剪到 <=5s
+        def record_timeout(body, timeout):
+            called.append(timeout)
+            raise llm.LLMError("LLM API HTTP 429: slow down")
+
+        llm._post = record_timeout
+        orig_sleep = llm.time.sleep
+        llm.time.sleep = lambda s: None
+        try:
+            try:
+                llm.chat([{"role": "user", "content": "hi"}],
+                         deadline=time.monotonic() + 5)
+                raise AssertionError("应失败")
+            except llm.LLMError:
+                pass
+            assert all(t <= 5 for t in called), called
+        finally:
+            llm.time.sleep = orig_sleep
+    finally:
+        llm._post = orig_post
+        (core.STATE_DIR / "budget.json").unlink(missing_ok=True)
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -933,8 +933,12 @@ def _execute_run(entry: dict, model: str | None) -> dict:
             _write_run(rec)
         except OSError:
             rec["unrecorded"] = True
+    # 长任务执行期间刷心跳：慢任务（任务超时可至 900s+）不该被 doctor 误报成
+    # "调度已停"。每次尝试前都刷一次，成本可忽略。
+    _touch_heartbeat()
     for attempt in range(1, RUN_RETRIES + 2):
         attempts = attempt
+        _touch_heartbeat()
         # 每次尝试独立会话：重试不重复追加同一条 prompt，也不复用上次的半截历史
         session = first_session if attempt == 1 else sess_mod.Session()
         if attempt > 1:
@@ -950,6 +954,11 @@ def _execute_run(entry: dict, model: str | None) -> dict:
             break
         except Exception as e:  # noqa: BLE001 —— 瞬时失败有限重试；仍是只读操作
             attempt_errors.append(f"{type(e).__name__}: {e}")
+            from . import llm as llm_mod
+            if llm_mod.is_budget_exhausted(e):
+                # 预算跨天才恢复：重试只会白花钱白花时间，直接按失败收尾。
+                # 规则检查结果已在本函数前半段落盘，通知不受影响。
+                break
             if attempt <= RUN_RETRIES:
                 time.sleep(RUN_RETRY_DELAY)
     try:
@@ -999,6 +1008,68 @@ def _record_synthetic_failed(entry: dict, exc: BaseException) -> dict:
         _safe_audit("schedule-record-error", id=entry["id"], error=str(e))
     _update_entry_state(entry["id"], rec["run_id"], "failed", None, reanchor=True)
     return rec
+
+
+# 心跳阈值必须覆盖"最长单任务执行窗口"：单次 attempt 期间不刷新心跳。
+# 任务可自定义 timeout_seconds（至 86400s），固定阈值会误报——按启用任务的
+# 实际超时取最大值 + 余量，动态计算而不是常量。
+HEARTBEAT_MARGIN = 300
+_HEARTBEAT_TASK = "schedule-daemon"
+
+
+def _heartbeat_stale_after(items: list[dict]) -> int:
+    """过期阈值 = 启用任务的最大执行窗口 + 余量（自定义 timeout 的任务不能被误报）。"""
+    try:
+        longest = max((_task_timeout(it) for it in items if it.get("enabled", True)),
+                      default=DEFAULT_TASK_TIMEOUT)
+    except (ScheduleError, TypeError, ValueError):
+        longest = MAX_TASK_TIMEOUT  # 配置损坏时按最大窗口算，宁可少报
+    return longest + HEARTBEAT_MARGIN
+
+
+def daemon_health() -> dict:
+    """调度守护进程心跳：fresh / stale / never / unknown（schedules.json 损坏）。"""
+    try:
+        with _locked("schedules.mutex"):
+            items, meta = _load_state()
+    except ScheduleError as e:
+        return {"state": "unknown", "error": str(e)}
+    stale_after = _heartbeat_stale_after(items)
+    last = _meta_ts(meta, "last_scan")
+    if last <= 0:
+        return {"state": "never", "last_beat": None, "age_seconds": None,
+                "stale_after": stale_after}
+    age = int(time.time() - last)
+    return {"state": "fresh" if age <= stale_after else "stale",
+            "last_beat": _iso(last), "age_seconds": age,
+            "stale_after": stale_after}
+
+
+def _heartbeat_synthetic(ok: bool, detail: str) -> dict:
+    return {"run_id": _new_run_id(_HEARTBEAT_TASK), "task_id": _HEARTBEAT_TASK,
+            "session_id": None, "status": "succeeded" if ok else "failed",
+            "verdict": None, "error": None if ok else detail}
+
+
+def alert_heartbeat_if_stale() -> None:
+    """启动调度时检查：上次心跳已过期说明调度中断过——通过通知状态机告警（自动去重）。
+
+    告警在"心跳恢复"（下一条成功记录）时自动恢复，与 W4 的恢复通知同一套语义。
+    旁路失败（未配置通知/事件）不影响调度本身。
+    """
+    health = daemon_health()
+    try:
+        if health["state"] == "stale":
+            minutes = (health["age_seconds"] or 0) // 60
+            notify.process_run(_heartbeat_synthetic(
+                False, f"巡检调度心跳中断约 {minutes} 分钟"
+                       f"（上次心跳 {health['last_beat']}；"
+                       f"可能原因：daemon 进程退出、cron 未触发、主机休眠）"))
+        elif health["state"] == "fresh":
+            # 给状态机一条成功记录：此前若报过中断，这里触发"已恢复"通知
+            notify.process_run(_heartbeat_synthetic(True, ""))
+    except Exception:  # noqa: BLE001 —— 告警旁路不能拖垮调度
+        pass
 
 
 def _claim_due(task_id: str, now: float) -> dict | None:
@@ -1263,6 +1334,7 @@ def daemon(model: str | None = None, once: bool = False) -> int:
         if not acquired:
             print("[schedule] 已有调度进程在运行，本次未执行（退出码 3）")
             return 3  # 明确区分"没跑"与"跑完且正常"
+        alert_heartbeat_if_stale()  # 上次心跳过期 = 调度中断过，先于本轮执行告警
         interrupted = reconcile_runs(records=True)
         for rec in interrupted:
             _notify_run(rec)  # 上次的中断也要能推到人，而不是只在 --once 退出码里
@@ -1315,6 +1387,7 @@ def cli(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="opsagent schedule",
                                 description="定时巡检（无人值守只读运行，每次执行有运行记录）")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="守护进程心跳与任务总览（诊断调度是否在跑）")
     sub.add_parser("list", help="列出定时任务（含预算与最近一次状态）")
     a = sub.add_parser("add", help="添加定时任务")
     a.add_argument("prompt", help="给 agent 的巡检指令（写清只读要求）")
@@ -1341,6 +1414,29 @@ def cli(argv: list[str] | None = None) -> int:
     run.add_argument("--once", action="store_true", help="只跑当前到期任务后退出")
     args = p.parse_args(argv)
     try:
+        if args.cmd == "status":
+            health = daemon_health()
+            state_label = {"fresh": "在运行", "stale": "已过期（调度中断）",
+                           "never": "从未运行", "unknown": "无法判定"}[health["state"]]
+            print(f"心跳: {state_label}"
+                  + (f"（上次 {health['last_beat']}，{health['age_seconds']}s 前）"
+                     if health.get("last_beat") else "")
+                  + (f"｜{health['error']}" if health.get("error") else ""))
+            entries = list_entries()
+            enabled = sum(1 for e in entries if e.get("enabled", True))
+            print(f"任务: {enabled} 启用 / {len(entries)} 总计")
+            recent = list_runs(tail=5)
+            if recent:
+                print("最近运行:")
+                for rec in recent:
+                    verdict = f"，{rec['verdict']}" if rec.get("verdict") else ""
+                    print(f"  {rec['started']}  {rec.get('task_id')}  {rec['status']}{verdict}")
+            if health["state"] == "stale":
+                print("⚠ 调度心跳已过期：daemon 可能已退出。"
+                      "用 opsagent schedule run 重启，或检查 systemd/launchd 服务。")
+                return 1
+            return 0
+
         if args.cmd == "list":
             print(format_list())
             return 0

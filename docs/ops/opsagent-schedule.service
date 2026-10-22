@@ -1,0 +1,31 @@
+# systemd：常驻调度（推荐）。安装：
+#   sudo cp docs/ops/opsagent-schedule.service /etc/systemd/system/
+#   sudo cp docs/ops/opsagent-schedule.env /etc/ops-agent/env   # 填真实 key，chmod 600
+#   sudo systemctl daemon-reload && sudo systemctl enable --now opsagent-schedule
+# 排障：journalctl -u opsagent-schedule -f；体检: opsagent doctor
+[Unit]
+Description=ops-agent scheduled inspection daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 换成 opsagent 的实际路径与运行用户。
+# 注意：不设 User 会以 root 运行，%h 展开为 /root，状态目录落到 /root/.ops-agent——
+# 与你在家目录配的 targets/通知不是同一份。建议二选一：
+#   a) 取消下一行注释并改成你的用户名（状态目录 = 该用户家目录下 .ops-agent）；
+#   b) 改用用户级服务：cp 本文件到 ~/.config/systemd/user/ 后 systemctl --user enable。
+# User=yourname
+ExecStart=/usr/local/bin/opsagent schedule run
+EnvironmentFile=-/etc/ops-agent/env
+Restart=always
+RestartSec=10
+# 状态目录与通知凭据只给本人
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=%h/.ops-agent
+
+[Install]
+WantedBy=multi-user.target

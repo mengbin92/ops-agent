@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import core  # noqa: E402
 from agent import loop, repl, rpc, session as sess_mod, tools  # noqa: E402
 
 
@@ -38,6 +39,65 @@ def _print_mode(prompt: str, model: str | None) -> int:
         return 1
     print(text)
     return 0
+
+
+def _budget_cli(usage, argv: list[str]) -> int:
+    """opsagent budget：status 查看 / set 调整 / recent 最近调用。"""
+    import argparse
+    parser = argparse.ArgumentParser(prog="opsagent budget",
+                                     description="LLM 调用预算（按本机自然日滚动）")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="今日用量与上限")
+    set_p = sub.add_parser("set", help="调整预算")
+    set_p.add_argument("--calls", type=int, default=None, metavar="N",
+                       help="每日调用次数上限（0=不限）")
+    set_p.add_argument("--tokens", type=int, default=None, metavar="N",
+                       help="每日 token 上限（0=不限）")
+    set_p.add_argument("--enable", action="store_true", help="启用预算")
+    set_p.add_argument("--disable", action="store_true", help="停用预算（不限制调用）")
+    rec = sub.add_parser("recent", help="最近调用记录")
+    rec.add_argument("--tail", type=int, default=20)
+    args = parser.parse_args(argv)
+    try:
+        if args.cmd == "status":
+            print(usage.format_status())
+            return 0
+        if args.cmd == "recent":
+            if args.tail < 0:
+                raise core.OpsxError("tail 不能为负数")
+            records = usage.recent(tail=args.tail)
+            if not records:
+                print("(无调用记录)")
+                return 0
+            for r in records:
+                est = "（估）" if r.get("estimated") else ""
+                print(f"{r.get('day', '?')}  {r.get('model', '?')}  "
+                      f"{r.get('prompt_tokens', 0)}+{r.get('completion_tokens', 0)}"
+                      f" tok{est}  {r.get('source', '')}")
+            return 0
+        # set
+        cfg = usage.load_budget()
+        if args.calls is not None:
+            if args.calls < 0:
+                raise core.OpsxError("--calls 不能为负（0=不限）")
+            cfg["daily_calls"] = args.calls or None
+        if args.tokens is not None:
+            if args.tokens < 0:
+                raise core.OpsxError("--tokens 不能为负（0=不限）")
+            cfg["daily_tokens"] = args.tokens or None
+        if args.enable and args.disable:
+            raise core.OpsxError("--enable 与 --disable 二选一")
+        if args.enable:
+            cfg["enabled"] = True
+        if args.disable:
+            cfg["enabled"] = False
+        path = usage.save_budget(cfg)
+        print(f"已写入 {path}（0600）")
+        print(usage.format_status())
+        return 0
+    except core.OpsxError as e:
+        print(f"[budget] 错误: {core.redact(str(e))}", file=sys.stderr)
+        return 1
 
 
 def _events_cli(argv: list[str]) -> int:
@@ -70,11 +130,18 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["events"]:
         from agent import events
         return _events_cli(argv[1:])
+    if argv[:1] == ["doctor"]:
+        import doctor
+        return doctor.cli(argv[1:])
+    if argv[:1] == ["budget"]:
+        import usage
+        return _budget_cli(usage, argv[1:])
     p = argparse.ArgumentParser(prog="opsagent", description="ops-agent 独立运维智能体",
                                 epilog="巡检：opsagent inspect [--target all]；"
-                                       "定时：opsagent schedule [list|add|remove|run]；"
+                                       "定时：opsagent schedule [status|list|add|run]；"
                                        "通知：opsagent notify [status|test|list|retry|mute]；"
-                                       "事件：opsagent events [--tail 30]")
+                                       "事件：opsagent events [--tail 30]；"
+                                       "体检：opsagent doctor；预算：opsagent budget [status|set|recent]")
     p.add_argument("--model", help="覆盖默认模型（或设 OPSAGENT_MODEL）")
     p.add_argument("-p", "--print", dest="oneshot", metavar="PROMPT", help="单发非交互模式")
     p.add_argument("mode", nargs="?", default="chat", choices=["chat", "rpc"], help="运行形态")

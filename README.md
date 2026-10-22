@@ -211,6 +211,31 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
 
+### 体检、心跳与预算（W7）
+
+```bash
+./opsagent doctor                       # 体检：LLM/状态目录/SSH/心跳/通知逐项诊断
+./opsagent schedule status              # 调度心跳与任务总览（心跳过期退出 1）
+./opsagent budget status                # 今日调用/上限（按本机自然日滚动）
+./opsagent budget set --calls 500 --tokens 500000
+./opsagent budget recent --tail 10      # 最近调用（含 token 与"（估）"标记）
+```
+
+- **doctor**：每项检查给 ✓/⚠/✗ + 证据 + 修复建议——LLM 分"key 缺失 / 鉴权失败(401/403) /
+  限流(429) / 网络不通"；SSH 逐台探活；心跳过期（任务执行期间不刷心跳，阈值按启用任务的
+  最大超时 + 300s 计算，不会被慢任务误报）；通知渠道显示脱敏后的 endpoint 与失败待发数。
+- **provider 临时错误退避**：429/408/5xx/网络瞬断在 `llm.chat` 内重试 2 次
+  （指数退避 3s/6s + 抖动，封顶 30s），401/400 等永久错误绝不重试；
+  退避与单次超时都裁剪到任务 deadline 内，累计等待不突破任务预算；流式已输出内容后不重试
+  （防止重复推送文本）。
+- **usage/调用预算**：每次调用记账（usage.jsonl + 按日聚合）；超限立即拒绝新的 LLM 调用
+  （`BudgetExhausted`，跨天自动恢复），**确定性规则检查（inspect/场景/通知）不受影响**；
+  状态文件损坏时 fail-closed（备份 .corrupt 并报错，不静默清零）。
+- **心跳过期告警**：调度 daemon 启动/`--once` 运行时检查上次心跳；过期经通知状态机告警
+  （自动去重），恢复时自动发"已恢复"。
+- **常驻部署**：`docs/ops/` 提供 systemd service（+ timer 替代方案）与 launchd plist
+  示例，含加固指令与环境变量文件说明。
+
 ### 变更场景（W6）：预检 → 快照 → 执行 → 后验 → 回滚建议
 
 `opsx exec` 只回答"命令退出码是多少"，回答不了"变更之后服务真的健康吗"。场景把
@@ -550,18 +575,19 @@ core.py 为纯函数库；演进 MCP server / agent 内核时直接包装同一�
 独立化演进路线（流式输出、compaction、skills、子代理、远程通道）见设计文档第 5 节。
 
 已按八周排期交付：W1 安全边界 → W2 确定性巡检 → W3 可追踪运行 → W4 通知与事件 →
-W5 变更执行记录与并发控制 → W6 变更场景（预检→快照→执行→后验→回滚建议）。
+W5 变更执行记录与并发控制 → W6 变更场景 → W7 体检/心跳/预算/退避。
 状态目录新增 `runs/`（运行记录）、`reports/`（巡检与场景报告）、`signals/`（规则结果摘要）、
 `notifications/`（发件箱）、`events.jsonl`（事件时间线）、`notify.json`（通知渠道，0600）、
-`executions/`（变更执行记录）、`locks/`（目标级写锁）。这些文件都是本地事实来源，不需要数据库。
+`executions/`（变更执行记录）、`locks/`（目标级写锁）、`usage.jsonl`/`usage-state.json`/`budget.json`（调用记账与预算，0600）。这些文件都是本地事实来源，不需要数据库。
 调度、运行、通知与执行记录 JSON 用临时文件替换；JSONL 查询跳过损坏行；配置损坏会报错；
 重要状态仍应备份。
 
 2026-10-22 对照路线图复审并修复 W1–W4（`241/241`），随后交付 W5（`261/261`）、
-W6（`300/300`）：详细问题、修复与验证见
+W6（`300/300`）、W7（`309/309`）：详细问题、修复与验证见
 [W1–W4 复审记录](docs/reviews/2026-10-22-roadmap-implementation-review.md)、
 [W5 复审记录](docs/reviews/2026-10-22-week5-change-safety-review.md) 与
-[W6 复审记录](docs/reviews/2026-10-22-week6-scenario-review.md)。
+[W6 复审记录](docs/reviews/2026-10-22-week6-scenario-review.md) 与
+[W7 复审记录](docs/reviews/2026-10-22-week7-reliability-review.md)。
 
 W5 再次复审修复后：`./opsx selftest` **292/292 passed**，新增 31 项回归，
 详见[二次审查记录](docs/reviews/2026-10-22-week5-followup-review.md)。升级前请结束在途变更；

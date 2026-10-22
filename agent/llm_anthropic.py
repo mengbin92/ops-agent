@@ -202,12 +202,17 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
     return _validate_message(msg)
 
 
-def chat(messages: list[dict], tools: list[dict] | None = None,
-         model: str | None = None, timeout: int = 300, on_delta=None) -> dict:
+def chat_once(messages: list[dict], tools: list[dict] | None = None,
+              model: str | None = None, timeout: int = 300,
+              on_delta=None) -> tuple[dict, tuple[int, int] | None]:
+    """单次调用（预算/退避/记账由 llm.chat 统一负责）。
+
+    返回 (message, (input_tokens, output_tokens) | None)；流式响应无 usage 字段。
+    """
     body = _body(messages, tools, model, stream=on_delta is not None)
     try:
         if on_delta is not None:
-            return _chat_stream(body, timeout, on_delta)
+            return _chat_stream(body, timeout, on_delta), None
         with _request(_endpoint(), body, _headers(), timeout) as resp:
             data = json.loads(resp.read().decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -216,4 +221,10 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
         raise LLMError(f"LLM API 读取失败: {e}") from e
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         raise LLMError(f"LLM 流式响应格式异常: {e}") from e
-    return _message(data)
+    msg = _message(data)
+    raw_usage = data.get("usage") if isinstance(data, dict) else None
+    used = None
+    if isinstance(raw_usage, dict):
+        used = (int(raw_usage.get("input_tokens") or 0),
+                int(raw_usage.get("output_tokens") or 0))
+    return msg, used
