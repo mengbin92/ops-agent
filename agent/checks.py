@@ -75,6 +75,11 @@ MIN_BUDGET, MAX_BUDGET = 10, 3600
 PROBE_BUDGET = 60
 EVIDENCE_LIMIT = 1200       # 单条证据保留的字符数（全量输出在报告文件里）
 REPORT_KEEP = 100           # 报告文件保留份数
+# 规则检查结果的机器可读摘要（按会话落盘，供调度/通知取用；模型不可用也有值）
+SIGNAL_KEEP = 300           # 与 session.SESSION_KEEP 对齐：会话还在，摘要就还在
+SIGNAL_ANOMALY_LIMIT = 100  # 单次摘要保留的异常条目上限
+SIGNAL_OUTPUT_LIMIT = 400   # 每条异常保留的证据输出字符数
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SERVICE_KINDS = ("systemd", "docker")
 SERVICE_EXPECT = ("running", "stopped")
 # 目标条目允许的顶层字段：写错层级（如把 disk_paths 写在顶层）必须报错，不能静默生效。
@@ -797,7 +802,7 @@ def _label(item: dict) -> str:
     return core.redact("；".join([label] + extra))
 
 
-def _run_target(item: dict, groups: tuple, timeout_override) -> dict:
+def _run_target(item: dict, groups: tuple, timeout_override, deadline=None) -> dict:
     cfg = dict(item["checks"])
     cfg["disk_paths"] = list(cfg["disk_paths"])
     if timeout_override:
@@ -807,8 +812,10 @@ def _run_target(item: dict, groups: tuple, timeout_override) -> dict:
               "kind": item["kind"], "tags": list(item["tags"]),
               "env": dict(item["env"]), "label": _label(item),
               "reachable": False, "checks": []}
+    own = time.monotonic() + cfg["budget_seconds"]
     budget = {"left": PROBE_BUDGET,
-              "deadline": time.monotonic() + cfg["budget_seconds"]}
+              # 整体 deadline（调度任务预算）与单目标预算取小：预设检查不能吃掉模型时间
+              "deadline": min(own, deadline) if deadline is not None else own}
     # 平台探测与分组无关：选探针（meminfo/free、nproc/sysctl）必须先知道是什么系统。
     check, platform = _connectivity(item, cfg["timeout"], budget)
     result["reachable"] = check["status"] == OK
@@ -845,10 +852,10 @@ def _run_target(item: dict, groups: tuple, timeout_override) -> dict:
     return result
 
 
-def _safe_target(item: dict, groups: tuple, timeout_override) -> dict:
+def _safe_target(item: dict, groups: tuple, timeout_override, deadline=None) -> dict:
     """单个目标出错（解析/意外异常）不能拖垮整次巡检：降级成该目标的一条 error。"""
     try:
-        return _run_target(item, groups, timeout_override)
+        return _run_target(item, groups, timeout_override, deadline)
     except Exception as e:  # noqa: BLE001 —— 其他目标的结果仍然有价值
         return {
             "name": item["name"], "target": item["target"], "host": item["host"],
@@ -902,15 +909,19 @@ def _skipped_names(inventory: list, selected: list) -> list:
     return [t["name"] for t in inventory if not t["enabled"] and t["name"] not in chosen]
 
 
-def run_checks(targets=None, groups=None, timeout=None) -> dict:
-    """跑三组确定性检查，返回结构化报告（不调用任何模型）。"""
+def run_checks(targets=None, groups=None, timeout=None, deadline=None) -> dict:
+    """跑三组确定性检查，返回结构化报告（不调用任何模型）。
+
+    deadline 是 time.monotonic() 口径的整体时间上限（调度任务预算），
+    与每个目标自己的 budget_seconds 取小——超时后的探针记 unknown，不静默跳过。
+    """
     started = time.monotonic()
     group_list = _norm_groups(groups)
     if timeout is not None and (type(timeout) is not int or not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT):
         raise CheckError(f"timeout 须为 {MIN_TIMEOUT}-{MAX_TIMEOUT} 的整数秒")
     inventory = load_inventory()
     selected = _select(inventory, targets)
-    target_reports = [_safe_target(item, group_list, timeout) for item in selected]
+    target_reports = [_safe_target(item, group_list, timeout, deadline) for item in selected]
 
     counts = {OK: 0, WARN: 0, CRITICAL: 0, UNKNOWN: 0, ERROR: 0}
     anomalies = []
@@ -1064,6 +1075,121 @@ def save_report(slug: str, text: str) -> Path | None:
         return None
     _prune_reports()
     return path
+
+
+def _signal_dir() -> Path:
+    return core.STATE_DIR / "signals"
+
+
+def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
+    """报告 → 机器可读摘要：异常项带上证据命令与输出片段。
+
+    证据必须在这里从 checks 结构里取，而不是等模型复述——模型可能改写、遗漏，
+    甚至在提示注入下伪造路径；通知与运行记录只信这份确定性文件。
+    """
+    evidence = {}
+    for target_report in report.get("targets") or []:
+        for check in (target_report or {}).get("checks") or []:
+            if isinstance(check, dict) and check.get("id"):
+                evidence[check["id"]] = check
+    anomalies = []
+    for anomaly in report.get("anomalies") or []:
+        if not isinstance(anomaly, dict):
+            continue
+        check = evidence.get(anomaly.get("id")) or {}
+        ev = check.get("evidence") or {}
+        anomalies.append({
+            "id": anomaly.get("id"), "target": anomaly.get("target"),
+            "name": anomaly.get("name"), "status": anomaly.get("status"),
+            "line": anomaly.get("line"),
+            "command": ev.get("command"),
+            "output": (ev.get("output") or "")[:SIGNAL_OUTPUT_LIMIT],
+        })
+        if len(anomalies) >= SIGNAL_ANOMALY_LIMIT:
+            break
+    all_anomalies = report.get("anomalies") or []
+    target_verdicts = {tr.get("name"): tr.get("verdict")
+                       for tr in report.get("targets") or [] if isinstance(tr, dict)}
+    return {
+        "version": 1,
+        "created_ts": time.time(),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "report_id": report.get("report_id"),
+        "verdict": report.get("verdict"),
+        "complete": report.get("complete"),
+        "groups": report.get("groups") or [],
+        "targets": report.get("target_names") or [],
+        "target_verdicts": target_verdicts,
+        "summary": report.get("summary") or {},
+        "report_path": str(report_path) if report_path else None,
+        "anomalies": anomalies,
+        # 摘要自身也可能被 100 条上限截断：此时"没看到"不等于"不存在"，禁止判恢复
+        "truncated": len(all_anomalies) > len(anomalies),
+    }
+
+
+def save_signal(session_id: str | None, report: dict,
+                report_path: Path | str | None = None) -> Path | None:
+    """把规则检查结果按会话落盘（`~/.ops-agent/signals/<session_id>.json`）。
+
+    调度与通知用会话 id 取回这份摘要，因此"LLM 完全不可用"也不影响异常上报：
+    检查块在模型之前跑完，摘要已经在这里了。写入失败只返回 None，不影响工具结果。
+    """
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    directory = _signal_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        payload = _signal_payload(report, report_path)
+        payload["session_id"] = session_id
+        path = directory / f"{session_id}.json"
+        tmp = directory / f".{session_id}-{uuid.uuid4().hex[:6]}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(core.redact_obj(payload), handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return None
+    _prune_signals()
+    return path
+
+
+def signal_path(session_id: str) -> Path | None:
+    """摘要文件路径（供运行记录引用；非法会话 id 返回 None）。"""
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    return _signal_dir() / f"{session_id}.json"
+
+
+def load_signal(session_id: str | None) -> dict | None:
+    """按会话取回规则检查摘要；没有或损坏时返回 None（调用方退回结论文本）。"""
+    path = signal_path(session_id or "")
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    if data.get("session_id") != session_id:
+        return None
+    if not isinstance(data.get("anomalies"), list):
+        return None
+    return data
+
+
+def _prune_signals(keep: int = SIGNAL_KEEP) -> None:
+    try:
+        files = sorted(_signal_dir().glob("*.json"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for path in files[:-keep]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _explain(report_text: str, model) -> str:

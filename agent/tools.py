@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402
 import remote  # noqa: E402
 from . import checks  # noqa: E402
+from . import events as events_mod  # noqa: E402
 from . import goal as goal_mod  # noqa: E402
 from . import memory as memory_mod  # noqa: E402
 from . import schedule as schedule_mod  # noqa: E402
@@ -284,11 +285,11 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
         return f"[opsx 错误] {e}"
 
 
-SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list"})
+SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events"})
 # 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见。
 # inspect 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
 SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent",
-                             "inspect", "ops_list"})
+                             "inspect", "events", "ops_list"})
 SUBAGENT_MAX_TASKS = 4
 SUBAGENT_MAX_TURNS = 8
 WORKFLOW_PREV_LIMIT = 6000
@@ -417,12 +418,25 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
         return f"[检查错误] {e}"
     text = checks.format_report(report)
     path = checks.save_report("inspect", text)
+    # 规则结果按会话落盘：通知与运行记录据此上报"模型不可用也成立"的异常
+    checks.save_signal(ctx.session_id, report, path)
     if len(text) > OUTPUT_LIMIT:
         tail = (f"\n...[报告共 {len(text)} 字符，已截断；完整内容: {path}"
                 "（用 read 的 offset/limit 分段读取）]" if path else
                 f"\n...[报告共 {len(text)} 字符，已截断；报告未能落盘]")
         return text[:OUTPUT_LIMIT] + tail
     return f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
+
+
+def _events(args: dict, ctx: ToolContext) -> str:
+    """事件时间线查询：只读本地 events.jsonl，不触网、不调模型。"""
+    n = args.get("tail", 20)
+    if type(n) is not int or not 0 <= n <= 200:
+        return "[错误] tail 须为 0-200 的整数"
+    kind = (args.get("kind") or "").strip() or None
+    if kind and not re.fullmatch(r"[a-z][a-z0-9-]{0,40}", kind):
+        return "[错误] kind 须为小写事件类型（如 anomaly-new、notify-failed）"
+    return events_mod.format_tail(n=n, kind=kind)
 
 
 def _workflow(args: dict, ctx: ToolContext) -> str:
@@ -495,6 +509,8 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
     body = "\n\n".join(sections)
     full = f"{body}\n\n{footer}"
     path = checks.save_report(f"workflow-{name}", full)
+    if report is not None:  # 只有真跑过规则检查才有信号可写
+        checks.save_signal(ctx.session_id, report, path)
     pointer = f"[全量报告] {path}" if path else "[报告未能落盘，以上为可见内容]"
     if len(full) <= OUTPUT_LIMIT:
         return f"{full}\n\n{pointer}"
@@ -624,6 +640,18 @@ REGISTRY: dict[str, dict] = {
                                     "description": "workflow 名（workflows/*.json，可不带 .json）；省略=列目录"}},
                           []),
         "handler": _workflow, "read_only": True,
+    },
+    "events": {
+        "schema": _schema("events",
+                          "事件时间线：最近发生的异常出现/升级/提醒/恢复、通知发送/失败/静默、"
+                          "运行失败/超时/中断/错过。只读本地记录，用来回答"
+                          "\"最近有什么告警、通知发出去没有\"。",
+                          {"tail": {"type": "integer",
+                                    "description": "条数（默认 20，上限 200）"},
+                           "kind": {"type": "string",
+                                    "description": "只看某类事件，如 anomaly-new / notify-failed"}},
+                          []),
+        "handler": _events, "read_only": True,
     },
     "inspect": {
         "schema": _schema("inspect",

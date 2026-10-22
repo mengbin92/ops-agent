@@ -65,6 +65,9 @@ _SENSITIVE_FILE_PATTERNS = [
     r"(?:^|/)etc/kubernetes/[^/\s]*\.conf$",
     r"(?i)(?:^|/)private/[^/\s]+\.pem$",
     r"(?:^|/)(?:shadow|gshadow)$",
+    # 通知配置里的 webhook URL 本身就是凭据（Slack/钉钉的 path 即 token）：
+    # 0600 挡不住同 uid 的模型进程，必须按敏感文件拦截读取。
+    r"(?:^|/)\.ops-agent/notify\.json$",
 ]
 # 敏感目录：read 拒绝；命令仅在"会打印内容"时拒绝（ls -l ~/.ssh 仍可用于确认权限）。
 _SENSITIVE_DIR_PATTERNS = [
@@ -74,6 +77,9 @@ _SENSITIVE_DIR_PATTERNS = [
     r"(?i)(?:^|/)\.kube(?:/|$)",
     r"(?i)(?:^|/)\.config/gcloud(?:/|$)",
     r"(?:^|/)\.ops-agent/snapshots(?:/|$)",  # 默认状态目录：快照原件供恢复，不读进模型
+    # 整个状态目录的递归读取会顺带扫到 notify.json（webhook 凭据）。只匹配目录本身，
+    # ~/.ops-agent/reports/*.md 这类子路径不受影响（巡检报告仍要能读）。
+    r"(?:^|/)\.ops-agent/?$",
 ]
 # k8s Secret 值：默认表格/describe 不输出值，-o yaml/json/jsonpath 等会输出明文（base64）。
 _KUBECTL_GET_SECRET = re.compile(r"\bkubectl\b.*?\bget\b.*?\bsecrets?\b", re.I)
@@ -120,6 +126,29 @@ def sensitive_dir(path: str) -> bool:
     return isinstance(path, str) and any(re.search(p, path) for p in _SENSITIVE_DIR_PATTERNS)
 
 
+def _path_probes(cand: str) -> list[str]:
+    """候选路径的等价写法：原样、词法归一、去掉 glob 段后的目录。
+
+    `grep -r x ~/.ops-agent/.`、`~/.ops-agent/*`、`~/.ops-agent/n*` 指向同一目录，
+    只按原始字符串匹配会被绕过；这里把候选归一后再判。
+    """
+    out = []
+    for value in (cand, os.path.expandvars(cand)):
+        if not value:
+            continue
+        norm = os.path.normpath(value)
+        for probe in (value, norm):
+            if probe not in out:
+                out.append(probe)
+        parts = norm.split("/")
+        while parts and any(ch in parts[-1] for ch in "*?["):
+            parts.pop()
+        trimmed = "/".join(parts) or "/"
+        if trimmed not in out:
+            out.append(trimmed)
+    return out
+
+
 def sensitive_command(cmd: str, strict: bool = False) -> str | None:
     """命令入口的敏感文件限制：返回命中的路径，命中则整条命令拒绝。
 
@@ -163,12 +192,16 @@ def sensitive_command(cmd: str, strict: bool = False) -> str | None:
             if "/" not in cand and "~" not in cand and not os.path.isfile(
                     os.path.expanduser(cand)) and not strict:
                 continue
-            if sensitive_path(cand):
-                return cand
-            if not strict and sensitive_path(os.path.realpath(os.path.expanduser(cand))):
-                return cand  # 符号链接指向凭据文件
-            if readers and sensitive_dir(cand):
-                return cand
+            for probe in _path_probes(cand):
+                if sensitive_path(probe):
+                    return cand
+                expanded = os.path.expanduser(probe)
+                real = os.path.realpath(expanded)
+                if real != probe and sensitive_path(real):
+                    return cand  # 符号链接/相对路径最终指向凭据文件
+                if readers and (sensitive_dir(probe) or sensitive_dir(real)):
+                    return cand
+                    # 目录规则也要看 realpath：cd 到软链目录再 cat 同样不该放行
     return None
 
 

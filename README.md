@@ -148,6 +148,7 @@ agent——没有可回答问题的人，因此只读排查，写操作会被守
 
 ```bash
 ./opsagent schedule add --daily 09:00 "只读巡检磁盘/内存/服务，异常给建议"
+./opsagent schedule add --daily 09:00 --checks all "解读规则检查结果并给出处理建议"
 ./opsagent schedule add --every 1800 --timeout 600 "检查 nginx 错误日志"
 ./opsagent schedule list              # 含预算与最近一次状态（成功/失败/超时/中断）
 ./opsagent schedule pause <id>        # 暂停：到期不跑；恢复后从当前时间重新起算，不补跑
@@ -157,6 +158,10 @@ agent——没有可回答问题的人，因此只读排查，写操作会被守
 ./opsagent schedule run               # 守护进程（同一时刻只允许一个，flock 防双开）
 ./opsagent schedule run --once        # 适合 cron：*/5 * * * * ... schedule run --once
 ```
+
+`--checks all`（或 `--checks web1 --checks-group resources`）声明**任务级规则检查**：每轮先在
+调用模型之前跑确定性探针，结果直接落 signal 与报告，模型只负责解读。这样即使 LLM 从第一轮
+就不可用（鉴权失败/断网），规则异常仍然会上报、仍然会通知。
 
 agent 里也可以直接说"每天九点巡检一次"，模型用 `schedule` 工具登记（list / runs / add /
 pause / resume / remove）。每次执行写审计（`schedule-run`，含状态与结论摘要），注册表的
@@ -190,6 +195,49 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   中途被 kill 时，排队中的任务仍是到期状态，下一轮会补上（不会被静默跳过）。
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
+
+### 通知与事件（W4）
+
+一条命令配好出口，之后异常由程序自动推；模型不参与"要不要通知"的判断。
+
+```bash
+./opsagent notify setup --url https://hooks.slack.com/services/T0/B0/xxxx \
+    --format slack --quiet-hours 23:00-07:00   # 也支持 feishu / dingtalk / generic
+./opsagent notify test                 # 发一条测试消息（不受静默影响）
+./opsagent notify status               # 渠道、发件箱统计、待重试条数（URL 只显示到主机）
+./opsagent notify list --status failed # 失败通知与下次重试时间
+./opsagent notify retry                # 立即重试（daemon 每轮也会自动重试）
+./opsagent notify mute --for 2h        # 全静默（异常也不发，仍记事件）
+./opsagent notify unmute
+./opsagent events --tail 30            # 事件时间线
+./opsagent events --kind notify-failed
+```
+
+**去重、恢复与静默**：每条异常按 fingerprint（检查项 id / 任务 id）记状态，只在四种情况发
+消息——新出现、级别升级、超过提醒间隔（`--renotify`，默认 6 小时）、恢复。一次运行最多
+**一条**消息，把本次所有新异常聚合成一条；同一持续异常不会每轮刷屏。
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `renotify_after` | 6 小时 | 同一异常再次提醒的最小间隔 |
+| `quiet_hours` | 无 | 静默时段（只压警告/恢复；**异常与"不可采集"仍然发送**） |
+| `mute_until` | 0 | 全静默：**连异常一起压**，只写事件与发件箱，可用 `notify mute` 设置 |
+| `enabled` | true | 总开关；停用等于不发送（事件照记） |
+| `timeout_seconds` | 8 | 单次 webhook 超时（3–30） |
+
+- **恢复通知**只在"本次确实检查过该目标、且采集完整"时才发：只查 `web1` 的报告不会把
+  `db1` 的旧告警清成已恢复；采集不完整就保持沉默，不猜。
+- **失败可查可重试**：发送失败落 `~/.ops-agent/notifications/<id>.json`（失败原因、HTTP 状态、
+  下次重试时间），daemon 每轮最多重试 5 条，指数退避（1min 起，上限 1h，最多 5 次）。已恢复
+  的旧告警标记 `superseded` 不再补发，避免"先收到恢复、又收到告警"。
+- **事件时间线**：`~/.ops-agent/events.jsonl`（0600，5MB 轮转一次，轮转后仍可 `--tail` 回看）。
+  只记状态变化：异常出现/升级/提醒/恢复、通知发送/失败/静默、运行失败/中断/错过，不记每次
+  正常巡检——否则时间线会变成第二个日志洪水。
+- **关联证据与会话**：消息里带 `run_id`、`session_id`（可 `/resume` 回看）、报告路径，以及每条
+  异常的探针命令与输出片段；`schedule runs` 也会显示该次运行的通知状态。
+- **凭据**：webhook URL 的 path 往往就是 token。`notify.json` 0600，事件/发件箱/审计只存
+  `scheme://host/…`；`read` 与 `bash` 读取 `notify.json` 或整个状态目录会被拒绝。走系统代理
+  （`http_proxy`/`https_proxy`），内网 webhook 需要设 `no_proxy`。
 
 **长目标（goal）**：在 REPL 里让 agent 推进多步目标（"排查到定位为止""升级并验证完"）。
 每轮结束后按目标状态自动续跑，默认最多 6 轮（`max_rounds` 可调，上限 20），完成后自动停。
@@ -298,8 +346,10 @@ API 完全不可用时 workflow 的规则结果照常产出。
 **敏感文件读取限制**：`read` 直接拒绝私钥（`id_rsa`/`id_ed25519`/`*.key`/`*.p12` 等）、
 `.env`（`.example`/`.sample`/`.template` 除外）、`.netrc`、`.kube/config`、
 `/etc/kubernetes/*.conf`、`/etc/ssh/ssh_host_*_key`、`/etc/ssl/private/*.pem`、
-`.aws/credentials`、`.docker/config.json`、`.config/gcloud/`、`/etc/shadow`
-与 `.ssh`/`.aws`/`.kube`/`.gnupg` 目录；命令入口（`opsx check`、hook、bash 工具、`opsx exec`）
+`.aws/credentials`、`.docker/config.json`、`.config/gcloud/`、`/etc/shadow`、
+`~/.ops-agent/notify.json`（webhook URL 即凭据，0600 也挡不住同 uid 的模型进程）
+与 `.ssh`/`.aws`/`.kube`/`.gnupg` 及整个 `~/.ops-agent` 目录（递归读取会顺带扫到
+`notify.json`；`~/.ops-agent/reports/` 下的报告仍可读）；命令入口（`opsx check`、hook、bash 工具、`opsx exec`）
 对引用这些文件或读取敏感目录内容的命令一律拒绝（`cat ~/.ssh/id_rsa`、经符号链接指向的私钥、
 `ssh host "cat id_rsa"` 的内层命令、远程命令里的裸 `id_rsa` 都覆盖）；`kubectl get secret
 -o yaml/json/jsonpath`（会把 Secret 值输出成明文）同样拒绝，`-o name` 与默认表格、`describe`
@@ -400,3 +450,8 @@ hook 允许直接调用本仓库的 `opsx`（或 Python + 本仓库脚本），�
 
 core.py 为纯函数库；演进 MCP server / agent 内核时直接包装同一组函数，状态目录布局即对外契约。
 独立化演进路线（流式输出、compaction、skills、子代理、远程通道）见设计文档第 5 节。
+
+已按八周排期交付：W1 安全边界 → W2 确定性巡检 → W3 可追踪运行 → W4 通知与事件。状态目录新增
+`runs/`（运行记录）、`reports/`（巡检报告）、`signals/`（规则结果摘要）、`notifications/`
+（发件箱）、`events.jsonl`（事件时间线）、`notify.json`（通知渠道，0600）。这些文件都是本地
+事实来源：不需要数据库，损坏时最多丢最后一行记录。

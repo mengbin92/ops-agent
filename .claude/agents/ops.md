@@ -80,6 +80,12 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
 
 每次变更执行后必须报告：执行的命令、退出码、snapshot_id、回滚命令。审计日志由 opsx 自动写入。
 
+## 告警与事件
+
+- 问"最近有什么告警 / 上次告警恢复没有 / 通知发出去了吗"用 `events`（只读时间线）。
+- 通知由定时任务自动发送，模型没有发通知的工具；需要改配置、重试失败通知或静默时，
+  让用户执行 `opsagent notify status|test|list|retry|mute --for 2h`。
+
 ## 输出
 
 - 默认使用中文。

@@ -1801,7 +1801,8 @@ def test_subagent_parallel_and_readonly():
     assert "只读上下文" in agent_tools.dispatch(
         "ops_exec", {"command": "systemctl restart x"}, sub_ctx)
     names = {s["function"]["name"] for s in agent_tools.tool_schemas(sub_ctx)}
-    assert names == {"bash", "read", "skill", "ops_list"}
+    # events 是只读时间线查询（W4），与 bash/read 同级；写工具仍不可见。
+    assert names == {"bash", "read", "skill", "events", "ops_list"}
     assert "subagent" not in names  # 不能继续嵌套派生
     # 空任务 / 超量
     assert "[错误]" in agent_tools.dispatch("subagent", {"tasks": []}, agent_tools.ToolContext())
@@ -4230,6 +4231,1163 @@ def test_schedule_interval_accepts_integral_float():
             raise AssertionError(f"应拒绝: {bad!r}")
         except schedule.ScheduleError:
             pass
+
+
+def _clean_notify():
+    """清掉通知/信号/事件状态：通知测试与调度测试互不污染。
+
+    事件也要清：否则"有没有写事件"的断言可能被前一个用例残留的事件蒙对。
+    """
+    import shutil
+    for name in ("notify.json", "notify-state.json", "notify-config-error.ts",
+                 "events.jsonl", "events.jsonl.1"):
+        (core.STATE_DIR / name).unlink(missing_ok=True)
+    for sub in ("notifications", "signals"):
+        shutil.rmtree(core.STATE_DIR / sub, ignore_errors=True)
+
+
+def _notify_setup(**over):
+    from agent import notify
+    payload = {"channel": "webhook",
+               "url": "https://hooks.example.com/services/T/B/SECRET",
+               "format": "generic"}
+    payload.update(over)
+    return notify.save_config(payload)
+
+
+class _FakePost:
+    """替身 _post：记录载荷，可按需失败。不发真实请求（自检不联网）。"""
+
+    def __init__(self, status=200, body="ok", error=None):
+        self.calls, self.status, self.body, self.error = [], status, body, error
+
+    def __call__(self, url, payload, timeout):
+        if self.error:
+            from agent import notify
+            raise notify.NotifyError(self.error)
+        self.calls.append(payload)
+        return self.status, self.body
+
+
+def _payload_text(payload: dict) -> str:
+    """四种 webhook 载荷里取纯文本（钉钉的 text 是对象，不是字符串）。"""
+    text = payload.get("text")
+    if isinstance(text, str):
+        return text
+    if isinstance(text, dict):
+        return text.get("content") or ""
+    return (payload.get("content") or {}).get("text") or ""
+
+
+def _anomaly(**over):
+    item = {"id": "web1/resources/磁盘 /data", "target": "web1", "name": "磁盘 /data",
+            "status": "critical", "line": "[critical] 磁盘 /data：/data 已用 96.0%",
+            "command": "df -P -k -- /data", "output": "/dev/vdb 1000 960 40 96% /data"}
+    item.update(over)
+    return item
+
+
+def _report_with(anomalies, complete=True, verdict=None):
+    if verdict is None:
+        verdict = ("异常" if any(a["status"] == "critical" for a in anomalies)
+                   else ("警告" if anomalies else "正常"))
+    targets = {}
+    for a in anomalies:
+        targets.setdefault(a["target"], {"name": a["target"], "label": a["target"],
+                                         "checks": [], "verdict": "异常",
+                                         "reachable": True, "platform": "Linux"})
+        targets[a["target"]]["checks"].append({
+            "id": a["id"], "target": a["target"], "group": "resources",
+            "name": a["name"], "status": a["status"], "display": a["status"],
+            "value": 96.0, "unit": "%", "threshold": "警告 85% / 异常 95%",
+            "detail": a["line"], "sampled_at": "2026-10-22 10:00:00",
+            "evidence": {"command": a.get("command"), "exit": 0, "output": a.get("output")}})
+    # 与 checks.run_checks 的真实报告同形：format_report 会读这些字段
+    return {"report_id": "R-test", "generated_at": "2026-10-22 10:00:00",
+            "duration_ms": 12, "mode": "rules-only",
+            "verdict": verdict, "complete": complete,
+            "groups": ["connectivity", "resources", "services"],
+            "coverage": {"groups_skipped": [], "targets_skipped": [],
+                         "groups_requested": ["connectivity", "resources", "services"],
+                         "targets_requested": ["all"]},
+            "target_names": sorted(targets) or ["web1"],
+            "summary": {"targets": len(targets) or 1, "checks": 6,
+                        "ok": max(0, 6 - len(anomalies)),
+                        "warn": 0, "critical": len(anomalies), "unknown": 0, "error": 0},
+            "targets": list(targets.values()), "anomalies": anomalies}
+
+
+def _rec_with_signal(report, status="succeeded", verdict=None, session="sess-sig-1"):
+    """构造一条与真实运行记录同形的记录（含 checks 信号落盘）。"""
+    from agent import checks
+    path = checks.save_signal(session, report, None)
+    return {"run_id": "run-1", "task_id": "sch-t1", "session_id": session,
+            "status": status, "verdict": verdict if verdict is not None else report["verdict"],
+            "signal_path": str(path) if path else None,
+            "rules_verdict": report.get("verdict"),
+            "rules_complete": report.get("complete"),
+            "anomalies": [{"id": a["id"], "target": a["target"], "name": a["name"],
+                           "status": a["status"], "line": a["line"],
+                           "command": a.get("command"), "output": a.get("output")}
+                          for a in report.get("anomalies") or []]}
+
+
+def test_notify_config_validation():
+    """配置是凭据入口：只允许 https（本机回环可 http）、拒绝内嵌凭据与未知字段。"""
+    from agent import notify
+    _clean_notify()
+    cases = [
+        ({"url": "http://example.com/hook"}, "https"),
+        ({"url": "ftp://example.com/x"}, "https"),
+        ({"url": "https://u:p@example.com/x"}, "用户名"),
+        ({"url": "https://example.com/a b"}, "空白"),
+        ({"url": ""}, "url"),
+        ({"format": "telegram"}, "format"),
+        ({"timeout_seconds": 60}, "timeout_seconds"),
+        ({"renotify_after": 10}, "renotify_after"),
+        ({"quiet_hours": "25:00-07:00"}, "quiet_hours"),
+        ({"quiet_hours": "08:00-08:00"}, "不能相同"),
+        ({"enabled": "yes"}, "enabled"),
+        ({"webhook": "x"}, "未知配置字段"),
+        ({"channel": "email"}, "channel"),
+    ]
+    for over, needle in cases:
+        payload = {"channel": "webhook", "url": "https://hooks.example.com/x"}
+        payload.update(over)
+        try:
+            notify.save_config(payload)
+            raise AssertionError(f"应拒绝: {over}")
+        except notify.NotifyError as e:
+            assert needle in str(e), (over, e)
+    cfg = _notify_setup()
+    path = core.STATE_DIR / "notify.json"
+    assert oct(path.stat().st_mode)[-3:] == "600"
+    shown = notify.describe_config(cfg)
+    assert "SECRET" not in shown and "hooks.example.com" in shown
+    assert notify.redact_endpoint("https://h.example.com:8443/a/b?x=1") == \
+        "https://h.example.com:8443/…"
+    assert notify.describe_config({}).startswith("未配置")
+    _clean_notify()
+
+
+def test_notify_payload_formats():
+    """四种 webhook 载荷形状 + 文本里必须带证据命令。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        for fmt, check in (
+                ("slack", lambda p: set(p) == {"text"}),
+                ("feishu", lambda p: p["msg_type"] == "text" and "text" in p["content"]),
+                ("dingtalk", lambda p: p["msgtype"] == "text" and "content" in p["text"]),
+                ("generic", lambda p: p["event"] == "ops-agent" and p["run_id"] == "run-1"
+                                      and p["items"] and p["severity"] == "critical")):
+            _clean_notify()
+            _notify_setup(format=fmt)
+            out = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+            assert out["notification"]["status"] == "sent", (fmt, out)
+            payload = sent.calls[-1]
+            assert check(payload), (fmt, payload)
+            text = _payload_text(payload)
+            assert "[异常]" in text and "df -P -k -- /data" in text, (fmt, text)
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_dedup_and_reminder():
+    """同一持续异常只提醒一次；到提醒间隔才再发一条（不刷屏也不静默）。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup(renotify_after=300)
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        first = notify.process_run(rec)
+        assert first["actions"]["new"] == 1 and len(sent.calls) == 1
+        again = notify.process_run(rec)
+        assert again["actions"]["suppressed"] == 1 and again["notification"] is None
+        assert len(sent.calls) == 1, "同一异常不应重复发送"
+        state = notify._load_state()
+        for entry in state["items"].values():
+            entry["notified_at"] = time.time() - 400
+        notify._save_state(state)
+        third = notify.process_run(rec)
+        assert third["actions"]["reminder"] == 1 and len(sent.calls) == 2
+        assert third["notification"]["title"].startswith("巡检")
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_escalation_is_sent():
+    """级别升级（警告 → 异常）必须立即发，不能被去重窗口吞掉。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        warn = _anomaly(status="warn", line="[warn] 磁盘 /data：已用 88%")
+        assert notify.process_run(_rec_with_signal(_report_with([warn])))["actions"]["new"] == 1
+        assert len(sent.calls) == 1
+        crit = _anomaly(status="critical")
+        out = notify.process_run(_rec_with_signal(_report_with([crit])))
+        assert out["actions"]["escalated"] == 1 and len(sent.calls) == 2
+        assert "[异常]" in sent.calls[-1]["text"]
+        assert out["notification"]["severity"] == "critical"
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_recovery_only_when_complete():
+    """恢复通知只在"采集完整且该项不再异常"时发；不完整不能当作已恢复。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        assert len(sent.calls) == 1
+        # 采集不完整：即使这次没看到异常项，也不能断言恢复。
+        # （"解读不完整"本身会作为一条任务级警告提醒一次——这是有意的降级信号。）
+        incomplete = _rec_with_signal(_report_with([], complete=False, verdict="不完整"),
+                                      verdict="不完整")
+        out_incomplete = notify.process_run(incomplete)
+        assert out_incomplete["actions"]["recovered"] == 0
+        items = (out_incomplete["notification"] or {}).get("items") or []
+        assert not any(i["fingerprint"].startswith("check:") for i in items), items
+        state = notify._load_state()
+        assert state["items"]["check:web1/resources/磁盘 /data"]["severity"] == "critical"
+        sent_before = len(sent.calls)
+        # 完整且干净：发恢复通知
+        ok = _rec_with_signal(_report_with([], complete=True, verdict="正常"), verdict="正常")
+        out = notify.process_run(ok)
+        # 两条历史项都该恢复：规则检查项 + 上一步"解读不完整"的任务级项
+        recovered = {r["fingerprint"] for r in out["notification"]["recoveries"]}
+        assert recovered == {"check:web1/resources/磁盘 /data", "task:sch-t1"}, recovered
+        assert out["notification"]["severity"] == "info"
+        assert "恢复" in sent.calls[-1]["text"] and len(sent.calls) == sent_before + 1
+        # 再跑一次不应重复发恢复
+        assert notify.process_run(ok)["notification"] is None
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_mute_suppresses_then_rearms():
+    """静默期内不发也不丢状态；解除静默后下一次巡检会重新提醒。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup(mute_until=time.time() + 3600)
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        out = notify.process_run(rec)
+        assert out["notification"]["status"] == "muted"
+        assert out["notification"]["muted_reason"] == "muted"
+        assert sent.calls == [], "静默期不能真的发出去"
+        assert len(notify.list_notifications(status="muted")) == 1
+        # 同一批异常静默期内只记一条 muted 记录
+        notify.process_run(rec)
+        assert len(notify.list_notifications(status="muted")) == 1
+        cfg = notify.load_config()
+        cfg["mute_until"] = 0
+        notify.save_config({k: cfg[k] for k in notify.CONFIG_FIELDS})
+        again = notify.process_run(rec)
+        assert again["notification"]["status"] == "sent" and len(sent.calls) == 1
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_quiet_hours_holds_warning_not_critical():
+    """静默时段只压警告；异常仍要能把人叫起来（否则静默等于关监控）。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    lt = time.localtime()
+    start, end = (lt.tm_hour - 1) % 24, (lt.tm_hour + 1) % 24
+    quiet = f"{start:02d}:00-{end:02d}:00"
+    try:
+        _clean_notify()
+        _notify_setup(quiet_hours=quiet)
+        warn = _anomaly(status="warn")
+        out = notify.process_run(_rec_with_signal(_report_with([warn])))
+        assert out["notification"]["status"] == "muted"
+        assert out["notification"]["muted_reason"] == "quiet_hours"
+        assert sent.calls == []
+        crit = _anomaly(id="web1/resources/内存", name="内存")
+        out2 = notify.process_run(_rec_with_signal(_report_with([crit])))
+        assert out2["notification"]["status"] == "sent" and len(sent.calls) == 1
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_failure_recorded_and_retried():
+    """发送失败要落库可查、按退避重试，重试成功后状态变 sent。"""
+    from agent import notify
+    orig = notify._post
+    notify._post = _FakePost(error="Connection refused")
+    try:
+        _clean_notify()
+        _notify_setup()
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        out = notify.process_run(rec)
+        notif = out["notification"]
+        assert notif["status"] == "failed" and notif["attempts"] == 1
+        assert "Connection refused" in notif["last_error"]
+        assert notif["next_attempt_ts"] > time.time() + 30, "失败后要退避，不能立即重试风暴"
+        assert notify.retry_pending() == [], "未到退避时间不应重试"
+        assert "failed" in notify.format_notifications()
+        assert notify.status()["pending"] == 1
+        pending = notify.list_notifications(status="failed")[0]
+        pending["next_attempt_ts"] = 0
+        notify._write_notification(pending)
+        notify._post = _FakePost()
+        done = notify.retry_pending(limit=5)
+        assert [d["status"] for d in done] == ["sent"] and done[0]["attempts"] == 2
+        assert notify.list_notifications(status="sent")
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_one_message_per_run():
+    """一次运行多个新异常 → 一条消息（刷屏的主要来源是每条异常发一次）。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        anomalies = [_anomaly(id=f"web{i}/resources/磁盘 /data", target=f"web{i}",
+                              name=f"磁盘 /data{i}") for i in range(3)]
+        out = notify.process_run(_rec_with_signal(_report_with(anomalies)))
+        assert len(sent.calls) == 1
+        text = sent.calls[0]["text"]
+        assert text.count("[异常]") == 3 and "共 3 项" not in text
+        assert out["notification"]["severity"] == "critical"
+        assert len(out["notification"]["items"]) == 3
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_unconfigured_keeps_events():
+    """没配渠道也要留事件：通知是出口，不是唯一的记录。"""
+    from agent import events, notify
+    _clean_notify()
+    out = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+    assert out["notification"] is None and out["actions"]["new"] == 1
+    assert notify.list_notifications() == []
+    assert any(r["kind"] == "anomaly-new" for r in events.tail(10))
+    _clean_notify()
+
+
+def test_notify_endpoint_not_leaked():
+    """webhook 的 path 就是凭据：事件与发件箱只能有脱敏后的 endpoint。"""
+    from agent import events, notify
+    orig = notify._post
+    notify._post = _FakePost()
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        outbox = "\n".join(p.read_text(encoding="utf-8")
+                           for p in (core.STATE_DIR / "notifications").glob("*.json"))
+        timeline = (core.STATE_DIR / "events.jsonl").read_text(encoding="utf-8")
+        assert "SECRET" not in outbox and "SECRET" not in timeline
+        assert notify.list_notifications()[0]["endpoint"] == "https://hooks.example.com/…"
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_cli_setup_status_and_errors():
+    """CLI 输出不能回显凭据；配置错误按 1 退出；test 子命令要真的走发送路径。"""
+    from agent import notify
+    _clean_notify()
+    orig = notify._post
+    notify._post = _FakePost()
+    saved_out, saved_err = sys.stdout, sys.stderr
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout, sys.stderr = out, err
+        codes = [
+            notify.cli(["setup", "--url", "https://hooks.example.com/services/T/B/SECRET",
+                        "--format", "slack"]),
+            notify.cli(["status"]),
+            notify.cli(["test"]),
+            notify.cli(["mute", "--for", "2h"]),
+            notify.cli(["list"]),
+        ]
+        bad = notify.cli(["setup", "--url", "http://example.com/hook"])
+        too_long = notify.cli(["mute", "--for", "9999d"])
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+        notify._post = orig
+    text = out.getvalue()
+    assert codes == [0, 0, 0, 0, 0], codes
+    assert "SECRET" not in text and "hooks.example.com" in text
+    assert "已发送" in text and "静默至" in text
+    assert bad == 1 and "https" in err.getvalue()
+    assert too_long == 1, "静默时长要有上限"
+    assert notify.list_notifications(status="sent"), "test 通知应落发件箱"
+    _clean_notify()
+
+
+def test_events_timeline_append_tail_and_rotate():
+    """时间线：倒序 tail、按类型过滤、坏行跳过、0600、按大小轮转。"""
+    from agent import events
+    for name in ("events.jsonl", "events.jsonl.1"):
+        (core.STATE_DIR / name).unlink(missing_ok=True)
+    assert events.append("anomaly-new", title="磁盘 96%", task="sch-1")
+    events.append("notify-sent", title="已发送")
+    assert [r["kind"] for r in events.tail(2)] == ["notify-sent", "anomaly-new"]
+    assert len(events.tail(10, kind="anomaly-new")) == 1
+    assert "磁盘 96%" in events.format_tail(2)
+    with open(core.STATE_DIR / "events.jsonl", "a", encoding="utf-8") as handle:
+        handle.write("{broken\n")
+    assert len(events.tail(5)) == 2          # 坏行被跳过，不影响已有事件
+    assert oct((core.STATE_DIR / "events.jsonl").stat().st_mode)[-3:] == "600"
+    orig = events.MAX_BYTES
+    events.MAX_BYTES = 1
+    try:
+        events.append("anomaly-recovered", title="恢复")
+    finally:
+        events.MAX_BYTES = orig
+    assert (core.STATE_DIR / "events.jsonl.1").is_file()
+    try:
+        events.append("Bad Kind!", title="x")
+        raise AssertionError("非法事件类型应拒绝")
+    except ValueError:
+        pass
+
+
+def test_notify_state_pruned_but_open_kept():
+    """恢复/沉默超过 30 天的 fingerprint 清掉；仍异常的无论多久都保留。"""
+    from agent import notify
+    now = time.time()
+    state = {"version": 1, "items": {
+        "check:old-recovered": {"severity": None, "last_seen": now - 40 * 86400},
+        "check:still-bad": {"severity": "critical", "last_seen": now - 40 * 86400},
+        "check:fresh": {"severity": None, "last_seen": now},
+        "check:garbage": "not-a-dict",
+    }}
+    notify._prune_state(state, now)
+    assert set(state["items"]) == {"check:still-bad", "check:fresh"}
+
+
+def test_notify_duration_and_quiet_hours():
+    from agent import notify
+    assert notify.parse_duration("30m") == 1800
+    assert notify.parse_duration("2h") == 7200
+    assert notify.parse_duration("7d") == 604800
+    assert notify.parse_duration("900s") == 900
+    for bad in ("0m", "2h30m", "", "-1h", None):
+        try:
+            notify.parse_duration(bad)
+            raise AssertionError(f"应拒绝: {bad!r}")
+        except notify.NotifyError:
+            pass
+    assert notify.in_quiet_hours(None, time.time()) is False
+    lt = time.localtime()
+    night = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 23, 30, 0, 0, 0, -1))
+    noon = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 12, 0, 0, 0, 0, -1))
+    assert notify.in_quiet_hours("23:00-07:00", night) is True
+    assert notify.in_quiet_hours("23:00-07:00", noon) is False
+    assert notify.in_quiet_hours("09:00-18:00", noon) is True
+
+
+def test_checks_signal_roundtrip_and_validation():
+    """信号按会话落盘（0600），会话/版本不匹配一律拒绝。"""
+    from agent import checks
+    _clean_notify()
+    assert checks.save_signal("bad id!", _report_with([])) is None
+    assert checks.save_signal(None, _report_with([])) is None
+    assert checks.load_signal(None) is None
+    path = checks.save_signal("sess-sig-1", _report_with([_anomaly()]), "/tmp/report.md")
+    assert path and oct(path.stat().st_mode)[-3:] == "600"
+    signal = checks.load_signal("sess-sig-1")
+    assert signal["complete"] is True and signal["report_path"] == "/tmp/report.md"
+    assert signal["anomalies"][0]["command"] == "df -P -k -- /data"
+    assert "96%" in signal["anomalies"][0]["output"]
+    path.write_text(json.dumps(dict(signal, session_id="other")), encoding="utf-8")
+    assert checks.load_signal("sess-sig-1") is None
+    path.write_text(json.dumps(dict(signal, version=2)), encoding="utf-8")
+    assert checks.load_signal("sess-sig-1") is None
+    path.write_text("{broken", encoding="utf-8")
+    assert checks.load_signal("sess-sig-1") is None
+    _clean_notify()
+
+
+def test_notify_llm_down_reports_rule_anomalies():
+    """验收核心：LLM 从第一轮就不可用，规则检查（先于模型运行）的异常仍能发出去。
+
+    这里刻意让 _run_entry 在任何工具调用之前就抛错——不依赖模型先成功调用 inspect。
+    """
+    from agent import checks, notify, schedule
+    _clean_notify()
+    _clean_schedules()
+    sent = _FakePost()
+    report = _report_with([_anomaly()])
+    orig = (notify._post, schedule._run_entry, checks.run_checks)
+
+    def fake_checks(targets=None, groups=None, timeout=None, deadline=None):
+        return report
+
+    def fake_entry(entry, model, session=None, deadline=None, extra=""):
+        assert "规则检查" in extra, "模型之前必须先跑规则检查"
+        raise ConnectionError("LLM 401 invalid api key: sk-live-ABCDEFGHIJKLMNOPQRST")
+
+    notify._post = sent
+    schedule._run_entry = fake_entry
+    checks.run_checks = fake_checks
+    try:
+        _notify_setup()
+        schedule.add("每日巡检", every_seconds=60, checks_target="all")
+        items = schedule.list_entries()
+        items[0]["next_run"] = time.time() - 1
+        schedule._save(items)
+        records = schedule.run_due()
+    finally:
+        notify._post, schedule._run_entry, checks.run_checks = orig
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["status"] == "failed", rec["status"]
+    assert len(rec["anomalies"]) == 1 and rec["signal_path"]
+    assert rec["notify_status"] == "sent" and rec["notification_id"]
+    text = sent.calls[0]["text"]
+    assert "df -P -k -- /data" in text and "web1 磁盘 /data" in text
+    assert "sk-live" not in text and "[已脱敏]" in text
+    assert rec["session_id"] in text
+    assert "通知:" in schedule.format_runs()
+    assert "规则检查 all" in schedule.format_list()
+    # 即使运行记录被截断/进程被杀，也要能按会话取回完整摘要
+    signal = notify._signal_from_record(rec)
+    assert signal and signal["anomalies"], signal
+    _clean_schedules()
+    _clean_notify()
+
+
+def test_notify_missed_and_interrupted_are_notified():
+    """错过与中断是"没人在看"的盲区，必须能推到人。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        missed = notify.process_run({"run_id": "r-m", "task_id": "sch-m", "status": "missed",
+                                     "error": "遗忘 5 个应执行时点"})
+        assert missed["notification"]["severity"] == "warning"
+        assert "错过" in sent.calls[-1]["text"]
+        interrupted = notify.process_run({"run_id": "r-i", "task_id": "sch-i",
+                                          "status": "interrupted", "error": "进程退出"})
+        assert interrupted["notification"]["severity"] == "critical"
+        assert "中断" in sent.calls[-1]["text"]
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_events_tool_is_readonly_and_bounded():
+    """events 是只读工具（无人值守可见）；模型没有发通知的工具，避免被告警刷屏。"""
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext(allowed=agent_tools.SCHEDULED_TOOLS)
+    out = agent_tools.dispatch("events", {"tail": 3}, ctx)
+    assert isinstance(out, str) and out
+    assert "[错误]" in agent_tools.dispatch("events", {"tail": -1}, ctx)
+    assert "[错误]" in agent_tools.dispatch("events", {"kind": "Bad Kind"}, ctx)
+    names = {s["function"]["name"] for s in agent_tools.tool_schemas(ctx)}
+    assert "events" in names and "notify" not in names
+
+
+def test_notify_subset_target_cannot_recover_other_target():
+    """只查 web1 的报告不能证明 db1 恢复：否则会误报"已恢复"，比漏报更危险。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        db = _anomaly(id="db1/resources/磁盘 /data", target="db1", name="磁盘 /data")
+        notify.process_run(_rec_with_signal(_report_with([db])))
+        assert len(sent.calls) == 1
+        # 另一个目标（web1）检查完整且干净，但根本没查 db1
+        web_ok = _report_with([], complete=True, verdict="正常")
+        web_ok["target_names"] = ["web1"]
+        web_ok["targets"] = [{"name": "web1", "label": "web1", "checks": [],
+                              "verdict": "正常", "reachable": True, "platform": "Linux"}]
+        out = notify.process_run(_rec_with_signal(web_ok, session="sess-web1",
+                                                  verdict="正常"))
+        assert out["actions"]["recovered"] == 0, out["actions"]
+        assert out["notification"] is None
+        state = notify._load_state()
+        assert state["items"]["check:db1/resources/磁盘 /data"]["severity"] == "critical"
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_truncated_anomalies_never_recover():
+    """>20 条异常时运行记录只留前 20 条，但恢复判定必须用完整摘要；
+    摘要文件没了（truncated）就禁止判定恢复。"""
+    from agent import checks, schedule, notify
+    _clean_notify()
+    anomalies = [_anomaly(id=f"web{i}/resources/磁盘 /x{i}", target=f"web{i}",
+                          name=f"磁盘 /x{i}") for i in range(25)]
+    report = _report_with(anomalies)
+    session = "sess-many-1"
+    path = checks.save_signal(session, report, None)
+    assert path
+    rec = {"run_id": "run-many", "task_id": "sch-many", "session_id": session,
+           "status": "succeeded", "verdict": "异常", "signal_path": str(path),
+           "rules_verdict": "异常", "rules_complete": True,
+           "rules_targets": report["target_names"]}
+    schedule._attach_signal(rec, checks.load_signal(session))
+    assert len(rec["anomalies"]) == 20 and rec["rules_truncated"] is True
+    # 第 25 条必须仍在 current 里（判定用完整 signal，不用紧凑副本）
+    current = notify._current_items(rec, notify._signal_from_record(rec))
+    assert f"check:{anomalies[-1]['id']}" in current
+    # 摘要文件缺失 → truncated，且不能据此判恢复
+    session2 = "sess-many-2"
+    path2 = checks.save_signal(session2, report, None)
+    rec2 = dict(rec, session_id=session2, signal_path=str(path2))
+    schedule._attach_signal(rec2, checks.load_signal(session2))
+    path2.unlink()
+    signal = notify._signal_from_record(rec2)
+    assert signal["truncated"] is True
+    assert notify._recoverable("check:web1/resources/磁盘 /x1", signal, rec2) is False
+    _clean_notify()
+
+
+def test_notify_retry_respects_mute_and_skips_recovered():
+    """静默期不补发旧告警；已恢复的旧告警标记 superseded，避免"先恢复又告警"。"""
+    from agent import notify
+    orig = notify._post
+    notify._post = _FakePost(error="Connection refused")
+    try:
+        _clean_notify()
+        _notify_setup()
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        notify.process_run(rec)
+        failed = notify.list_notifications(status="failed")[0]
+        failed["next_attempt_ts"] = 0
+        notify._write_notification(failed)
+        # 静默期：不补发
+        cfg = notify.load_config()
+        cfg["mute_until"] = time.time() + 600
+        notify.save_config({k: cfg[k] for k in notify.CONFIG_FIELDS})
+        done = notify.retry_pending(limit=5)
+        assert [d["status"] for d in done] == ["muted"], done
+        # 解除静默后，一条"所属异常已恢复"的失败通知不该再补发（会变成先恢复又告警）。
+        cfg["mute_until"] = 0
+        notify.save_config({k: cfg[k] for k in notify.CONFIG_FIELDS})
+        stale = {
+            "id": "20261022-000000-ntf-stale1", "created": time.time() - 60,
+            "created_iso": "2026-10-22 10:00:00", "kind": "anomaly",
+            "severity": "critical", "title": "巡检告警 1 项",
+            "text": "[ops-agent] 巡检告警 1 项\n旧消息", "items": [], "recoveries": [],
+            "task_id": "sch-t1", "run_id": "run-old", "session_id": "sess-old",
+            "report_path": None, "fingerprints": ["check:web1/resources/内存"],
+            "endpoint": "https://hooks.example.com/…", "status": "failed",
+            "attempts": 1, "last_error": "Connection refused", "next_attempt_ts": 0,
+            "http_status": None,
+        }
+        notify._write_notification(stale)
+        state = notify._load_state()
+        state["items"]["check:web1/resources/内存"] = {"severity": None,
+                                                      "last_seen": time.time()}
+        notify._save_state(state)
+        notify._post = _FakePost()
+        done = notify.retry_pending(limit=5)
+        assert [d["status"] for d in done] == ["superseded"], done
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_2xx_error_body_is_failure():
+    """钉钉/飞书用 200 + errcode 表示失败：不能记成 sent。"""
+    from agent import notify
+    orig = notify._post
+    try:
+        _clean_notify()
+        _notify_setup(format="dingtalk")
+        notify._post = lambda url, payload, timeout: (
+            200, '{"errcode": 310000, "errmsg": "keywords not in content"}')
+        out = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        assert out["notification"]["status"] == "failed"
+        assert "errcode=310000" in out["notification"]["last_error"]
+        _clean_notify()
+        _notify_setup(format="feishu")
+        notify._post = lambda url, payload, timeout: (200, '{"code": 19001, "msg": "bad token"}')
+        out = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        assert out["notification"]["status"] == "failed"
+        assert "code=19001" in out["notification"]["last_error"]
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_url_rejects_bad_port_and_control_chars():
+    from agent import notify
+    _clean_notify()
+    for url, needle in (
+            ("https://h.example.com:99999/x", "端口"),
+            ("https://h.example.com:abc/x", "端口"),
+            ("https://h.example.com/x\x01y", "控制字符"),
+            ("https://h.example.com/x\nY", "控制字符")):
+        try:
+            notify.save_config({"channel": "webhook", "url": url})
+            raise AssertionError(f"应拒绝: {url!r}")
+        except notify.NotifyError as e:
+            assert needle in str(e), (url, e)
+    # 坏端口的历史配置不能让 status/describe 崩溃
+    assert "非法端口" in notify.redact_endpoint("https://h.example.com:99999/x")
+    _clean_notify()
+
+
+def test_notify_quiet_hours_equal_minutes_rejected():
+    """8:00-08:00 与 08:00-08:00 等价，都必须拒绝（否则等于全天静默）。"""
+    from agent import notify
+    _clean_notify()
+    for quiet in ("08:00-08:00", "8:00-08:00", "23:00-23:00"):
+        try:
+            notify.save_config({"channel": "webhook",
+                                "url": "https://hooks.example.com/x",
+                                "quiet_hours": quiet})
+            raise AssertionError(f"应拒绝: {quiet}")
+        except notify.NotifyError as e:
+            assert "不能相同" in str(e), (quiet, e)
+    _clean_notify()
+
+
+def test_notify_recovery_held_while_muted_then_sent():
+    """静默期不丢恢复：解除静默后补发一次"已恢复"。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        assert len(sent.calls) == 1
+        cfg = notify.load_config()
+        cfg["mute_until"] = time.time() + 600
+        notify.save_config({k: cfg[k] for k in notify.CONFIG_FIELDS})
+        ok = _rec_with_signal(_report_with([], complete=True, verdict="正常"), verdict="正常")
+        muted = notify.process_run(ok)
+        assert muted["notification"]["status"] == "muted"
+        assert len(sent.calls) == 1
+        assert notify._load_state()["items"]["check:web1/resources/磁盘 /data"]["severity"]             == "critical", "静默期不能先把状态清成已恢复"
+        cfg["mute_until"] = 0
+        notify.save_config({k: cfg[k] for k in notify.CONFIG_FIELDS})
+        out = notify.process_run(ok)
+        assert out["actions"]["recovered"] == 1 and out["notification"]["severity"] == "info"
+        assert len(sent.calls) == 2 and "恢复" in sent.calls[-1]["text"]
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_missed_is_transient_not_recovered():
+    """错过是一次性事件：发过即结束，不会紧接着再发一条"恢复"。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run({"run_id": "r-m", "task_id": "sch-m", "status": "missed",
+                            "error": "遗忘 3 个应执行时点"})
+        assert "错过" in sent.calls[-1]["text"]
+        assert notify._load_state()["items"]["missed:sch-m"]["severity"] is None
+        ok = {"run_id": "r-ok", "task_id": "sch-m", "status": "succeeded",
+              "verdict": "正常"}
+        out = notify.process_run(ok)
+        assert out["actions"]["recovered"] == 0 and out["notification"] is None
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_setup_preserves_existing_settings():
+    """setup 只改显式传入的字段；enable/disable 不该顺带解除静默。"""
+    from agent import notify
+    _clean_notify()
+    notify.save_config({"channel": "webhook", "url": "https://hooks.example.com/a",
+                        "format": "slack", "renotify_after": 1800,
+                        "quiet_hours": "23:00-07:00", "enabled": False,
+                        "mute_until": time.time() + 600})
+    saved = io.StringIO()
+    old = sys.stdout
+    sys.stdout = saved
+    try:
+        assert notify.cli(["setup", "--url", "https://hooks.example.com/b"]) == 0
+        assert notify.cli(["disable"]) == 0
+    finally:
+        sys.stdout = old
+    cfg = notify.load_config()
+    assert cfg["format"] == "slack" and cfg["renotify_after"] == 1800
+    assert cfg["quiet_hours"] == "23:00-07:00"
+    assert cfg["enabled"] is False
+    assert cfg["mute_until"] > time.time(), "disable 不该解除静默"
+    out = saved.getvalue()
+    assert "hooks.example.com" in out and "notify.json" in out
+    sys.stdout = old
+    saved2 = io.StringIO()
+    sys.stdout = saved2
+    try:
+        assert notify.cli(["setup", "--url", "https://hooks.example.com/b",
+                           "--no-quiet-hours"]) == 0
+    finally:
+        sys.stdout = old
+    assert notify.load_config()["quiet_hours"] is None
+    _clean_notify()
+
+
+def test_schedule_running_record_has_session_before_model():
+    """运行记录在调用模型前就带 session_id：进程被 kill 后仍能找回规则摘要。"""
+    from agent import checks, schedule
+    _clean_notify()
+    _clean_schedules()
+    seen = {}
+    orig = schedule._run_entry
+
+    def fake(entry, model, session=None, deadline=None, extra=""):
+        recs = list((core.STATE_DIR / "runs").glob("*.json"))
+        seen["records"] = [json.loads(p.read_text(encoding="utf-8")) for p in recs]
+        seen["session"] = session.id
+        raise ConnectionError("boom")
+
+    schedule._run_entry = fake
+    try:
+        entry = schedule.add("巡检", every_seconds=60)
+        schedule._execute_run(entry, None)
+    finally:
+        schedule._run_entry = orig
+    assert seen["records"], "调用模型前必须已写 running 记录"
+    assert any(r.get("session_id") == seen["session"] and r["status"] == "running"
+               for r in seen["records"]), seen["records"]
+    _clean_schedules()
+    _clean_notify()
+
+
+def test_events_tail_reads_rotated_file():
+    """轮转后仍能查到 .1 里的历史，否则"最近发生了什么"会突然断档。"""
+    from agent import events
+    for name in ("events.jsonl", "events.jsonl.1"):
+        (core.STATE_DIR / name).unlink(missing_ok=True)
+    events.append("anomaly-new", title="旧事件")
+    orig = events.MAX_BYTES
+    events.MAX_BYTES = 1
+    try:
+        events.append("anomaly-new", title="新事件")
+    finally:
+        events.MAX_BYTES = orig
+    assert (core.STATE_DIR / "events.jsonl.1").is_file()
+    titles = [r.get("title") for r in events.tail(5)]
+    assert "旧事件" in titles and "新事件" in titles, titles
+
+
+def test_notify_unconfigured_events_do_not_flood():
+    """没配渠道时持续异常也只记一次事件，不能每轮巡检刷一条。"""
+    from agent import events, notify
+    _clean_notify()
+    for name in ("events.jsonl", "events.jsonl.1"):
+        (core.STATE_DIR / name).unlink(missing_ok=True)
+    rec = _rec_with_signal(_report_with([_anomaly()]))
+    for _ in range(3):
+        notify.process_run(rec)
+    rows = [r for r in events.tail(50) if r["kind"] == "anomaly-new"]
+    assert len(rows) == 1, rows
+    _clean_notify()
+
+
+def test_notify_muted_events_and_records_deduped():
+    """静默期同样不重复写 anomaly-new，也不重复写 muted 记录。"""
+    from agent import events, notify
+    orig = notify._post
+    notify._post = _FakePost()
+    try:
+        _clean_notify()
+        for name in ("events.jsonl", "events.jsonl.1"):
+            (core.STATE_DIR / name).unlink(missing_ok=True)
+        _notify_setup(mute_until=time.time() + 3600)
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        for _ in range(3):
+            notify.process_run(rec)
+        assert len([r for r in events.tail(50) if r["kind"] == "anomaly-new"]) == 1
+        assert len(notify.list_notifications(status="muted")) == 1
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_critical_to_unreachable_is_an_alert():
+    """磁盘 98% → 探针超时：这是"测不到了"，必须提醒，不能被去重压掉。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        assert len(sent.calls) == 1
+        unknown = _anomaly(status="unknown", line="[unknown] 磁盘 /data：df 执行失败（exit=255）")
+        out = notify.process_run(_rec_with_signal(_report_with([unknown])))
+        assert out["notification"]["status"] == "sent"
+        assert "不可采集" in sent.calls[-1]["text"]
+        assert len(sent.calls) == 2
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_message_keeps_report_path_when_truncated():
+    """正文被截断时，报告路径与追溯命令必须仍在消息里（否则"完整清单见报告"无处可寻）。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        anomalies = [_anomaly(id=f"web{i}/resources/磁盘 /data{i}", target=f"web{i}",
+                              name=f"磁盘 /data{i}",
+                              line="x" * 400) for i in range(20)]
+        rec = _rec_with_signal(_report_with(anomalies))
+        rec["report_path"] = "/Users/example/.ops-agent/reports/20261022-inspect-abc.md"
+        out = notify.process_run(rec)
+        text = out["notification"]["text"]
+        assert len(text) <= notify.TEXT_LIMIT + 200, len(text)
+        assert "报告: /Users/example/.ops-agent/reports/20261022-inspect-abc.md" in text
+        assert "追溯:" in text
+        assert "已截断" in text, "20 条 × 400 字符必然超预算，应显式说明被截断"
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_signal_found_without_signal_path():
+    """进程被 kill 时运行记录只有 session_id：仍要能按会话找回规则摘要。"""
+    from agent import checks, notify
+    _clean_notify()
+    report = _report_with([_anomaly()])
+    session = "sess-killed-1"
+    path = checks.save_signal(session, report, None)
+    assert path
+    rec = {"run_id": "run-killed", "task_id": "sch-k", "session_id": session,
+           "status": "interrupted", "started_ts": time.time(), "verdict": None}
+    items = notify._current_items(rec, notify._signal_from_record(rec))
+    assert "check:web1/resources/磁盘 /data" in items, items
+    assert "run:sch-k" in items
+    # 旧摘要（早于本次运行）不能被当成本次结论
+    old = dict(rec, started_ts=time.time() + 3600)
+    assert notify._signal_from_record(old) is None
+    _clean_notify()
+
+
+def test_schedule_pending_notify_survives_runs_query():
+    """先 `schedule runs` 对账、后 daemon 启动：中断记录仍要能推给用户。"""
+    from agent import notify, schedule
+    _clean_notify()
+    _clean_schedules()
+    sent = _FakePost()
+    orig = notify._post
+    notify._post = sent
+    try:
+        _notify_setup()
+        now = time.time()
+        rec = {"run_id": "20261022-100000-sch-dead-abcdef", "task_id": "sch-dead",
+               "prompt": "x", "session_id": None, "pid": 99999999, "status": "running",
+               "verdict": None, "started": "2026-10-22 10:00:00", "started_ts": now,
+               "finished": None, "finished_ts": None, "duration_s": None,
+               "attempts": 0, "error": None, "result_preview": "",
+               "report_path": None}
+        (core.STATE_DIR / "runs").mkdir(parents=True, exist_ok=True)
+        (core.STATE_DIR / "runs" / f"{rec['run_id']}.json").write_text(
+            json.dumps(rec), encoding="utf-8")
+        # 诊断时最常见的动作：先查 runs（会把 running 标成 interrupted）
+        assert schedule.reconcile_runs() == 1
+        assert schedule.list_runs()[0]["status"] == "interrupted"
+        pending = schedule._pending_notify_runs()
+        assert [r["run_id"] for r in pending] == [rec["run_id"]], pending
+        schedule._notify_pending_runs()
+        assert len(sent.calls) == 1 and "中断" in sent.calls[-1]["text"]
+        # 已通知过的不再重复补发
+        assert schedule._pending_notify_runs() == []
+    finally:
+        notify._post = orig
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_notify_state_corrupt_does_not_supersede():
+    """状态文件损坏时不能把失败通知判成"已恢复"，否则告警被静默丢掉。"""
+    from agent import notify
+    orig = notify._post
+    notify._post = _FakePost(error="Connection refused")
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        failed = notify.list_notifications(status="failed")[0]
+        failed["next_attempt_ts"] = 0
+        notify._write_notification(failed)
+        notify._state_path().write_text("{broken", encoding="utf-8")
+        notify._post = _FakePost()
+        done = notify.retry_pending(limit=5)
+        assert [d["status"] for d in done] == ["sent"], done
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_sensitive_state_dir_bypass_variants():
+    """`~/.ops-agent/.`、`/*`、`n*` 都是同一目录：只按字符串前缀匹配会被绕过。"""
+    for cmd in ("grep -r SECRET ~/.ops-agent/.",
+                "grep -r SECRET ~/.ops-agent/*",
+                "cat ~/.ops-agent/n*",
+                "grep -r hook ~/.ops-agent"):
+        assert core.sensitive_command(cmd), cmd
+        assert core.check(cmd)[0] != 0, cmd
+    # 报告与普通列目录仍可用（巡检报告必须能读）
+    assert core.sensitive_command("cat ~/.ops-agent/reports/x.md") is None
+    assert core.sensitive_command("ls -l ~/.ops-agent") is None
+    assert core.sensitive_command("cat ~/.ops-agent/notify.json")
+
+
+def test_schedule_checks_target_validated():
+    """--checks 写错目标名要在 add 时拒绝，不能留下"看起来跑过规则检查"的任务。"""
+    from agent import schedule
+    _clean_schedules()
+    try:
+        schedule.add("巡检", every_seconds=60, checks_target="typo")
+        raise AssertionError("未注册目标应被拒绝")
+    except schedule.ScheduleError as e:
+        assert "未注册" in str(e)
+    try:
+        schedule.add("巡检", every_seconds=60, checks_groups=["resources"])
+        raise AssertionError("只给分组应被拒绝")
+    except schedule.ScheduleError as e:
+        assert "配合" in str(e)
+    try:
+        schedule.add("巡检", every_seconds=60, checks_target="local",
+                     checks_groups=["nope"])
+        raise AssertionError("未知分组应被拒绝")
+    except schedule.ScheduleError as e:
+        assert "未知检查分组" in str(e)
+    entry = schedule.add("巡检", every_seconds=60, checks_target="local",
+                         checks_groups=["resources"])
+    assert entry["checks"] == {"targets": "local", "groups": ["resources"]}
+    _clean_schedules()
+
+
+def test_notify_recovery_retried_after_failure():
+    """恢复消息发送失败时不能先清状态：下一轮要能补发，否则"恢复"永久丢失。"""
+    from agent import notify
+    orig = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        notify._post = _FakePost(error="Connection refused")
+        ok = _rec_with_signal(_report_with([], complete=True, verdict="正常"), verdict="正常")
+        failed = notify.process_run(ok)
+        assert failed["notification"]["status"] == "failed"
+        state = notify._load_state()
+        assert state["items"]["check:web1/resources/磁盘 /data"]["severity"] == "critical", \
+            "恢复消息没发出去就不能清成已恢复"
+        assert state["items"]["check:web1/resources/磁盘 /data"].get("pending_recovery")
+        notify._post = _FakePost()
+        retried = notify.process_run(ok)
+        assert retried["actions"]["recovered"] == 1
+        assert retried["notification"]["severity"] == "info"
+        assert notify._load_state()["items"]["check:web1/resources/磁盘 /data"][
+            "severity"] is None
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_other_target_unreachable_does_not_block_recovery():
+    """别的目标不可达不该拖住本目标的恢复（全局 complete 早就为假）。"""
+    from agent import notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        web = _anomaly(id="web1/resources/磁盘 /data", target="web1", name="磁盘 /data")
+        notify.process_run(_rec_with_signal(_report_with([web])))
+        assert len(sent.calls) == 1
+        # 本次：web1 干净且完整，db1 不可达 → 全局 complete=False
+        report = _report_with([], complete=False, verdict="不完整")
+        report["target_names"] = ["web1", "db1"]
+        report["targets"] = [
+            {"name": "web1", "label": "web1", "checks": [], "verdict": "正常",
+             "reachable": True, "platform": "Linux"},
+            {"name": "db1", "label": "db1", "verdict": "不完整", "reachable": False,
+             "platform": "",
+             "checks": [{"id": "db1/connectivity/连通性", "target": "db1",
+                         "group": "connectivity", "name": "连通性", "status": "error",
+                         "display": "不可达", "threshold": "", "detail": "ssh 超时",
+                         "sampled_at": "2026-10-22 10:00:00",
+                         "evidence": {"command": "uname -s", "exit": 255,
+                                      "output": "ssh: connect timed out"}}]}]
+        out = notify.process_run(_rec_with_signal(report, session="sess-web1", verdict="不完整"))
+        assert out["actions"]["recovered"] == 1, out["actions"]
+        assert any("磁盘 /data" in r["title"]
+                   for r in out["notification"]["recoveries"])
+    finally:
+        notify._post = orig
+        _clean_notify()
+
+
+def test_notify_recurrence_after_recovery_logs_new_event():
+    """恢复后再次异常要重新记一条 anomaly-new，时间线不能看不出复发。"""
+    from agent import events, notify
+    orig = notify._post
+    sent = _FakePost()
+    notify._post = sent
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        ok = _rec_with_signal(_report_with([], complete=True, verdict="正常"), verdict="正常")
+        notify.process_run(ok)
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()]),
+                                            session="sess-again-1"))
+        kinds = [r["kind"] for r in events.tail(20)]
+        assert kinds.count("anomaly-new") == 2, kinds
+        assert "anomaly-recovered" in kinds
+        assert len(sent.calls) == 3
+    finally:
+        notify._post = orig
+        _clean_notify()
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
