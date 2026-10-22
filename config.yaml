@@ -1,7 +1,7 @@
 # 只读白名单：命中即 R0 直接放行（按顺序匹配）
 readonly_patterns:
   - ^kubectl[ \t]+(get|describe|logs|top|api-resources|config[ \t]+view)(?=[ \t]|$)
-  - ^systemctl[ \t]+(status|list-units|list-timers|show|is-active|is-enabled|is-system-running|list-dependencies|--failed)(?=[ \t]|$)
+  - ^systemctl[ \t]+(status|list-units|list-timers|list-unit-files|show|is-active|is-enabled|is-system-running|list-dependencies|--failed)(?=[ \t]|$)
   - ^journalctl(?=[ \t]|$)
   - ^docker[ \t]+(ps|images|logs|inspect|stats|port|top|version|info)(?=[ \t]|$)
   - ^docker[ \t]+compose[ \t]+(ps|logs|config|top)(?=[ \t]|$)
@@ -28,6 +28,8 @@ readonly_patterns:
   - ^nproc[ \t]*$
   - ^sysctl[ \t]+-n[ \t]+[A-Za-z0-9_.]+(?:[ \t]+[A-Za-z0-9_.]+)*[ \t]*$
   - ^sysctl[ \t]+(-a|--all)[ \t]*$
+  # 场景预检/后验用：nginx -t 只测语法不重载（reload/start 才是写操作）
+  - ^nginx[ \t]+-t[ \t]*$
   - ^(brew[ \t]+(list|info|outdated)|launchctl[ \t]+list)(?=[ \t]|$)
   - ^brew[ \t]+services(?:[ \t]+(list|info)(?=[ \t]|$)|[ \t]*$)
 

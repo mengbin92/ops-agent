@@ -35,7 +35,7 @@ def _guarded_cli(command: str) -> bool:
         exe = Path(argv[0]).expanduser()
     return (exe.resolve() == core.REPO_DIR / "opsx" and len(argv) > 1
             and argv[1] in {"check", "approve", "revoke", "exec", "snapshot", "rollback",
-                            "list", "targets", "audit", "selftest"})
+                            "scenario", "list", "targets", "audit", "selftest"})
 
 
 def _print_execution(cmd: str, target: str | None = None,
@@ -113,6 +113,22 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("rollback")
     r.add_argument("snapshot_id")
     r.add_argument("--yes", action="store_true", help="已确认回滚计划，非交互环境必须显式指定")
+
+    sc = sub.add_parser(
+        "scenario", help="固定变更场景：预检→快照→执行→后验→回滚建议",
+        epilog="run 退出码：0 通过｜1 执行失败｜2 需审批/守门拒绝/需确认动作｜"
+               "3 预检未通过｜4 快照未建成｜7 验证失败（exit=0 但后验不健康）｜"
+               "120 结果未知或有未核实执行｜121 目标被占用")
+    sc.add_argument("action", choices=["list", "show", "run", "rollback"])
+    sc.add_argument("name", nargs="?", default="",
+                    help="场景名（run/rollback 时为场景名或执行记录 id）")
+    sc.add_argument("--param", action="append", default=[], metavar="K=V",
+                    help="场景参数，可多次")
+    sc.add_argument("--target", default="", help="SSH 目标名；省略=场景声明或本机")
+    sc.add_argument("--wait-lock", type=float, default=0.0, metavar="SECONDS")
+    sc.add_argument("--yes", action="store_true",
+                    help="scenario rollback：已核对回滚计划，必须显式指定"
+                         "（未加 --yes 时展示计划并退出 2，与需审批同码：都需人工动作）")
 
     sub.add_parser("list", help="列出快照、审批戳与 SSH 目标")
     sub.add_parser("targets", help="列出已注册的 SSH 目标")
@@ -264,6 +280,55 @@ def main(argv: list[str] | None = None) -> int:
             started = time.time()
             print(core.redact(remote.rollback(args.snapshot_id, confirm=True)))  # 远程推回
             _print_rollback_execution(args.snapshot_id, plan.get("target"), since=started)
+            return 0
+
+        if args.sub == "scenario":
+            import scenario
+            if args.action == "list":
+                entries = scenario.catalog()
+                if not entries:
+                    print("(无场景定义；内置在 scenarios/*.json，自定义放 "
+                          f"{scenario.dirs()[0]}/*.json)")
+                    return 0
+                for entry in entries:
+                    params = (f"（参数: {', '.join(entry['params'])}）"
+                              if entry["params"] else "")
+                    print(f"{entry['name']}{params} — {entry['description']}")
+                return 0
+            if args.action == "show":
+                print(json.dumps(scenario.load(args.name), ensure_ascii=False, indent=2))
+                return 0
+            if args.action == "run":
+                params = {}
+                for spec in args.param:
+                    key, sep, value = spec.partition("=")
+                    if not sep or not key.strip():
+                        raise core.OpsxError(f"--param 须为 K=V 形式: {spec!r}")
+                    params[key.strip()] = value
+                result = scenario.run(args.name, params, target=args.target or None,
+                                      actor="cli", lock_wait=args.wait_lock)
+                print(scenario.format_result(result, with_suggestion=True))
+                # 退出码：0 通过 / 1 执行失败 / 2 需审批或需确认动作 /
+                # 3 预检未通过 / 7 验证失败 / 120 结果未知或存在未核实执行 /
+                # 121 目标被占用。gate_denied 复用 2（都是"需要人工动作"）。
+                return {"ok": 0, "exec_failed": 1, "approval_required": 2,
+                        "gate_denied": 2, "precheck_failed": 3,
+                        "snapshot_failed": 4, "verify_failed": 7,
+                        "busy": 121, "uncertain": 120}.get(result["verdict"], 1)
+            # rollback：先展示计划再要 --yes（与 opsx rollback 同确认语义）
+            import execution
+            record = execution.get(args.name)
+            if record is None:
+                raise core.OpsxError(f"没有这条执行记录: {args.name!r}")
+            if not record.get("snapshot_id"):
+                raise core.OpsxError("该执行记录没有关联快照，没有可回滚的内容")
+            if not args.yes:
+                plan = remote.rollback_plan(record["snapshot_id"])
+                print(core.redact(core.format_rollback_plan(plan)))
+                print("\n回滚是写操作：确认后加 --yes 执行。")
+                return 2
+            result = scenario.rollback(args.name, confirm=True)
+            print(scenario._format_rollback(result))
             return 0
 
         if args.sub == "targets":

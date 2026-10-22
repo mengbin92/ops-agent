@@ -39,6 +39,7 @@ KINDS = (
     "notify-config-error",
     "run-failed", "run-timeout", "run-interrupted", "run-missed",
     "schedule-checks-error",
+    "scenario-precheck-failed", "scenario-verify-failed", "scenario-rolled-back",
 )
 
 _KIND_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}$")

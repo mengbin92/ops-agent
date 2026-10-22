@@ -211,6 +211,40 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
 
+### 变更场景（W6）：预检 → 快照 → 执行 → 后验 → 回滚建议
+
+`opsx exec` 只回答"命令退出码是多少"，回答不了"变更之后服务真的健康吗"。场景把
+"执行后的确定性验证"变成必经步骤：**命令 exit=0 但后验不健康时，报告的不是"成功"
+而是"验证失败"，并给出回滚建议。**
+
+```bash
+./opsx scenario list                              # 可用场景
+./opsx scenario run systemd-restart --param service=nginx
+./opsx scenario run nginx-reload                  # 改完 nginx 配置后应用
+./opsx scenario run docker-restart --param container=api
+./opsx scenario rollback <execution_id>           # 先展示回滚计划（exit 2）
+./opsx scenario rollback <execution_id> --yes     # 确认后恢复并重跑后验作证据
+```
+
+内置三个场景（`scenarios/*.json`，自定义放 `~/.ops-agent/scenarios/` 同名覆盖）：
+
+| 场景 | 预检 | 执行 | 后验 |
+| --- | --- | --- | --- |
+| `systemd-restart` | 单元存在（LoadState=loaded） | `systemctl restart` | ActiveState=active 且 SubState≠failed |
+| `docker-restart` | 容器 running | `docker restart` | running 且健康（有 healthcheck 时） |
+| `nginx-reload` | `nginx -t` 语法（**坏配置在 reload 前就被拦下**） | `systemctl reload`（含配置快照） | active + 语法仍 ok |
+
+要点：
+
+- **预检失败不写入任何东西**——不建快照、不消耗审批、不产生执行记录（exit 3）。
+- 执行命令复用 `opsx exec` 的全部守门（审批/锁/快照/执行记录），场景不复制安全逻辑；
+  预检/后验探针强制只读（R0）。
+- 结论分清六种"没执行"：需审批（2）、守门拒绝（2）、预检未过（3）、快照未建成（4）、
+  目标被占（121）、结果未知（120）——都能直接进脚本。
+- agent 侧用 `scenario_run` 工具：先展示完整命令与全部探针请求确认，批准后执行；
+  无人值守（定时巡检/子代理）不可用。
+- 回滚后验证**只作证据不判定**：配置已恢复旧版时，变更后验失败可能正是回滚生效的表现。
+
 ### 变更执行记录与并发控制（W5）
 
 变更不再只有"退出码"这一个结果。每次 `opsx exec` / `opsx rollback` 都落一条记录
@@ -516,16 +550,18 @@ core.py 为纯函数库；演进 MCP server / agent 内核时直接包装同一�
 独立化演进路线（流式输出、compaction、skills、子代理、远程通道）见设计文档第 5 节。
 
 已按八周排期交付：W1 安全边界 → W2 确定性巡检 → W3 可追踪运行 → W4 通知与事件 →
-W5 变更执行记录与并发控制。状态目录新增 `runs/`（运行记录）、`reports/`（巡检报告）、
-`signals/`（规则结果摘要）、`notifications/`（发件箱）、`events.jsonl`（事件时间线）、
-`notify.json`（通知渠道，0600）、`executions/`（变更执行记录）、`locks/`（目标级写锁）。
-这些文件都是本地事实来源，不需要数据库。调度、运行、通知与执行记录 JSON 用临时文件替换；
-JSONL 查询跳过损坏行；配置损坏会报错；重要状态仍应备份。
+W5 变更执行记录与并发控制 → W6 变更场景（预检→快照→执行→后验→回滚建议）。
+状态目录新增 `runs/`（运行记录）、`reports/`（巡检与场景报告）、`signals/`（规则结果摘要）、
+`notifications/`（发件箱）、`events.jsonl`（事件时间线）、`notify.json`（通知渠道，0600）、
+`executions/`（变更执行记录）、`locks/`（目标级写锁）。这些文件都是本地事实来源，不需要数据库。
+调度、运行、通知与执行记录 JSON 用临时文件替换；JSONL 查询跳过损坏行；配置损坏会报错；
+重要状态仍应备份。
 
-2026-10-22 对照路线图复审并修复 W1–W4（`241/241`），随后交付 W5（`261/261`）：
-详细问题、修复与验证见
-[W1–W4 复审记录](docs/reviews/2026-10-22-roadmap-implementation-review.md) 与
-[W5 复审记录](docs/reviews/2026-10-22-week5-change-safety-review.md)。
+2026-10-22 对照路线图复审并修复 W1–W4（`241/241`），随后交付 W5（`261/261`）、
+W6（`300/300`）：详细问题、修复与验证见
+[W1–W4 复审记录](docs/reviews/2026-10-22-roadmap-implementation-review.md)、
+[W5 复审记录](docs/reviews/2026-10-22-week5-change-safety-review.md) 与
+[W6 复审记录](docs/reviews/2026-10-22-week6-scenario-review.md)。
 
 W5 再次复审修复后：`./opsx selftest` **292/292 passed**，新增 31 项回归，
 详见[二次审查记录](docs/reviews/2026-10-22-week5-followup-review.md)。升级前请结束在途变更；

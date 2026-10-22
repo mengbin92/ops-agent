@@ -349,6 +349,67 @@ def _ops_executions(args: dict, ctx: ToolContext) -> str:
     return text
 
 
+def _scenario_run(args: dict, ctx: ToolContext) -> str:
+    """运行固定变更场景：预检→快照→执行→后验→回滚建议。
+
+    审批在执行之前就绪（用户确认后建戳，exec_change 消耗）：预检失败时戳保留
+    未消耗，修好预检项重跑即可，不需要重新确认。
+    """
+    import scenario
+    name = args.get("name") or ""
+    params = args.get("params") or {}
+    target = args.get("target") or None
+    try:
+        scen = scenario.load(name)
+        resolved = scenario.resolve_params(scen, params)
+        exec_cmd = scenario.substitute(scen["exec"]["cmd"], resolved)
+        tgt = scenario._exec_target(scen, target)
+        env = core.resolve_env(exec_cmd, tgt)
+    except (scenario.ScenarioError, core.OpsxError, remote.RemoteError) as e:
+        return f"[场景错误] {core.redact(str(e))}"
+    level, _ = core.classify(exec_cmd)
+
+    # 确认框必须给出完整命令与全部探针：人批准的是整条链路，不是"跑个场景"
+    preview = [f"变更场景 {name}：{scen['description']}",
+               f"目标: {tgt or '本机'}｜参数: {resolved or '无'}"]
+    preview += [f"预检 {i}: {scenario.substitute(c['cmd'], resolved)}"
+                for i, c in enumerate(scen["precheck"], 1)]
+    preview.append(f"执行: {exec_cmd}")
+    preview += [f"快照文件: {scenario.substitute(pp, resolved)}"
+                for pp in scen["exec"]["snapshot_files"]]
+    preview += [f"快照命令 {i}: {scenario.substitute(c['command'], resolved)}"
+                for i, c in enumerate(scen["exec"]["snapshot_cmds"], 1)]
+    preview += [f"后验 {i}: {scenario.substitute(c['cmd'], resolved)}"
+                for i, c in enumerate(scen["postcheck"], 1)]
+    preview.append(f"风险级别: {level}｜执行环境: {core.format_env(env)}")
+    preview_text = "\n".join(preview)
+
+    if ctx.ask_user is None:
+        return ("[opsx 拒绝] 变更场景需要人工确认，当前形态没有确认通道，"
+                "未执行任何变更。\n" + preview_text)
+    if level == "R3":
+        prompt = (preview_text
+                  + "\n\n**不可逆操作（R3）**：必须输入“确认执行”，其他回答均拒绝。")
+        valid = {"确认执行"}
+    else:
+        prompt = preview_text + "\n\n输入“确认执行”或 yes 批准，其他回答均拒绝。"
+        valid = {"确认执行", "确认", "yes", "y"}
+    answer = ctx.ask_user(prompt)
+    if not isinstance(answer, str) or answer.strip().casefold() not in valid:
+        core.audit("scenario-deny", scenario=name, cmd=exec_cmd, target=tgt)
+        return "[opsx 拒绝] 用户未批准，未执行任何变更。"
+    if level != "R0":   # 只读执行命令没有也不需要审批戳
+        try:
+            core.approve(exec_cmd, target=tgt, env=env, force=(level == "R3"))
+        except core.OpsxError as e:
+            return f"[opsx 错误] 建审批戳失败（未执行任何变更）: {core.redact(str(e))}"
+    try:
+        result = scenario.run(name, params, target=target, actor="agent")
+    except scenario.ScenarioError as e:
+        return f"[场景错误] {core.redact(str(e))}"
+    return scenario.format_result(result, with_suggestion=True)
+
+
 SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events", "ops_executions"})
 # 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见。
 # inspect 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
@@ -850,6 +911,19 @@ REGISTRY: dict[str, dict] = {
                                                "aborted"]}},
                           []),
         "handler": _ops_executions, "read_only": True,
+    },
+    "scenario_run": {
+        "schema": _schema("scenario_run",
+                          "运行固定变更场景：预检→快照→执行→后验→回滚建议。"
+                          "执行前会向用户请求确认；后验失败时即使命令 exit=0 也报验证失败。"
+                          "无人值守上下文不可用。",
+                          {"name": {"type": "string", "description": "场景名（opsx scenario list 可查）"},
+                           "params": {"type": "object",
+                                      "description": "场景参数，如 {\"service\": \"nginx\"}"},
+                           "target": {"type": "string",
+                                      "description": "SSH 目标名；省略=场景声明或本机"}},
+                          ["name"]),
+        "handler": _scenario_run, "read_only": False,
     },
     "ops_list": {
         "schema": _schema("ops_list", "列出快照、审批戳与已注册的 SSH 目标。", {}, []),

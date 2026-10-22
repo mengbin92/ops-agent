@@ -227,7 +227,10 @@ def update(execution_id: str, **fields) -> dict | None:
         rec = _read(path) if path.is_file() else None
         if rec is None:
             return None
-        allowed = {"phase", "snapshot_id", "host", "env"}
+        allowed = {"phase", "snapshot_id", "host", "env",
+                   # W6 场景装饰字段：记录命令本身的成败（status），场景层附加
+                   # "后验是否健康"的证据；缺了它们，"exit=0 但后验失败"就查无对证
+                   "scenario", "scenario_params", "precheck", "postcheck"}
         for key, value in fields.items():
             if key in allowed:
                 rec[key] = value
@@ -475,6 +478,18 @@ def format_record(rec: dict) -> str:
     lines = [line]
     if rec.get("cmd"):
         lines.append(f"  命令: {core.redact(rec['cmd'])[:200]}")
+    if rec.get("scenario"):
+        # 场景执行的额外证据层：后验失败时这条记录的状态虽是 succeeded，
+        # 但场景判定是"验证失败"——必须一起显示，否则会误读成"变更成功"
+        parts = [f"场景 {rec['scenario']}"]
+        if rec.get("precheck"):
+            parts.append(f"预检 {rec['precheck']}")
+        if rec.get("postcheck"):
+            parts.append(f"后验 {rec['postcheck']}")
+        lines.append("  " + "｜".join(parts))
+        if rec.get("postcheck") == "failed":
+            lines.append("  **后验失败：命令 exit=0 但服务不健康，不要据此认为变更成功**"
+                         "（完整证据见场景报告）")
     if rec.get("error"):
         lines.append(f"  错误: {rec['error']}")
     resolved = rec.get("resolved")

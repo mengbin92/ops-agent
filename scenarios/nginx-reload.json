@@ -1,0 +1,18 @@
+{
+  "description": "改完 nginx 配置后应用：预检查语法（坏配置在 reload 前就被拦下）→ 快照配置 → reload → 后验 active；reload 出问题可回滚配置文件。注意：nginx -t 只覆盖主 conf include 范围内的配置，{config_file} 若在范围外，预检保证不了它的语法。",
+  "params": {
+    "service": {"default": "nginx", "pattern": "^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$"},
+    "config_file": {"default": "/etc/nginx/nginx.conf", "pattern": "^/[A-Za-z0-9._@+/-]{1,200}$"}
+  },
+  "precheck": [
+    {"cmd": "nginx -t", "expect_contains": "syntax is ok"}
+  ],
+  "exec": {
+    "cmd": "systemctl reload {service}",
+    "snapshot_files": ["{config_file}"]
+  },
+  "postcheck": [
+    {"cmd": "systemctl show {service} -p ActiveState --value", "expect": "active"},
+    {"cmd": "nginx -t", "expect_contains": "syntax is ok"}
+  ]
+}

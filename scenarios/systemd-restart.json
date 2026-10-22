@@ -1,0 +1,21 @@
+{
+  "description": "重启 systemd 服务并验证已恢复 active（预检确认单元存在，避免对不存在单元白忙一场）",
+  "params": {
+    "service": {"required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$",
+                "description": "systemd 单元名，如 nginx、redis-server.service"}
+  },
+  "precheck": [
+    {"cmd": "systemctl show {service} -p LoadState --value", "expect": "loaded"}
+  ],
+  "exec": {
+    "cmd": "systemctl restart {service}",
+    "snapshot_cmds": [
+      {"command": "systemctl show {service} -p ActiveState -p SubState -p NRestarts",
+       "name": "重启前状态"}
+    ]
+  },
+  "postcheck": [
+    {"cmd": "systemctl show {service} -p ActiveState --value", "expect": "active"},
+    {"cmd": "systemctl show {service} -p SubState --value", "expect_not": "failed"}
+  ]
+}

@@ -7719,6 +7719,309 @@ def test_w5_review_legacy_alias_lock_and_owner_write_failure():
         pass
 
 
+def _write_scenario(name: str, body: dict) -> Path:
+    """往临时状态目录写一个测试场景。"""
+    import json as json_mod
+    d = Path(core.STATE_DIR, "scenarios")
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{name}.json"
+    path.write_text(json_mod.dumps(body, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_scenario_load_and_substitution():
+    """场景加载校验：字段写错即报错；占位符单遍替换且不碰 docker 模板大括号。"""
+    import scenario
+    # 内置场景必须都能加载（校验不跑命令）
+    names = {e["name"] for e in scenario.catalog() if not e["broken"]}
+    assert {"systemd-restart", "docker-restart", "nginx-reload"} <= names
+    # 未知字段
+    _write_scenario("w6-bad", {"exec": {"cmd": "echo hi"}, "oops": 1})
+    try:
+        scenario.load("w6-bad")
+        raise AssertionError("未知字段应报错")
+    except scenario.ScenarioError as e:
+        assert "oops" in str(e)
+    # 探针期望字段拼错
+    _write_scenario("w6-bad2", {"exec": {"cmd": "echo hi"},
+                                "postcheck": [{"cmd": "echo x", "expects": "x"}]})
+    try:
+        scenario.load("w6-bad2")
+        raise AssertionError("拼错的期望字段应报错")
+    except scenario.ScenarioError as e:
+        assert "expects" in str(e)
+    # 占位符替换：单遍、不碰 {{.State.Status}}、未定义占位符报错
+    params = {"container": "web1"}
+    text = scenario.substitute(
+        "docker inspect --format '{{.State.Status}}' {container}", params)
+    assert text == "docker inspect --format '{{.State.Status}}' web1", text
+    try:
+        scenario.substitute("echo {typo}", params)
+        raise AssertionError("未定义占位符应报错")
+    except scenario.ScenarioError as e:
+        assert "{typo}" in str(e)
+    # 未知参数 / 必填缺失 / pattern 违规
+    scen = {"name": "t", "params": {"service": {"required": True}},
+            "exec": {"cmd": "systemctl restart {service}"}}
+    try:
+        scenario.resolve_params(scen, {"oops": "1"})
+        raise AssertionError("未知参数应报错")
+    except scenario.ScenarioError as e:
+        assert "oops" in str(e)
+    try:
+        scenario.resolve_params(scen, {})
+        raise AssertionError("缺必填应报错")
+    except scenario.ScenarioError as e:
+        assert "service" in str(e)
+    try:
+        scenario.resolve_params(scen, {"service": "bad name; rm -rf"})
+        raise AssertionError("pattern 违规应报错")
+    except scenario.ScenarioError as e:
+        assert "不符合约束" in str(e)
+
+
+def test_scenario_precheck_failure_blocks_execution():
+    """预检失败：不建快照、不碰审批、不产生执行记录，事件与报告留痕。"""
+    import scenario
+    _write_scenario("w6-pre-fail", {
+        "precheck": [{"cmd": "echo blocked", "expect": "should-be-ok"}],
+        "exec": {"cmd": "docker restart w6-never"},
+        "postcheck": [{"cmd": "echo fine", "expect": "fine"}]})
+    core.approve("docker restart w6-never", ttl_seconds=60)
+    before_events = len([e for e in __import__("agent.events", fromlist=["x"]).tail(50)
+                         if e["kind"] == "scenario-precheck-failed"])
+    result = scenario.run("w6-pre-fail")
+    assert result["verdict"] == "precheck_failed"
+    assert result["execution_id"] is None and result["snapshot_id"] is None
+    assert result["report_path"] and Path(result["report_path"]).is_file()
+    # 审批未被消耗：命令仍处于已授权状态
+    assert core.check("docker restart w6-never")[0] == 0
+    # 没有执行记录、没有快照
+    import execution
+    assert execution.find_latest("docker restart w6-never", None) is None
+    after = [e for e in __import__("agent.events", fromlist=["x"]).tail(50)
+             if e["kind"] == "scenario-precheck-failed"]
+    assert len(after) == before_events + 1
+
+
+def test_scenario_exit0_but_unhealthy_reports_verify_failed():
+    """验收核心：命令 exit=0 但后验不健康 → 仍报验证失败，证据留痕，给回滚建议。"""
+    import scenario
+    # 探针词不能含 "-ok" 这类旗标形状：core 的写标记检测会把它当 find -ok 处理，
+    # 正确降级 R2。"preok" 才是干净词。
+    _write_scenario("w6-verify-fail", {
+        "precheck": [{"cmd": "echo preok", "expect": "preok"}],
+        "exec": {"cmd": "echo changed"},   # R0，退出码必然 0
+        "postcheck": [{"cmd": "echo unhealthy", "expect": "healthy"},
+                      {"cmd": "echo healthy", "expect": "healthy"}]})
+    result = scenario.run("w6-verify-fail")
+    assert result["verdict"] == "verify_failed", result["verdict"]
+    assert result["execution_id"], "应有执行记录"
+    assert len(result["postcheck"]) == 2
+    assert result["postcheck"][0]["passed"] is False
+    assert result["postcheck"][1]["passed"] is True
+    assert "不要据此认为变更成功" in result["suggestion"]
+    assert "无自动回滚点" in result["suggestion"]       # 没有快照时的诚实提示
+    # 执行记录：命令本身成功（succeeded 不撒谎），但后验结果必须跟着记录走
+    import execution
+    rec = execution.get(result["execution_id"])
+    assert rec["status"] == "succeeded" and rec["exit_code"] == 0
+    assert rec["scenario"] == "w6-verify-fail" and rec["postcheck"] == "failed"
+    assert rec["precheck"] == "passed"
+    shown = execution.format_record(rec)
+    assert "后验失败" in shown and "不要据此认为变更成功" in shown
+    # 事件关联 execution_id；报告落盘
+    from agent import events
+    hits = [e for e in events.tail(20) if e["kind"] == "scenario-verify-failed"]
+    assert hits and hits[-1].get("execution_id") == result["execution_id"]
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "验证失败" in report and "unhealthy" in report
+    assert report.index("后验") < report.index("建议")
+
+
+def test_scenario_requires_approval_no_write():
+    """无人工审批时不写入：exec 被守门拦下，无快照、无记录、审批未消耗。"""
+    import scenario
+    _write_scenario("w6-approval", {
+        "precheck": [{"cmd": "echo ready", "expect": "ready"}],
+        "exec": {"cmd": "docker restart w6-needs-approval"},
+        "postcheck": [{"cmd": "echo ok", "expect": "ok"}]})
+    result = scenario.run("w6-approval")
+    assert result["verdict"] == "approval_required"
+    assert result["execution_id"] is None and result["snapshot_id"] is None
+    assert "opsx approve" in result["suggestion"]
+    assert "docker restart w6-needs-approval" in result["suggestion"]
+    import execution
+    assert execution.find_latest("docker restart w6-needs-approval", None) is None
+    # 批准后即可执行（审批 → 通过）
+    core.approve("docker restart w6-needs-approval", ttl_seconds=60)
+    result2 = scenario.run("w6-approval")
+    # docker restart 在测试机失败（无 docker/容器）→ 命令失败，走不到后验
+    assert result2["verdict"] == "exec_failed", result2["verdict"]
+    assert result2["execution_id"] is not None
+
+
+def test_scenario_happy_path_rollback_and_verify():
+    """正常路径：预检→快照→执行→后验通过；确认后回滚配置并给出回滚后证据。"""
+    import scenario
+    with tempfile.TemporaryDirectory() as td:
+        conf = Path(td) / "w6-app.conf"
+        conf.write_text("old-config\n")
+        new_conf = Path(td) / "w6-new.conf"
+        new_conf.write_text("new-config\n")
+        _write_scenario("w6-happy", {
+            "precheck": [{"cmd": f"cat {new_conf}", "expect": "new-config"}],
+            "exec": {"cmd": f"cp {new_conf} {conf}", "snapshot_files": [str(conf)]},
+            "postcheck": [{"cmd": f"cat {conf}", "expect": "new-config"}]})
+        exec_cmd = f"cp {new_conf} {conf}"
+        core.approve(exec_cmd, ttl_seconds=60)
+        result = scenario.run("w6-happy")
+        assert result["verdict"] == "ok", result
+        assert conf.read_text() == "new-config\n"
+        rec = __import__("execution").get(result["execution_id"])
+        assert rec["scenario"] == "w6-happy" and rec["postcheck"] == "passed"
+        assert rec["snapshot_id"] == result["snapshot_id"]
+        # 经确认回滚：配置恢复，回滚后证据里能看到旧内容
+        rb = scenario.rollback(result["execution_id"], confirm=True)
+        assert conf.read_text() == "old-config\n"
+        assert rb["rollback_execution_id"]
+        assert any("old-config" in r["output"] for r in rb["verify"]), rb["verify"]
+        assert "仅作回滚后状态的证据" in rb["verify_note"]
+        assert Path(rb["report_path"]).is_file()
+        from agent import events
+        hits = [e for e in events.tail(20) if e["kind"] == "scenario-rolled-back"]
+        assert hits and hits[-1].get("snapshot_id") == result["snapshot_id"]
+
+
+def test_scenario_agent_tool_requires_confirmation():
+    """agent 工具：无确认通道拒绝；用户拒绝不写；批准后建戳并执行整条链路。"""
+    from agent import tools as agent_tools
+    import scenario as scenario_mod
+    _write_scenario("w6-agent", {
+        "precheck": [{"cmd": "echo agent-pre", "expect": "agent-pre"}],
+        "exec": {"cmd": "echo agent-changed"},
+        "postcheck": [{"cmd": "echo agent-post", "expect": "agent-post"}]})
+    ctx = agent_tools.ToolContext()
+    out = agent_tools.dispatch("scenario_run", {"name": "w6-agent"}, ctx)
+    assert "[opsx 拒绝]" in out and "未执行任何变更" in out
+    assert "echo agent-changed" in out       # 拒绝时也要展示完整命令
+    # 用户拒绝
+    answers = iter(["no"])
+    ctx2 = agent_tools.ToolContext(ask_user=lambda q: next(answers))
+    out = agent_tools.dispatch("scenario_run", {"name": "w6-agent"}, ctx2)
+    assert "用户未批准" in out
+    # 批准 → 执行 → 后验通过
+    answers = iter(["yes"])
+    ctx3 = agent_tools.ToolContext(ask_user=lambda q: next(answers))
+    out = agent_tools.dispatch("scenario_run", {"name": "w6-agent"}, ctx3)
+    assert "通过（后验全部健康）" in out, out
+    import execution
+    rec = execution.find_latest("echo agent-changed", None)
+    assert rec and rec["scenario"] == "w6-agent"
+
+
+def test_scenario_cli_exit_codes():
+    """CLI 退出码：list/show=0；预检失败=3；验证失败=7；回滚未确认=2。"""
+    import subprocess
+    import sys as sys_mod
+    state = tempfile.mkdtemp(prefix="opsx-w6-cli-")
+    env = dict(os.environ, OPSX_STATE_DIR=state)
+    opsx = str(core.REPO_DIR / "opsx")
+
+    def run(*a):
+        return subprocess.run([sys_mod.executable, opsx, *a], capture_output=True,
+                              text=True, env=env)
+
+    r = run("scenario", "list")
+    assert r.returncode == 0 and "systemd-restart" in r.stdout
+    r = run("scenario", "show", "docker-restart")
+    assert r.returncode == 0 and "container" in r.stdout
+    # 预检失败 → 3
+    d = Path(state, "scenarios")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "w6-cli.json").write_text(json.dumps({
+        "precheck": [{"cmd": "echo no", "expect": "yes"}],
+        "exec": {"cmd": "echo cli"},
+        "postcheck": [{"cmd": "echo bad", "expect": "good"}]}), encoding="utf-8")
+    r = run("scenario", "run", "w6-cli")
+    assert r.returncode == 3, (r.returncode, r.stdout)
+    assert "预检未通过" in r.stdout
+    # 验证失败 → 7（命令 exit=0 但后验不健康）
+    (d / "w6-cli.json").write_text(json.dumps({
+        "exec": {"cmd": "echo cli-changed"},
+        "postcheck": [{"cmd": "echo bad", "expect": "good"}]}), encoding="utf-8")
+    r = run("scenario", "run", "w6-cli")
+    assert r.returncode == 7, (r.returncode, r.stdout)
+    assert "验证失败" in r.stdout
+    # 回滚分支分两种：记录无快照 → 明确报错 1；有快照未加 --yes → 展示计划退出 2。
+    # 解析必须按真实输出格式（"执行记录: exe-…｜"），拿不到就失败，不能静默跳过。
+    m = re.search(r"执行记录: (exe-\S+?)｜", r.stdout)
+    assert m is not None, f"输出里没有执行记录: {r.stdout}"
+    r = run("scenario", "rollback", m.group(1))
+    assert r.returncode == 1 and "没有可回滚的内容" in r.stderr, (r.returncode, r.stderr)
+    # 有快照的记录：未加 --yes → 计划预览 2；--yes → 恢复并给出回滚后证据
+    snap_file = Path(state, "app.conf")
+    snap_file.write_text("old\n")
+    (d / "w6-cli2.json").write_text(json.dumps({
+        "exec": {"cmd": f"echo new > {snap_file}", "snapshot_files": [str(snap_file)]},
+        "postcheck": [{"cmd": f"cat {snap_file}", "expect": "new"}]}), encoding="utf-8")
+    assert run("approve", f"echo new > {snap_file}").returncode == 0
+    r = run("scenario", "run", "w6-cli2")
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    m = re.search(r"执行记录: (exe-\S+?)｜", r.stdout)
+    assert m is not None, f"输出里没有执行记录: {r.stdout}"
+    r = run("scenario", "rollback", m.group(1))
+    assert r.returncode == 2 and "--yes" in r.stdout, (r.returncode, r.stdout)
+    r = run("scenario", "rollback", m.group(1), "--yes")
+    assert r.returncode == 0 and "回滚后验证" in r.stdout, (r.returncode, r.stdout)
+    assert snap_file.read_text() == "old\n"
+
+
+def test_scenario_gate_codes_have_distinct_verdicts():
+    """门禁返回码分流（复审 M1）：120→uncertain、121→busy、快照门 2→gate_denied。
+
+    以前一律误判为 exec_failed/approval_required：121 的"目标被占用"消失，
+    快照命令守门被拒绝时给出的 approve 话术是误导（重批也解决不了）。
+    """
+    import scenario
+    import execution
+    # 120：同命令有未核实执行 → uncertain，不是 exec_failed
+    cmd = "docker restart w6-gate-unknown"
+    core.approve(cmd, ttl_seconds=60)
+    rec = execution.begin("exec", cmd, None, core.local_env(), phase="exec")
+    rec["pid"] = 99999999
+    with execution._locked():
+        execution._write(rec)
+    _write_scenario("w6-gate", {"exec": {"cmd": cmd},
+                                "postcheck": [{"cmd": "echo ok", "expect": "ok"}]})
+    result = scenario.run("w6-gate")
+    assert result["verdict"] == "uncertain", result["verdict"]
+    assert "不会自动重放" in result["suggestion"]
+    execution.resolve(rec["id"], "observed-failed")
+
+    # 121：目标锁被占 → busy，不是 exec_failed
+    cmd2 = "docker restart w6-gate-busy"
+    core.approve(cmd2, ttl_seconds=60)
+    _write_scenario("w6-gate-busy", {"exec": {"cmd": cmd2},
+                                     "postcheck": [{"cmd": "echo ok", "expect": "ok"}]})
+    with core.target_lock(None):
+        result = scenario.run("w6-gate-busy")
+    assert result["verdict"] == "busy", result["verdict"]
+    assert "占用" in result["suggestion"]
+
+    # 快照命令守门拒绝（snapshot_cmds 非 R0）→ gate_denied，不是 approval_required
+    cmd3 = "docker restart w6-gate-denied"
+    core.approve(cmd3, ttl_seconds=60)   # exec 已批准，仍被快照门拦下
+    _write_scenario("w6-gate-denied", {
+        "exec": {"cmd": cmd3,
+                 "snapshot_cmds": [{"command": "cp /a /b", "name": "x"}]},
+        "postcheck": [{"cmd": "echo ok", "expect": "ok"}]})
+    result = scenario.run("w6-gate-denied")
+    assert result["verdict"] == "gate_denied", result["verdict"]
+    assert "不是重新批准能解决的" in result["suggestion"]
+    assert "opsx approve" not in result["suggestion"]
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
