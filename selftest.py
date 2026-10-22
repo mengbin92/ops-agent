@@ -677,17 +677,65 @@ def test_markdown_inline_link_and_list():
 
 
 def test_copy_to_clipboard():
-    import shutil
+    """剪贴板复制：自检默认**不碰**系统剪贴板。
+
+    pbcopy 会覆盖用户当前复制的内容，而且没有可靠的"撤销"——内容已经丢了。
+    以前这里真跑 pbcopy，于是每执行一次 `./opsx selftest` 就把用户剪贴板换成
+    "ops-agent 复制测试 ✓"：用户按 Cmd+V 拿到的是这行字，必须重新复制一次。
+
+    默认路径全部用替身验证（命令选择、stdin 入参、降级与失败文案），
+    真实写入只在 OPSX_SELFTEST_CLIPBOARD=1 时执行，并尽量把原内容放回去。
+    """
     import subprocess as sp
+    import types
     from agent import repl
+
     text = "ops-agent 复制测试 ✓"
-    result = repl.copy_to_clipboard(text)
-    if shutil.which("pbcopy"):
-        pasted = sp.run(["pbpaste"], capture_output=True, text=True).stdout
-        assert pasted == text
-        assert "已复制" in result
-    else:  # 无剪贴板工具的环境：应优雅降级而非异常
-        assert "复制失败" in result or "已复制" in result
+    real_sub, real_shutil = repl.subprocess, repl.shutil
+
+    if os.environ.get("OPSX_SELFTEST_CLIPBOARD") == "1":
+        before = None
+        if real_shutil.which("pbpaste"):
+            before = sp.run(["pbpaste"], capture_output=True, text=True).stdout
+        try:
+            assert "已复制" in repl.copy_to_clipboard(text)
+            if real_shutil.which("pbcopy"):
+                pasted = sp.run(["pbpaste"], capture_output=True, text=True).stdout
+                assert pasted == text
+        finally:
+            if before is not None:  # 尽力恢复，别让自检留下自己的痕迹
+                sp.run(["pbcopy"], input=before, text=True, timeout=5, check=False)
+        return
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((list(cmd), kw.get("input")))
+        return sp.CompletedProcess(cmd, 0, "", "")
+
+    try:
+        repl.subprocess = types.SimpleNamespace(run=fake_run,
+                                                SubprocessError=sp.SubprocessError)
+        repl.shutil = types.SimpleNamespace(which=lambda name: f"/usr/bin/{name}")
+        result = repl.copy_to_clipboard(text)
+        assert "已复制" in result and calls, result
+        assert calls[0][1] == text, "文本必须作为 stdin 传给剪贴板工具"
+        assert calls[0][0][0] in ("pbcopy", "wl-copy", "xclip"), calls[0][0]
+
+        # 没有任何剪贴板工具：优雅降级，不抛异常
+        repl.shutil = types.SimpleNamespace(which=lambda name: None)
+        assert "复制失败" in repl.copy_to_clipboard(text)
+
+        # 工具存在但执行失败：返回说明而不是抛出去
+        def boom(cmd, **kw):
+            raise sp.CalledProcessError(1, cmd)
+
+        repl.subprocess = types.SimpleNamespace(run=boom,
+                                                SubprocessError=sp.SubprocessError)
+        repl.shutil = types.SimpleNamespace(which=lambda name: f"/usr/bin/{name}")
+        assert "复制失败" in repl.copy_to_clipboard(text)
+    finally:
+        repl.subprocess, repl.shutil = real_sub, real_shutil
 
 
 def test_repl_history_roundtrip():
