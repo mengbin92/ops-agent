@@ -218,8 +218,13 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
         # 审批绑定实际执行环境（主机/cwd/k8s context），批准后环境变化即失效。
         env = core.resolve_env(args["command"], target)
         warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
+        uses = args.get("uses", 1)
+        # 次数必须出现在确认框里：否则模型用 uses=100 换来的授权，人看起来和 1 次一样
+        times = "1 次（执行后即失效，再执行需重新批准）" if uses == 1 \
+            else f"{uses} 次（同一授权可重复执行 {uses} 次）"
         answer = ctx.ask_user(f"批准此变更？\n执行环境：{core.format_env(env)}\n"
                               f"风险级别：{level}{warning}\n"
+                              f"可用次数：{times}\n"
                               f"完整命令：\n{args['command']}\n"
                               "输入“确认执行”或 yes 批准，其他回答均拒绝。")
         if not isinstance(answer, str) or answer.strip().casefold() not in {"确认执行", "确认", "yes", "y"}:
@@ -227,12 +232,14 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
             core.audit("approve-deny", cmd=args["command"], level=level, target=target)
             return "[opsx 拒绝] 用户未明确批准此命令，不创建审批戳。"
         path = core.approve(args["command"], ttl_seconds=args.get("ttl_seconds", 900),
-                            force=args.get("force", False), target=target, env=env)
+                            force=args.get("force", False), target=target, env=env,
+                            uses=uses)
     except (core.OpsxError, remote.RemoteError) as e:
         return f"[opsx 错误] {e}"
     stamp = json.loads(path.read_text(encoding="utf-8"))
     return (f"审批戳已创建（级别 {stamp['level']}，TTL {stamp['ttl']}s，"
-            f"{core.format_env(env)}）。现在可重新执行该命令；环境变化后旧戳失效。")
+            f"可用 {stamp.get('uses', 1)} 次，{core.format_env(env)}）。"
+            "现在可重新执行该命令；执行一次即消耗一次，环境变化后旧戳失效。")
 
 
 def _ops_revoke(args: dict, ctx: ToolContext) -> str:
@@ -254,6 +261,7 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     snap_cmds = []
     for spec in args.get("snapshot_cmds", []):
         snap_cmds.append((spec["command"], spec.get("name", "")))
+    started = time.time()
     if target:
         code, sid, output = remote.exec_change(target, cmd, _snapshot_filespec(args), snap_cmds)
     else:
@@ -261,9 +269,31 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     out_text = _cap(output, f"exec-{target or 'local'}") if output else "(无输出)"
     sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     where = f"目标 {target} " if target else "本机"
+    import execution
+    record = execution.find_latest(cmd, target)
+    # 只认本次调用产生的记录：被门禁挡下时不会新建记录，find_latest 会返回上一条，
+    # 那样会把"这次没执行"配上一次的状态（"失败 + 状态 succeeded"）
+    if record is not None and float(record.get("started_ts") or 0) < started:
+        record = None
+    exec_text = ""
+    if record is not None:
+        exec_text = f"；execution_id={record['id']}（状态 {record['status']}）"
+        if record["status"] == "unknown":
+            # 这一条最重要：状态未知时不能让人以为"没生效"而直接重跑
+            exec_text += ("\n**结果未知**：断线/超时导致无法确认命令是否完成。"
+                          "不要重复执行同一条命令（会二次生效）；"
+                          "同目标同命令的新执行会被拒绝，直到有人核实："
+                          f"`opsx executions resolve {record['id']} "
+                          "--observed-ok|--observed-failed`")
+    # "没执行"的判据是"本次没有一条说明命令已下发的记录"，而不是退出码：
+    # 命令自身也可能返回 2（审批未通过）之外的同名码，光看数字会互相误判。
+    executed = record is not None and record.get("status") in ("succeeded", "failed",
+                                                               "unknown")
+    if not executed and code != 0:
+        return f"[opsx 拒绝] {where}本次未执行（exit={code}）。\n{out_text}"
     if code == 0:
-        return f"[完成] {where}执行成功（exit=0），{sid_text}。\n{out_text}"
-    return f"[失败] {where}执行未完成（exit={code}），{sid_text}。\n{out_text}"
+        return f"[完成] {where}执行成功（exit=0），{sid_text}{exec_text}。\n{out_text}"
+    return f"[失败] {where}执行未完成（exit={code}），{sid_text}{exec_text}。\n{out_text}"
 
 
 def _ops_rollback(args: dict, ctx: ToolContext) -> str:
@@ -285,11 +315,35 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
         return f"[opsx 错误] {e}"
 
 
-SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events"})
+def _ops_executions(args: dict, ctx: ToolContext) -> str:
+    """只读查询变更执行记录。刻意不提供"核实"动作：unknown 必须由人关闭。"""
+    import execution
+    # 不调 reconcile：这是声明为只读的工具，对账落盘交给 opsx executions / daemon。
+    # list_records 会把"进程已死但仍是 running"的记录按 unknown/aborted 呈现。
+    if args.get("action", "list") == "show":
+        record = execution.get(args.get("execution_id") or "")
+        if record is None:
+            return f"[错误] 没有这条执行记录: {args.get('execution_id')!r}"
+        return execution.format_record(record)
+    tail = args.get("tail", 20)
+    if type(tail) is not int or tail < 0:
+        return "[错误] tail 须为非负整数"
+    summary = execution.summary()
+    text = execution.format_list(execution.list_records(
+        tail=tail, status=args.get("status") or None))
+    if summary["pending"]:
+        text += (f"\n\n待核实 {summary['pending']} 条："
+                 f"{', '.join(summary['pending_ids'])}\n"
+                 "这些记录的变更结果未知，同目标同命令不会被放行重放。"
+                 "请让人执行 `opsx executions resolve <id> --observed-ok|--observed-failed`。")
+    return text
+
+
+SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events", "ops_executions"})
 # 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见。
 # inspect 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
 SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent",
-                             "inspect", "events", "ops_list"})
+                             "inspect", "events", "ops_executions", "ops_list"})
 SUBAGENT_MAX_TASKS = 4
 SUBAGENT_MAX_TURNS = 8
 WORKFLOW_PREV_LIMIT = 6000
@@ -740,7 +794,9 @@ REGISTRY: dict[str, dict] = {
                           {"command": {"type": "string"},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
                            "ttl_seconds": {"type": "integer", "default": 900},
-                           "force": {"type": "boolean", "default": False}}, ["command"]),
+                           "force": {"type": "boolean", "default": False},
+                           "uses": {"type": "integer", "default": 1,
+                                    "description": "该授权允许执行几次（默认 1）"}}, ["command"]),
         "handler": _ops_approve, "read_only": False,
     },
     "ops_revoke": {
@@ -770,6 +826,20 @@ REGISTRY: dict[str, dict] = {
                           "执行前自动保存回滚前副本（本机快照恢复文件，远程快照推回目标机）。",
                           {"snapshot_id": {"type": "string"}}, ["snapshot_id"]),
         "handler": _ops_rollback, "read_only": False,
+    },
+    "ops_executions": {
+        "schema": _schema("ops_executions",
+                          "查变更执行记录（只读）：status=running/unknown 表示结果尚未确定；"
+                          "unknown 需由人核实（opsx executions resolve），模型不能自行关闭。",
+                          {"action": {"type": "string", "enum": ["list", "show"],
+                                      "default": "list"},
+                           "execution_id": {"type": "string"},
+                           "tail": {"type": "integer", "default": 20},
+                           "status": {"type": "string",
+                                      "enum": ["running", "succeeded", "failed", "unknown",
+                                               "aborted"]}},
+                          []),
+        "handler": _ops_executions, "read_only": True,
     },
     "ops_list": {
         "schema": _schema("ops_list", "列出快照、审批戳与已注册的 SSH 目标。", {}, []),

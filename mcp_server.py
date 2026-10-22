@@ -70,6 +70,8 @@ TOOLS = [
             "command": {"type": "string"},
             "ttl_seconds": {"type": "integer", "default": 900},
             "force": {"type": "boolean", "default": False},
+            "uses": {"type": "integer", "default": 1,
+                     "description": "该授权允许执行几次；默认 1 = 一次批准只生效一次"},
         },
         "required": ["command"],
     }),
@@ -103,6 +105,17 @@ TOOLS = [
                        "confirm": {"type": "boolean", "default": False}},
         "required": ["snapshot_id"],
     }),
+    _tool("ops_executions", "变更执行记录：查状态与待核实项（只读；核实请用 opsx executions resolve）", {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "show"], "default": "list"},
+            "execution_id": {"type": "string"},
+            "tail": {"type": "integer", "default": 20},
+            "status": {"type": "string", "enum": ["running", "succeeded", "failed",
+                                                  "unknown", "aborted"]},
+        },
+        "required": [],
+    }, read_only=True),
     _tool("ops_list", "列出快照与审批戳（只读）", {
         "type": "object", "properties": {},
     }, read_only=True),
@@ -142,10 +155,11 @@ def call_tool(name, args):
             cmd,
             ttl_seconds=args.get("ttl_seconds", 900),
             force=args.get("force", False),
+            uses=args.get("uses", 1),
         )
         stamp = json.loads(path.read_text(encoding="utf-8"))
         return _result({"stamp_file": path.name, "level": stamp["level"],
-                        "ttl_seconds": stamp["ttl"],
+                        "ttl_seconds": stamp["ttl"], "uses": stamp.get("uses", 1),
                         "env": core.format_env(stamp.get("env") or core.local_env())})
     if name == "ops_revoke":
         revoked = core.revoke(_require(args, "command"))
@@ -157,8 +171,26 @@ def call_tool(name, args):
             args.get("snapshot_files", []),
             snap_cmds,
         )
+        import execution
+        record = execution.find_latest(_require(args, "command"))
         payload = {"exit_code": code, "snapshot_id": sid, "output": output[:4000]}
+        if record is not None:
+            payload["execution_id"] = record["id"]
+            payload["execution_status"] = record["status"]
         return _result(payload)
+    if name == "ops_executions":
+        import execution
+        # 不落盘对账：本工具标了 readOnlyHint，list_records 的视图已按 unknown/aborted 呈现
+        if args.get("action", "list") == "show":
+            record = execution.get(_require(args, "execution_id"))
+            if record is None:
+                raise core.OpsxError(f"没有这条执行记录: {args.get('execution_id')}")
+            return _result(record)
+        summary = execution.summary()
+        return _result({"summary": summary,
+                        "records": execution.list_records(
+                            tail=args.get("tail", 20),
+                            status=args.get("status") or None)})
     if name == "ops_rollback":
         sid = _require(args, "snapshot_id")
         plan = remote.rollback_plan(sid)

@@ -81,6 +81,11 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 ./opsx rollback <snapshot_id>          # 先展示目标/影响文件/差异，确认后才改写
 ./opsx rollback <snapshot_id> --yes    # 已核对计划（非交互环境必须显式加）
 
+# 变更执行记录（每次 exec/rollback 一条，断线后靠它确认结果）
+./opsx executions                      # 最近 20 条 + 待核实项
+./opsx executions show <execution_id>
+./opsx executions resolve <id> --observed-ok|--observed-failed
+
 # 确定性巡检（规则检查不依赖模型，退出码 0/2/3/1）
 ./opsagent inspect
 ./opsagent inspect --target web1 --json
@@ -108,9 +113,16 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 
 - agent 内：只读排查用 `bash` 带 `target`（仍要求 R0）；写操作 `ops_approve` 与 `ops_exec`
   必须带同一个 `target`——本机戳不能用于远程目标，A 机器的戳也不能拿到 B 机器用。
-- 远程快照：执行前用 `cat` 拉回 `~/.ops-agent/snapshots/<id>/files/...` 存档（快照路径用绝对路径）；
-  回滚用 stdin 覆盖写回（保留原 inode/权限；文件已被删则重建，权限取默认值）。
+- 远程快照：执行前用 `cat` 拉回 `~/.ops-agent/snapshots/<id>/files/...` 存档（快照路径用绝对路径），
+  同时记录权限与属主；快照还记录目标机指纹（hostname + machine-id 前 12 位）。
   目标机不需要安装任何东西。
+- 远程回滚是**原子写**：目标目录内 `mktemp` → 写入 → 校验字节数 → `chmod` → `rename`。
+  写一半断线不会留下半份配置（要么旧内容、要么完整新内容）；软链会被解析到真实文件
+  且保留链接本身。权限按快照记录还原；快照没记权限时，覆盖已有文件沿用目标当前权限、
+  重建用 0600。文件此前被删除时按快照重建，属主/属组**不自动还原**（需要 root），
+  报告里会写明，需要时人工 `chown`。
+- 目标被改指向（`targets.json` 换了 host，或指纹对不上）时拒绝回滚——
+  拿 A 机的快照覆盖 B 机是灾难。
 - 认证：`BatchMode=yes`，要求密钥/ssh-agent 免密——agent 无人值守，不能停在密码提示上。
 - 目标字段（host/user/port/identity）含空白或前导 `-` 一律拒绝，避免配置值被 ssh 当成选项。
 - 同一份注册表也是**巡检清单**：可选字段 `tags` / `env` / `services` / `checks` / `enabled`
@@ -195,6 +207,48 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   中途被 kill 时，排队中的任务仍是到期状态，下一轮会补上（不会被静默跳过）。
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
+
+### 变更执行记录与并发控制（W5）
+
+变更不再只有"退出码"这一个结果。每次 `opsx exec` / `opsx rollback` 都落一条记录
+（`~/.ops-agent/executions/<id>.json`，0600，保留 500 条），带 id、状态、证据：
+
+```
+running ──exit=0──────────────────────▶ succeeded
+   │
+   ├──明确失败（非零退出 / 本机超时且已终止）──▶ failed
+   ├──执行前中止（守门 / 快照 / 审批 / 锁冲突）──▶ aborted
+   └──无法确认（SSH 断线 255 / 远程超时 / 进程被杀）──▶ unknown
+```
+
+**unknown 是唯一需要人介入的终态。** 它表示"命令可能已经生效一部分"——断线、远程超时、
+执行进程被 kill 都属于这种。这时系统不会自动重放：同一目标同一命令的新执行会被拒绝
+（exit 120），直到有人核实：
+
+```bash
+./opsx executions show <id>                          # 看命令、目标、快照、错误
+./opsx executions resolve <id> --observed-ok         # 核实：已生效（不要再跑一次）
+./opsx executions resolve <id> --observed-failed     # 核实：未生效（可重新批准后执行）
+```
+
+核实只记录事实，不提供任何自动动作：`--observed-ok` 之后再执行一次往往是错的
+（重复生效），`--observed-failed` 才是"重试"的前提。
+
+| 机制 | 行为 |
+|---|---|
+| 目标级写锁 | 同一目标同一时刻只允许一个变更；锁覆盖"快照 + 执行"整段（否则后一个的快照会含前一个的改动，回滚就回到中间态）。抢不到锁 exit 121，并记一条 `aborted` |
+| 审批次数 | 一次批准只对应一次执行（`--uses N` 可显式放宽，R3 不可逆操作只能是 1）。次数在**确定要执行**的那一刻才消耗：预检、`opsx check`、hook 都不会用掉授权 |
+| 断线判定 | SSH exit 255 / 远程超时 → `unknown`（远端可能仍在跑）；本机超时 → `failed`（进程组已被 kill） |
+| 执行前中止 | 参数错误、锁冲突、快照失败、审批用尽 → `aborted`，明确"本次没执行"，不制造待核实项 |
+| 部分恢复 | 回滚中途失败会写明"已恢复 N/M 个文件"，不会只说"失败"让人以为文件没动 |
+
+`opsx exec` 的退出码：`0` 成功、`1` 执行失败、`2` 无授权/守门拒绝、`3` 快照失败、
+`4` 超时、`120` 有未核实的 unknown 挡着、`121` 目标正被另一次变更占用。
+120/121 只描述"本次没执行"，不描述结果——命令自身的退出码可能是 5/6，
+所以判断"有没有执行"要看执行记录，不要只看数字。
+
+已知边界：进程存活判断用 pid，pid 被复用时方向是**少拦**（看起来还在跑 → 放行）；
+`unknown` 只说明"无法确认"，不代表一定生效，需要按证据人工核实。
 
 ### 通知与事件（W4）
 
@@ -453,11 +507,14 @@ W4 已支持单向 webhook、事件去重与恢复通知；双向 IM 对话尚�
 core.py 为纯函数库；演进 MCP server / agent 内核时直接包装同一组函数，状态目录布局即对外契约。
 独立化演进路线（流式输出、compaction、skills、子代理、远程通道）见设计文档第 5 节。
 
-已按八周排期交付：W1 安全边界 → W2 确定性巡检 → W3 可追踪运行 → W4 通知与事件。状态目录新增
-`runs/`（运行记录）、`reports/`（巡检报告）、`signals/`（规则结果摘要）、`notifications/`
-（发件箱）、`events.jsonl`（事件时间线）、`notify.json`（通知渠道，0600）。这些文件都是本地
-事实来源，不需要数据库。调度、运行与通知 JSON 用临时文件替换；JSONL 查询跳过损坏行，
-配置损坏会报错，重要状态仍应备份。
+已按八周排期交付：W1 安全边界 → W2 确定性巡检 → W3 可追踪运行 → W4 通知与事件 →
+W5 变更执行记录与并发控制。状态目录新增 `runs/`（运行记录）、`reports/`（巡检报告）、
+`signals/`（规则结果摘要）、`notifications/`（发件箱）、`events.jsonl`（事件时间线）、
+`notify.json`（通知渠道，0600）、`executions/`（变更执行记录）、`locks/`（目标级写锁）。
+这些文件都是本地事实来源，不需要数据库。调度、运行、通知与执行记录 JSON 用临时文件替换；
+JSONL 查询跳过损坏行；配置损坏会报错；重要状态仍应备份。
 
-2026-10-22 对照路线图复审并修复 W1–W4：`./opsx selftest` **241/241 passed**，
-详细问题、修复与验证见 [复审记录](docs/reviews/2026-10-22-roadmap-implementation-review.md)。
+2026-10-22 对照路线图复审并修复 W1–W4（`241/241`），随后交付 W5（`261/261`）：
+详细问题、修复与验证见
+[W1–W4 复审记录](docs/reviews/2026-10-22-roadmap-implementation-review.md) 与
+[W5 复审记录](docs/reviews/2026-10-22-week5-change-safety-review.md)。

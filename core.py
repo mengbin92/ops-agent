@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,10 +26,16 @@ STATE_DIR = Path(os.environ.get("OPSX_STATE_DIR", str(Path.home() / ".ops-agent"
 REPO_DIR = Path(__file__).resolve().parent
 
 _RANK = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+MAX_APPROVAL_USES = 100      # 单个审批戳最多可用次数（防止"一次批准、长期免检"）
 
 
 class OpsxError(Exception):
     pass
+
+
+class TargetBusy(OpsxError):
+    """目标正被另一次变更占用。单独一类是为了让调用方区分"并发冲突"与其它错误：
+    前者要用自己的退出码/提示（不是"你的命令有问题"）。"""
 
 
 # ---- 秘密脱敏与敏感文件：模型请求、会话、审计、输出落盘共用同一出口 ----
@@ -380,6 +387,19 @@ def audit(event: str, **fields) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _safe_audit(event: str, **fields) -> None:
+    """变更路径的审计写入：失败不打断已完成的变更，但必须让人看见。
+
+    为什么不能直接用 audit：一次 exec 已经执行完，此时 audit 因磁盘满抛 OSError，
+    会把"执行完成"变成"调用方收到异常、看不到输出"，进而可能被当成"没执行"重跑。
+    """
+    try:
+        audit(event, **fields)
+    except OSError as e:
+        print(f"[opsx] 警告：审计写入失败（{type(e).__name__}: {e}）——"
+              "本次变更状态以 executions 记录为准，但缺审计留痕", file=sys.stderr)
+
+
 def normalize(cmd: str) -> str:
     if re.search(r"['\"\\\n\r]", cmd):
         return cmd  # 引号、转义及换行中的空白会改变 shell 语义
@@ -506,17 +526,131 @@ def _validate_k8s_change_scope(cmd: str) -> None:
         raise OpsxError("kubectl 变更的 namespace 须为非空、无变量展开的固定值")
 
 
+# ---- 目标级写锁：同一目标同一时刻只允许一个变更在执行 ----
+# 为什么需要：快照→执行→(下一步)验证这条链路不是原子的，两个会话交错执行时，
+# 后一个的快照可能已经包含前一个的改动，"回滚到快照"就回到一个中间态。
+# 锁按目标划分（本机算一个目标）：不同目标的变更互不阻塞，同一目标必须串行。
+_TARGET_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+LOCAL_TARGET = "local"
+LOCAL_LOCK_FILE = "@local"
+DEFAULT_LOCK_WAIT = 0.0      # 默认不等待：并发写入立即失败，比两边互等更可诊断
+
+
+def _lock_name(target: str | None) -> str:
+    """锁文件名。本机用 `@local` 而不是 `local`：`local` 是合法目标名，
+    否则"本机"与"名为 local 的远程目标"会抢同一把锁，互相误判占用。"""
+    if target is None:
+        return LOCAL_LOCK_FILE
+    if not isinstance(target, str) or not _TARGET_RE.fullmatch(target):
+        raise OpsxError(f"非法的锁目标名: {target!r}（1-64 位字母数字._-）")
+    return target
+
+
+def _lock_path(target: str | None) -> Path:
+    return STATE_DIR / "locks" / f"{_lock_name(target)}.lock"
+
+
+def _validate_lock_args(target: str | None, wait) -> None:
+    """锁相关参数的校验，单独暴露给 exec_change 提前调用。
+
+    否则 `--wait-lock -1` 这类参数错误会发生在记录已经建好、锁还没拿到的时候，
+    被记成一条"结果未知"，并要求人去核实一条根本没下发的命令。
+    """
+    _lock_name(target)
+    if type(wait) not in (int, float) or not math.isfinite(wait) or wait < 0:
+        raise OpsxError("锁等待秒数须为非负数值")
+
+
+def _read_lock_owner(fd: int) -> str:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+        info = json.loads(raw) if raw else {}
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    bits = []
+    if info.get("execution_id"):
+        bits.append(f"execution {info['execution_id']}")
+    if info.get("pid"):
+        bits.append(f"pid {info['pid']}")
+    if info.get("actor"):
+        bits.append(f"来源 {info['actor']}")
+    return "，".join(bits)
+
+
+@contextmanager
+def target_lock(target: str | None, wait: float = DEFAULT_LOCK_WAIT,
+                actor: str = "", execution_id: str | None = None):
+    """目标级排他锁。拿不到就抛 OpsxError（不做静默等待）。
+
+    wait：最多等待秒数。默认 0 = 立即失败，错误里带持有者信息，让人能判断是
+    "另一个会话正在改"还是"上次崩了留下的锁"（flock 随进程退出自动释放，
+    所以后者不会发生，残留文件不代表被锁）。
+    """
+    _validate_lock_args(target, wait)
+    path = _lock_path(target)
+    _ensure_state_dir()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    name = target or LOCAL_TARGET
+    deadline = time.monotonic() + wait
+    acquired = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    if not acquired:
+        owner = _read_lock_owner(fd)
+        os.close(fd)
+        detail = f"（当前持有者：{owner}）" if owner else ""
+        raise TargetBusy(
+            f"目标 {name} 正在被另一次变更占用{detail}：拒绝并发写入。"
+            "等它结束后重试；flock 随进程退出自动释放，残留的锁文件本身不代表被占用。")
+    payload = json.dumps({"pid": os.getpid(), "target": name, "actor": actor,
+                          "execution_id": execution_id,
+                          "at": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False)
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload.encode("utf-8"))
+    except OSError:
+        pass  # 持有者信息只是诊断用，写不进去不影响锁本身
+    _safe_audit("target-lock", target=name, actor=actor, execution_id=execution_id)
+    try:
+        yield
+    finally:
+        try:
+            os.ftruncate(fd, 0)   # 先清持有者信息再解锁：避免释放后留下"好像还被占着"
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        _safe_audit("target-unlock", target=name, actor=actor, execution_id=execution_id)
+
+
 def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
-            target: str | None = None, env: dict | None = None) -> Path:
+            target: str | None = None, env: dict | None = None,
+            uses: int = 1) -> Path:
     if type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise OpsxError("审批 TTL 须为正整数秒")
     if type(force) is not bool:
         raise OpsxError("force 须为布尔值")
+    if type(uses) is not int or not 1 <= uses <= MAX_APPROVAL_USES:
+        raise OpsxError(f"审批可用次数须为 1-{MAX_APPROVAL_USES} 的整数（默认 1：一次一变）")
     level, _ = classify(cmd)
     if level == "R0":
         raise OpsxError("只读命令无需审批戳")
     if level == "R3" and not force:
         raise OpsxError("R3 命令需 --force 显式确认（不可逆操作）")
+    if level == "R3" and uses != 1:
+        # 不可逆操作不接受"一次批准、多次执行"：重复生效的代价无法回滚
+        raise OpsxError("R3 不可逆操作的审批只能使用 1 次（uses 必须为 1）")
     env = env or resolve_env(cmd, target)
     _validate_k8s_change_scope(cmd)
     stamp = {
@@ -529,15 +663,58 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
         "force": force,
         "level": level,
         "method": "manual",
+        # 次数受控：默认一次一变。uses>1 是给"必须重试同一命令"的场景（如幂等部署脚本），
+        # 每次都必须在执行时消耗，不能在预检时消耗。
+        "uses": uses,
+        "used": 0,
     }
     p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
     _ensure_state_dir()
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    p.write_text(json.dumps(stamp, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 与 consume_stamp 共用 approvals 的 flock 并原子替换：否则并发的"消耗"会用旧内容
+    # 覆盖刚写入的新授权（新 uses 丢失、used 回退），或让 reader 读到半截 JSON。
+    with open(p.parent / ".mutex", "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(stamp, out, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
     prune_approvals()  # 顺带清理过期戳
-    audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target,
-          env=env)
+    _safe_audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target,
+          env=env, uses=uses)
     return p
+
+
+def _stamp_uses(stamp: dict) -> tuple[int, int]:
+    """(允许次数, 已用次数)。旧戳没有这两个字段：按"还剩一次未用"处理。"""
+    uses = stamp.get("uses", 1)
+    used = stamp.get("used", 0)
+    if type(uses) is not int or not 1 <= uses <= MAX_APPROVAL_USES:
+        uses = 1
+    if type(used) is not int or used < 0:
+        used = 0
+    return uses, used
+
+
+def _stamp_valid(stamp, cmd: str, target: str | None, env: dict | None) -> bool:
+    """审批戳是否仍然可用（只读判断，不消耗次数）。
+
+    check_stamp 与 consume_stamp 共用同一份判定：分成两套逻辑时，
+    迟早会出现"预检通过、执行时却按另一套规则拒绝/放行"的不一致。
+    """
+    if not isinstance(stamp, dict):
+        return False
+    uses, used = _stamp_uses(stamp)
+    return (_stamp_live(stamp) and used < uses and
+            stamp.get("cmd_hash") == cmd_hash(cmd, target) and
+            normalize(stamp.get("cmd") or "") == normalize(cmd) and
+            stamp.get("target") == target and stamp.get("env") == env and
+            stamp.get("level") == classify(cmd)[0] and
+            (stamp.get("level") != "R3" or stamp.get("force") is True))
 
 
 def check_stamp(cmd: str, target: str | None = None, env: dict | None = None) -> bool:
@@ -549,12 +726,65 @@ def check_stamp(cmd: str, target: str | None = None, env: dict | None = None) ->
         _validate_k8s_change_scope(cmd)
         if env is None:
             env = resolve_env(cmd, target)
-        return (_stamp_live(s) and s["cmd_hash"] == cmd_hash(cmd, target) and
-                normalize(s["cmd"]) == normalize(cmd) and s.get("target") == target and
-                s.get("env") == env and
-                s["level"] == classify(cmd)[0] and
-                (s["level"] != "R3" or s.get("force") is True))
+        return _stamp_valid(s, cmd, target, env)
     except Exception:  # noqa: BLE001 —— 环境解析或戳内容任何异常都按无效处理（安全方向）
+        return False
+
+
+def consume_stamp(cmd: str, target: str | None = None,
+                  env: dict | None = None) -> int | None:
+    """原子地消耗一次审批，返回剩余次数；戳无效/已用完返回 None。
+
+    必须由真正执行变更的路径调用（exec_change / remote.exec_change），且要在
+    "确定要执行"之后：放在 check/hook 预检里会把戳提前用掉，用户什么都没改成，
+    授权却没了。整个过程在 approvals 的 flock 内完成，两个进程同时消耗不会双花。
+    """
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
+    _ensure_state_dir()
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    remaining = None
+    with open(p.parent / ".mutex", "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            if not p.exists():
+                return None
+            try:
+                stamp = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            if env is None:
+                try:
+                    env = resolve_env(cmd, target)
+                except Exception:  # noqa: BLE001 —— 含 RemoteError：解析不出环境就不放行
+                    return None
+            if not _stamp_valid(stamp, cmd, target, env):
+                return None
+            uses, used = _stamp_uses(stamp)
+            stamp["used"] = used + 1
+            tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(stamp, out, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+            remaining = uses - stamp["used"]
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    _safe_audit("approve-consume", cmd=cmd, target=target, remaining=remaining)
+    return remaining
+
+
+def stamp_exhausted(cmd: str, target: str | None = None) -> bool:
+    """戳还在有效期内，但可用次数已用完：给"请重新批准"而不是"没有审批"。"""
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
+    if not p.exists():
+        return False
+    try:
+        stamp = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(stamp, dict) or not _stamp_live(stamp):
+            return False
+        uses, used = _stamp_uses(stamp)
+        return used >= uses
+    except (OSError, ValueError):
         return False
 
 
@@ -584,9 +814,18 @@ def prune_approvals() -> None:
 def revoke(cmd: str, target: str | None = None) -> bool:
     """撤销审批戳（用户取消变更/提前失效）。返回是否确有戳被删除。"""
     p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
-    existed = p.exists()
-    p.unlink(missing_ok=True)
-    audit("revoke", cmd=cmd, target=target, existed=existed)
+    _ensure_state_dir()
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # 与 approve/consume 共用同一把锁：否则"消耗"在锁内已读到戳，撤销删掉后它又把
+    # 文件写回去（used+1），撤销被静默推翻。
+    with open(p.parent / ".mutex", "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            existed = p.exists()
+            p.unlink(missing_ok=True)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    _safe_audit("revoke", cmd=cmd, target=target, existed=existed)
     return existed
 
 
@@ -600,9 +839,12 @@ def collect_state() -> dict:
         for p in sorted(adir.glob("*.json")):
             try:
                 st = json.loads(p.read_text(encoding="utf-8"))
-                if (not _stamp_live(st) or not isinstance(st.get("cmd"), str)
-                        or not isinstance(st.get("env"), dict)):
+                if not isinstance(st, dict):
                     continue
+                uses, used = _stamp_uses(st)
+                if (not _stamp_live(st) or not isinstance(st.get("cmd"), str)
+                        or not isinstance(st.get("env"), dict) or used >= uses):
+                    continue  # 已用尽的戳不是"可用授权"，列出来会让人误判还有额度
                 if st.get("level") not in _RANK or st.get("target") is not None and not isinstance(st["target"], str):
                     continue
                 approvals.append({"cmd": st["cmd"], "level": st["level"], "ttl": st["ttl"],
@@ -654,6 +896,10 @@ def check(cmd: str, target: str | None = None, env: dict | None = None) -> tuple
     if check_stamp(cmd, target, env):
         audit("check", cmd=cmd, level=level, result="allow-stamp", target=target)
         return 0, "有效审批戳，放行"
+    if stamp_exhausted(cmd, target):
+        audit("check", cmd=cmd, level=level, result="deny-exhausted", target=target)
+        return 2, ("[opsx] 审批戳已用尽（该授权只允许有限次执行）：请重新批准本次变更。"
+                   "一次批准对应一次执行，避免旧授权被反复复用。")
     if stamp_env_mismatch(cmd, target, env):
         audit("check", cmd=cmd, level=level, result="deny-env", target=target)
         return 2, ("[opsx] 审批戳的执行环境已变化（主机/工作目录/KUBECONFIG/k8s context 不同），"
@@ -799,8 +1045,11 @@ def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
             if item["type"] == "file":
                 if not isinstance(item["src"], str) or not item["src"].startswith("/") or "\x00" in item["src"]:
                     raise ValueError("源文件路径须为绝对路径")
-                if not meta.get("target") and (type(item.get("mode")) is not int or not 0 <= item["mode"] <= 0o7777):
+                if item.get("mode") is not None and (type(item["mode"]) is not int
+                                                     or not 0 <= item["mode"] <= 0o7777):
                     raise ValueError("文件权限非法")
+                if item.get("owner") is not None and not isinstance(item["owner"], str):
+                    raise ValueError("属主记录非法")
             elif not isinstance(item.get("cmd"), str):
                 raise ValueError("快照命令非法")
         return d, meta
@@ -921,7 +1170,7 @@ def _rollback_backup(original_sid: str, target: str | None, file_items: list,
     except BaseException:  # 含 Ctrl-C：清掉半成品目录后原样抛出
         shutil.rmtree(d, ignore_errors=True)
         raise
-    audit("rollback-backup", id=sid, rollback_of=original_sid, target=target,
+    _safe_audit("rollback-backup", id=sid, rollback_of=original_sid, target=target,
           files=len(items))
     return sid
 
@@ -930,7 +1179,9 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
     """恢复本机快照。confirm=False 时只做只读的事（拒绝文件写入，返回捕获状态除外）。
 
     回滚本身是写操作：入口（CLI/agent/MCP）展示 rollback_plan 并由人确认后再传 confirm。
+    回滚也走目标锁与执行记录：并发回滚会互相覆盖，失败/中断必须留下"恢复了几个文件"。
     """
+    import execution
     d, meta = load_snapshot(snapshot_id)
     if meta.get("target"):
         raise OpsxError("远程快照须通过 remote.rollback 恢复")
@@ -938,43 +1189,61 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
     if file_items and not confirm:
         raise OpsxError("回滚会覆盖当前文件，属于写操作：请先预览并由人确认"
                         "（CLI: opsx rollback <id>；agent: ops_rollback 会展示差异并确认）")
-    backup_sid = None
-    report = []
-    try:
-        if file_items:
-            backup_sid = _rollback_backup(
-                snapshot_id, None, file_items, _local_read_state,
-                lambda src: stat.S_IMODE(Path(src).stat().st_mode))
-        for item in meta["items"]:
-            if item["type"] == "file":
-                staged = None
-                try:
-                    with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent,
-                                                     delete=False) as f:
-                        staged = Path(f.name)
-                    shutil.copy2(d / item["dest"], staged)
-                    os.chmod(staged, item["mode"])
-                    os.replace(staged, item["src"])
-                except OSError as e:
-                    raise OpsxError(f"文件回滚失败 {item['src']}: {e}") from e
-                finally:
-                    if staged is not None:
-                        staged.unlink(missing_ok=True)
-                report.append(f"已恢复文件: {item['src']}")
-            else:
-                out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
-                report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
-    except OpsxError as e:
-        audit("rollback-failed", snapshot_id=snapshot_id,
-              backup_snapshot_id=backup_sid, error=str(e))
+    with target_lock(None, actor="rollback"):
+        rec = execution.begin("rollback", f"rollback {snapshot_id}", None,
+                              local_env(), snapshot_id=snapshot_id, phase="backup")
+        backup_sid = None
+        report = []
+        restored = 0
+        try:
+            if file_items:
+                backup_sid = _rollback_backup(
+                    snapshot_id, None, file_items, _local_read_state,
+                    lambda src: stat.S_IMODE(Path(src).stat().st_mode))
+                execution.update(rec["id"], phase="restore")
+            for item in meta["items"]:
+                if item["type"] == "file":
+                    staged = None
+                    try:
+                        with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent,
+                                                         delete=False) as f:
+                            staged = Path(f.name)
+                        shutil.copy2(d / item["dest"], staged)
+                        # mode 缺省（手工改过的旧快照）不能让回滚崩在半路：
+                        # 先写 0600，恢复成功后至少不会把 0600 的文件放大成 0644。
+                        os.chmod(staged, item.get("mode") or 0o600)
+                        os.replace(staged, item["src"])
+                    except OSError as e:
+                        raise OpsxError(f"文件回滚失败 {item['src']}: {e}") from e
+                    finally:
+                        if staged is not None:
+                            staged.unlink(missing_ok=True)
+                    report.append(f"已恢复文件: {item['src']}")
+                    restored += 1
+                else:
+                    out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
+                    report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
+        except OpsxError as e:
+            _safe_audit("rollback-failed", snapshot_id=snapshot_id,
+                  backup_snapshot_id=backup_sid, error=str(e), execution_id=rec["id"])
+            # 部分恢复必须说清楚：只说"失败"会让人以为文件没动
+            error = f"{e}（已恢复 {restored}/{len(file_items)} 个文件）"
+            execution.finish(rec["id"], "failed", error=error)
+            if backup_sid:
+                raise OpsxError(f"{error}（回滚前副本: {backup_sid}）") from e
+            raise
+        except BaseException:
+            execution.finish(
+                rec["id"], "unknown",
+                error=f"回滚被中断，已恢复 {restored}/{len(file_items)} 个文件，需核实")
+            raise
         if backup_sid:
-            raise OpsxError(f"{e}（回滚前副本: {backup_sid}）") from e
-        raise
-    if backup_sid:
-        report.append(f"回滚前副本: {backup_sid}"
-                      f"（如需撤销本次回滚: opsx rollback {backup_sid}）")
-    audit("rollback", snapshot_id=snapshot_id, backup_snapshot_id=backup_sid,
-          files=[item["src"] for item in file_items])
+            report.append(f"回滚前副本: {backup_sid}"
+                          f"（如需撤销本次回滚: opsx rollback {backup_sid}）")
+        execution.finish(rec["id"], "succeeded", output="\n".join(report))
+    _safe_audit("rollback", snapshot_id=snapshot_id, backup_snapshot_id=backup_sid,
+          execution_id=rec["id"], files=[item["src"] for item in file_items])
+    execution.prune()
     return "\n".join(report)
 
 
@@ -992,6 +1261,35 @@ def prune_snapshots(keep: int = 200) -> None:
 
 EXEC_TIMEOUT = 3600          # 变更命令默认最长 1 小时
 EXEC_AUDIT_OUTPUT = 2000     # 审计里保留的输出字符数
+# 退出码：0 成功 / 1 执行失败 / 2 无授权或守门拒绝 / 3 快照失败 /
+# 4 超时（本机已终止；远程是否仍在跑见执行记录）/ 120 有未核实的 unknown 挡着 /
+# 121 目标正被另一次变更占用。120/121 只描述"本次没执行"，不描述结果。
+# 不使用 5/6：命令自身的退出码也可能是 5 或 6（rsync/curl/systemctl/自定义脚本都有），
+# 那样调用方会把"命令真的失败了"误读成"没执行"。120/121 在运维工具里罕见。
+EXEC_ABORT_UNKNOWN = 120
+EXEC_ABORT_LOCK = 121
+
+
+def _prepare_exec(cmd: str, target: str | None = None) -> tuple[int, str]:
+    """执行前的统一门禁：守门 + 同目标同命令是否有未核实的 unknown。
+
+    "不自动重放"落在这里：只要上一条执行还是 unknown（可能改了一半），就不放行
+    同一条命令再跑一次。核实由人做（opsx executions resolve），不提供自动动作。
+    """
+    import execution  # 延迟导入：execution 依赖本模块
+    code, msg = check(cmd, target)
+    if code != 0:
+        return code, msg
+    blocked = execution.pending_unknown(target, cmd_hash(cmd, target))
+    if blocked is not None:
+        where = f"目标 {target}" if target else "本机"
+        return EXEC_ABORT_UNKNOWN, (
+            f"[opsx] 拒绝执行：{where} 上有一条未核实的执行 {blocked['id']}"
+            f"（{blocked.get('error') or '无法确认命令是否完成'}）。\n"
+            "命令可能已经生效一部分，自动重放会造成重复生效。请先核实实际状态，再决定：\n"
+            f"  opsx executions show {blocked['id']}\n"
+            f"  opsx executions resolve {blocked['id']} --observed-ok|--observed-failed")
+    return 0, ""
 
 
 def exec_change(
@@ -999,57 +1297,117 @@ def exec_change(
     snapshot_files: list[str] | None = None,
     snapshot_cmds: list[tuple[str, str]] | None = None,
     timeout: int = EXEC_TIMEOUT,
+    actor: str = "cli",
+    lock_wait: float = DEFAULT_LOCK_WAIT,
 ) -> tuple[int, str | None, str]:
-    """原子执行：校验→快照→执行→审计。返回 (exit_code, snapshot_id, output)。
+    """原子执行：守门→锁→重验→快照→消耗审批→执行→记录状态。
 
-    输出一律 capture（调用方自行展示）：避免经 MCP 嵌入时子进程输出污染
-    stdio 协议帧；同时写入审计（截断）。exit=4 表示超时终止。
+    返回 (exit_code, snapshot_id, output)。输出一律 capture（调用方自行展示），
+    同时写审计（截断）并落一条 execution 记录（含状态与证据）。
+
+    锁覆盖"快照 + 执行"整段而不是只锁执行：两个会话交错时，后一个的快照可能
+    已经包含前一个的改动，"回滚到快照"就回到一个中间态。
     """
+    import execution
     snapshot_files = snapshot_files or []
     snapshot_cmds = snapshot_cmds or []
-    code, msg = check(cmd)
+    code, msg = _prepare_exec(cmd, None)
     if code != 0:
-        print(redact(msg), file=sys.stderr)
+        # 不在这里打印：调用方（CLI / agent 工具 / MCP）都会展示返回的 msg，
+        # 再打一遍就等于同一个错误出现两次。
         return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = check(c)
         if code != 0:
-            audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
+            _safe_audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
             output = redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
+
+    _validate_lock_args(None, lock_wait)   # 参数错误要在建记录之前就失败
+    rec = execution.begin("exec", cmd, None, resolve_env(cmd, None), phase="lock")
     sid = None
-    if snapshot_files or snapshot_cmds:
-        sid, d = begin_snapshot()
-        items: list = []
-        try:
-            for f in snapshot_files:
-                _snapshot_file_into(d, f, items)
-            for c, name in snapshot_cmds:
-                _snapshot_cmd_into(d, c, name, items)
-            _write_meta(d, sid, items)
-        except (OpsxError, subprocess.SubprocessError, OSError) as e:
-            shutil.rmtree(d, ignore_errors=True)
-            output = redact(f"[opsx] 快照失败，已中止执行: {e}")
-            print(output, file=sys.stderr)
-            audit("exec-abort", cmd=cmd, reason=str(e))
-            return 3, None, output
-    if sid:
-        code, msg = check(cmd)  # 快照可能耗时：执行前重验 TTL、撤销和环境。
-        if code != 0:
-            audit("exec-abort", cmd=cmd, snapshot_id=sid, reason="快照后审批失效")
-            return code, sid, msg
+    dispatched = False   # 命令是否真的下发过：决定中断时记 unknown 还是 aborted
+    try:
+        with target_lock(None, wait=lock_wait, actor=actor, execution_id=rec["id"]):
+            env = resolve_env(cmd, None)
+            code, msg = check(cmd, None, env)  # 锁内重验：等锁期间审批可能过期/被撤销
+            if code != 0:
+                _safe_audit("exec-abort", cmd=cmd, reason="等锁后审批失效")
+                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
+                return code, None, msg
+            code, msg = _prepare_exec(cmd, None)  # 锁内再查一次 unknown：等锁期间可能新增
+            if code != 0:
+                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
+                return code, None, msg
+            if snapshot_files or snapshot_cmds:
+                execution.update(rec["id"], phase="snapshot")
+                sid, d = begin_snapshot()
+                items: list = []
+                try:
+                    for f in snapshot_files:
+                        _snapshot_file_into(d, f, items)
+                    for c, name in snapshot_cmds:
+                        _snapshot_cmd_into(d, c, name, items)
+                    _write_meta(d, sid, items)
+                except (OpsxError, subprocess.SubprocessError, OSError) as e:
+                    shutil.rmtree(d, ignore_errors=True)
+                    output = redact(f"[opsx] 快照失败，已中止执行: {e}")
+                    print(output, file=sys.stderr)
+                    _safe_audit("exec-abort", cmd=cmd, reason=str(e))
+                    execution.finish(rec["id"], "aborted", error=output, phase="snapshot")
+                    return 3, None, output
+                execution.update(rec["id"], snapshot_id=sid, phase="authorize")
+            remaining = None
+            if classify(cmd)[0] != "R0":
+                # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有
+                remaining = consume_stamp(cmd, None, env)
+                if remaining is None:
+                    # 审批在"确定要执行"的这一刻才消耗；已经失效就不该再跑
+                    output = redact("[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
+                    _safe_audit("exec-abort", cmd=cmd, snapshot_id=sid, reason="审批戳已失效")
+                    execution.finish(rec["id"], "aborted", error=output, phase="exec")
+                    return 2, sid, output
+            del remaining  # 剩余次数只对审批路径有意义，已在 consume_stamp 审计里留痕
+            execution.update(rec["id"], phase="exec")
+            dispatched = True   # 从这一刻起命令可能已经生效
+            exit_code, status, output, err = _run_change(cmd, timeout)
+            execution.finish(rec["id"], status, exit_code=exit_code, error=err,
+                             output=output)
+    except TargetBusy as e:
+        _safe_audit("exec-abort", cmd=cmd, reason=str(e))
+        execution.finish(rec["id"], "aborted", error=str(e), phase="lock")
+        return EXEC_ABORT_LOCK, None, str(e)
+    except BaseException as e:  # 含 Ctrl-C：命令可能改了一半，不能当成"没执行"
+        reason = (f"{type(e).__name__}: {e}" if not isinstance(e, KeyboardInterrupt)
+                  else "用户中断（Ctrl-C），无法确认命令是否完成")
+        _safe_audit("exec-abort", cmd=cmd, snapshot_id=sid, reason=reason)
+        # 命令没下发（还在拿锁/做快照/校验）就是明确的中止；下发过才谈得上"结果未知"
+        execution.finish(rec["id"], "unknown" if dispatched else "aborted", error=reason)
+        if isinstance(e, (OpsxError, KeyboardInterrupt)):
+            raise OpsxError(redact(f"[opsx] 变更未完成：{reason}；"
+                                   f"执行记录 {rec['id']} 需核实")) from e
+        raise
+    _safe_audit("exec", cmd=cmd, snapshot_id=sid, exit_code=exit_code,
+          execution_id=rec["id"], output=output[:EXEC_AUDIT_OUTPUT])
+    prune_snapshots()
+    execution.prune()
+    return exit_code, sid, output
+
+
+def _run_change(cmd: str, timeout: int) -> tuple[int, str, str, str | None]:
+    """执行并归类结果，返回 (exit_code, 状态, 输出, 错误说明)。
+
+    本机超时能 killpg 终止进程组，所以状态是 failed（明确失败）；远程超时不能
+    确认远端是否还在跑，由 remote 那条路径判 unknown。
+    """
     try:
         r = run_shell(cmd, timeout=timeout)
         output = redact(r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else ""))
-        exit_code = r.returncode
+        return r.returncode, "succeeded" if r.returncode == 0 else "failed", output, None
     except subprocess.TimeoutExpired:
-        output = f"[opsx] 超时：命令超过 {timeout}s 未结束，已终止"
-        exit_code = 4
+        return (4, "failed",
+                f"[opsx] 超时：命令超过 {timeout}s 未结束，已终止进程组",
+                f"超时 {timeout}s，进程组已终止")
     except OSError as e:
-        output = f"[opsx] 执行失败: {e}"
-        exit_code = 1
-    audit("exec", cmd=cmd, snapshot_id=sid, exit_code=exit_code,
-          output=output[:EXEC_AUDIT_OUTPUT])
-    prune_snapshots()
-    return exit_code, sid, output
+        return 1, "failed", redact(f"[opsx] 执行失败: {e}"), f"{type(e).__name__}: {e}"

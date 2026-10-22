@@ -29,6 +29,14 @@ class RemoteError(Exception):
     pass
 
 
+class _UncertainChange(RemoteError):
+    """变更可能已经生效，但我们无法确认结果（超时 / 缺少后验输出）。
+
+    单独一类是为了让调用方把执行记录标成 unknown 而不是 failed：后者会让人以为
+    "没生效"，从而重跑一条可能已经生效的命令。
+    """
+
+
 def _targets_file() -> Path:
     return core.STATE_DIR / "targets.json"
 
@@ -84,13 +92,20 @@ def _snapshot_target_env(meta: dict) -> dict:
     target = meta["target"]
     current = target_env(target)
     recorded = meta.get("env")
-    if not isinstance(recorded, dict):
-        return current  # 旧快照没有指纹：按 target 名解析，兼容历史快照
-    for key in ("host", "user", "port", "identity", "options"):
-        if recorded.get(key) != current.get(key):
+    if isinstance(recorded, dict):
+        for key in ("host", "user", "port", "identity", "options"):
+            if recorded.get(key) != current.get(key):
+                raise RemoteError(
+                    f"快照记录的 {target} 与当前注册表不一致（{key}: {recorded.get(key)!r} → "
+                    f"{current.get(key)!r}）：拒绝回滚，请核对 targets.json 或重新快照")
+    # 旧快照没有机器指纹：按 target 名解析（兼容历史），但不再静默信任"同名即同机"
+    recorded_machine = meta.get("machine")
+    if isinstance(recorded_machine, str) and recorded_machine:
+        now_machine = _target_machine(target)
+        if now_machine and now_machine != recorded_machine:
             raise RemoteError(
-                f"快照记录的 {target} 与当前注册表不一致（{key}: {recorded.get(key)!r} → "
-                f"{current.get(key)!r}）：拒绝回滚，请核对 targets.json 或重新快照")
+                f"快照记录的主机指纹 {recorded_machine} 与当前目标机 {now_machine} 不一致："
+                "同名目标很可能已被改指向另一台机器，拒绝回滚。请核对 targets.json 后重试")
     return current
 
 
@@ -177,8 +192,70 @@ def _dest(d: Path, path_str: str) -> Path:
     return dest
 
 
+def _target_stat(name: str, path_str: str) -> tuple[int | None, str]:
+    """一次 SSH 同时取权限（八进制）与属主，返回 (mode|None, "user:group")。
+
+    为什么要一次取：快照是在目标锁内做的，每个文件多两次往返会把锁的持有时间
+    成倍拉长（N 个文件从 N 次变成 3N+1 次 SSH）。
+    取不到权限返回 None：回滚时"覆盖已有文件沿用目标当前权限、重建用 600"，
+    绝不用目标机默认 umask 猜——那可能把 0600 的配置恢复成 0644。
+    """
+    q = shlex.quote(path_str)
+    cmd = (f"stat -c '%a %U:%G' -- {q} 2>/dev/null "
+           f"|| stat -f '%Lp %Su:%Sg' -- {q} 2>/dev/null || echo '?'")
+    try:
+        r = _ssh(name, cmd, timeout=IO_TIMEOUT)
+    except (subprocess.TimeoutExpired, RemoteError):
+        return None, ""
+    if r.returncode != 0:
+        return None, ""
+    lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+    fields = lines[0].split() if lines else []
+    mode = None
+    if fields and fields[0].isdigit() and len(fields[0]) <= 5:
+        value = int(fields[0], 8)
+        if 0 <= value <= 0o7777:
+            mode = value
+    owner = fields[1] if len(fields) > 1 else ""
+    return mode, (owner if owner and owner != "?" else "")
+
+
+def _target_mode(name: str, path_str: str) -> int | None:
+    return _target_stat(name, path_str)[0]
+
+
+def _target_owner(name: str, path_str: str) -> str:
+    """属主/属组名（只用于报告与核对，不用于恢复：改属主通常需要 root）。"""
+    return _target_stat(name, path_str)[1] or "?"
+
+
+def _target_machine(name: str) -> str:
+    """目标机指纹：hostname + machine-id 的前 12 位。
+
+    用途不是安全边界（SSH 认证才是），而是识别"targets.json 里同名目标被改指向
+    另一台机器"这种运维事故：快照来自 A 机，回滚打到 B 机就是灾难。
+    """
+    cmd = ("{ hostname 2>/dev/null || uname -n 2>/dev/null || echo '?'; } ; "
+           "cat /etc/machine-id 2>/dev/null || true")
+    try:
+        r = _ssh(name, cmd, timeout=IO_TIMEOUT)
+    except (subprocess.TimeoutExpired, RemoteError):
+        return ""
+    text = r.stdout.decode("utf-8", "replace")
+    parts = [line.strip() for line in text.splitlines() if line.strip()]
+    if not parts:
+        return ""
+    host = parts[0]
+    machine_id = parts[1] if len(parts) > 1 else ""
+    return f"{host}/{machine_id[:12]}" if machine_id else host
+
+
 def _pull_file(name: str, path_str: str, d: Path, items: list) -> None:
-    """远程文件拉回本地存档。取不到就 abort——没有快照不允许执行。"""
+    """远程文件拉回本地存档。取不到就 abort——没有快照不允许执行。
+
+    同时记录权限与属主：回滚要把权限一起还原，否则"内容对了、权限松了"
+    等于把 0600 的密钥文件恢复成 0644。
+    """
     dest = _dest(d, path_str)
     try:
         r = _ssh(name, f"cat -- {shlex.quote(path_str)}", timeout=IO_TIMEOUT)
@@ -187,8 +264,14 @@ def _pull_file(name: str, path_str: str, d: Path, items: list) -> None:
     if r.returncode != 0:
         raise RemoteError(f"远程取快照失败({r.returncode}): {path_str}: {_text(r)[:300]}")
     dest.write_bytes(r.stdout)
-    items.append({"type": "file", "remote": name, "src": path_str,
-                  "dest": str(dest.relative_to(d))})
+    item = {"type": "file", "remote": name, "src": path_str,
+            "dest": str(dest.relative_to(d))}
+    mode, owner = _target_stat(name, path_str)
+    if mode is not None:
+        item["mode"] = mode
+    if owner:
+        item["owner"] = owner
+    items.append(item)
 
 
 def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list) -> None:
@@ -205,6 +288,8 @@ def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list) -> None:
 
 def _write_meta(d: Path, sid: str, name: str, items: list) -> None:
     meta = {"id": sid, "target": name, "env": target_env(name),
+            # 机器指纹：回滚前比对，防"同名目标被改指向另一台机器"时把 A 机配置写到 B 机
+            "machine": _target_machine(name),
             "created": datetime.now(timezone.utc).isoformat(), "items": items}
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -244,59 +329,124 @@ def snapshot_cmd(name: str, cmd: str, label: str = "") -> str:
 
 def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
                 snapshot_cmds: list[tuple[str, str]] | None = None,
-                timeout: int = core.EXEC_TIMEOUT) -> tuple[int, str | None, str]:
-    """远程原子执行：本机守门 → 远程快照 → ssh 执行 → 本地审计。
+                timeout: int = core.EXEC_TIMEOUT, actor: str = "cli",
+                lock_wait: float = core.DEFAULT_LOCK_WAIT) -> tuple[int, str | None, str]:
+    """远程原子执行：守门→锁→重验→远程快照→消耗审批→ssh 执行→记录状态。
 
     返回 (exit_code, snapshot_id, output)，与 core.exec_change 同形
-    （exit=2 无审批戳、3 快照失败、4 超时）。
+    （exit=2 无授权、3 快照失败、4 超时、120 有未核实执行、121 目标被占用）。
+
+    远程超时与 SSH 255 都记 unknown 而不是 failed：这两种情况下远端可能已经
+    执行了一半，标 failed 会让人以为"没生效"而重跑，正是最危险的误判。
     """
+    import execution
     snapshot_files = snapshot_files or []
     snapshot_cmds = snapshot_cmds or []
     get_target(name)  # 先把"打错目标名"报出来，而不是误导用户去建审批戳
-    code, msg = core.check(cmd, target=name)
+    code, msg = core._prepare_exec(cmd, name)
     if code != 0:
-        print(core.redact(msg), file=sys.stderr)
         return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
         code, _ = core.check(c, target=name)
         if code != 0:
-            core.audit("exec-abort", cmd=cmd, target=name, reason=f"快照命令未通过守门: {c}")
+            core._safe_audit("exec-abort", cmd=cmd, target=name, reason=f"快照命令未通过守门: {c}")
             output = core.redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
+
+    core._validate_lock_args(name, lock_wait)   # 参数错误要在建记录之前就失败
+    # env 必须与审批时同源（core.resolve_env = target_env + k8s 作用域）：
+    # 用 target_env 会漏掉 kubectl 命令的 k8s 键，导致远程 kubectl 变更永远判定
+    # "执行环境已变化"，重新批准也不通。
+    env = core.resolve_env(cmd, name)
+    rec = execution.begin("exec", cmd, name, env, phase="lock")
     sid = None
-    if snapshot_files or snapshot_cmds:
-        sid, d = core.begin_snapshot()
-        items: list = []
-        try:
-            for f in snapshot_files:
-                _pull_file(name, f, d, items)
-            for c, label in snapshot_cmds:
-                _capture_cmd(name, c, label, d, items)
-            _write_meta(d, sid, name, items)
-        except (RemoteError, OSError, subprocess.SubprocessError) as e:
-            shutil.rmtree(d, ignore_errors=True)
-            output = core.redact(f"[opsx] 远程快照失败，已中止执行: {e}")
-            print(output, file=sys.stderr)
-            core.audit("exec-abort", cmd=cmd, target=name, reason=str(e))
-            return 3, None, output
-    if sid:
-        code, msg = core.check(cmd, target=name)
-        if code != 0:
-            core.audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
-                       reason="快照后审批失效")
-            return code, sid, msg
+    dispatched = False   # 命令是否真的下发过：决定中断时记 unknown 还是 aborted
+    try:
+        with core.target_lock(name, wait=lock_wait, actor=actor, execution_id=rec["id"]):
+            code, msg = core.check(cmd, name, env)  # 锁内重验：等锁期间审批可能过期
+            if code != 0:
+                core._safe_audit("exec-abort", cmd=cmd, target=name, reason="等锁后审批失效")
+                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
+                return code, None, msg
+            code, msg = core._prepare_exec(cmd, name)
+            if code != 0:
+                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
+                return code, None, msg
+            if snapshot_files or snapshot_cmds:
+                execution.update(rec["id"], phase="snapshot")
+                sid, d = core.begin_snapshot()
+                items: list = []
+                try:
+                    for f in snapshot_files:
+                        _pull_file(name, f, d, items)
+                    for c, label in snapshot_cmds:
+                        _capture_cmd(name, c, label, d, items)
+                    _write_meta(d, sid, name, items)
+                except (RemoteError, OSError, subprocess.SubprocessError) as e:
+                    shutil.rmtree(d, ignore_errors=True)
+                    output = core.redact(f"[opsx] 远程快照失败，已中止执行: {e}")
+                    print(output, file=sys.stderr)
+                    core._safe_audit("exec-abort", cmd=cmd, target=name, reason=str(e))
+                    execution.finish(rec["id"], "aborted", error=output, phase="snapshot")
+                    return 3, None, output
+                execution.update(rec["id"], snapshot_id=sid, phase="authorize")
+            if core.classify(cmd)[0] != "R0":
+                # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有
+                remaining = core.consume_stamp(cmd, name, env)
+                if remaining is None:
+                    output = core.redact(
+                        "[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
+                    core._safe_audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
+                               reason="审批戳已失效")
+                    execution.finish(rec["id"], "aborted", error=output, phase="exec")
+                    return 2, sid, output
+            execution.update(rec["id"], phase="exec")
+            dispatched = True   # 从这一刻起远端可能已经生效
+            exit_code, status, output, err = _run_remote_change(name, cmd, timeout)
+            execution.finish(rec["id"], status, exit_code=exit_code, error=err,
+                             output=output)
+    except core.TargetBusy as e:
+        core._safe_audit("exec-abort", cmd=cmd, target=name, reason=str(e))
+        execution.finish(rec["id"], "aborted", error=str(e), phase="lock")
+        return core.EXEC_ABORT_LOCK, None, str(e)
+    except BaseException as e:  # 含 Ctrl-C：远端命令可能仍在跑，不能当成"没执行"
+        reason = (f"{type(e).__name__}: {e}" if not isinstance(e, KeyboardInterrupt)
+                  else "用户中断（Ctrl-C），无法确认远端命令是否完成")
+        core._safe_audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
+                         reason=reason)
+        # 命令没下发（还在拿锁/做快照/校验）就是明确的中止；下发过才谈得上"结果未知"
+        execution.finish(rec["id"], "unknown" if dispatched else "aborted", error=reason)
+        if isinstance(e, (core.OpsxError, KeyboardInterrupt)):
+            raise core.OpsxError(core.redact(
+                f"[opsx] 变更未完成：{reason}；执行记录 {rec['id']} 需核实")) from e
+        raise
+    core._safe_audit("exec", cmd=cmd, target=name, snapshot_id=sid, exit_code=exit_code,
+               execution_id=rec["id"], output=output[:core.EXEC_AUDIT_OUTPUT])
+    core.prune_snapshots()
+    execution.prune()
+    return exit_code, sid, output
+
+
+def _run_remote_change(name: str, cmd: str, timeout: int) -> tuple[int, str, str, str | None]:
+    """执行并归类结果，返回 (exit_code, 状态, 输出, 错误说明)。"""
     try:
         r = _ssh(name, cmd, timeout=timeout)
-        output = core.redact(_text(r))
-        exit_code = r.returncode
     except subprocess.TimeoutExpired:
-        output = f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认"
-        exit_code = 4
-    core.audit("exec", cmd=cmd, target=name, snapshot_id=sid, exit_code=exit_code,
-               output=output[:core.EXEC_AUDIT_OUTPUT])
-    core.prune_snapshots()
-    return exit_code, sid, output
+        return (4, "unknown",
+                f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认",
+                f"远程执行超时 {timeout}s，远端可能仍在执行")
+    except RemoteError as e:
+        # ssh 客户端本身起不来：命令一定没下发，可以判 failed
+        return 1, "failed", core.redact(f"[opsx] 远程执行失败: {e}"), str(e)
+    output = core.redact(_text(r))
+    if r.returncode == 255:
+        return (255, "unknown",
+                output + "\n[opsx] SSH 会话异常（exit 255）：无法确认命令是否执行完成。"
+                "若已确认未生效，用 opsx executions resolve <id> --observed-failed 关闭后重试",
+                "SSH 连接异常（exit 255），远端执行状态未知")
+    return (r.returncode, "succeeded" if r.returncode == 0 else "failed", output,
+            None if r.returncode == 0 else f"命令退出码 {r.returncode}")
 
 
 def _remote_read(name: str, path_str: str) -> tuple[bool, bytes]:
@@ -328,11 +478,107 @@ def rollback_plan(snapshot_id: str) -> dict:
         snapshot_id, read_state=lambda src: _remote_read(target, src))
 
 
+# 原子恢复脚本：同目录临时文件 → chmod → rename。
+# 为什么不能 `cat > 目标`：写到一半断线会留下半份配置，这比"没回滚"更糟——
+# 服务可能起不来，而且文件"看起来是在的"。rename 在同一文件系统内是原子的，
+# 所以要么是旧内容，要么是完整的新内容。
+_RESTORE_TEMPLATE = """set -eu
+p=@@PATH@@
+n=0
+while [ -L "$p" ] && [ "$n" -lt 8 ]; do
+  t=$(readlink "$p")
+  case "$t" in
+    /*) p="$t" ;;
+    *) p="$(dirname -- "$p")/$t" ;;
+  esac
+  n=$((n + 1))
+done
+had=0
+if [ -e "$p" ]; then had=1; fi
+d=$(dirname -- "$p")
+tmp=$(mktemp "$d/.opsx-restore.XXXXXX")
+trap 'if [ -n "${tmp:-}" ]; then rm -f "$tmp"; fi' EXIT HUP INT TERM
+cat > "$tmp"
+got=$(wc -c < "$tmp" | tr -d ' ')
+if [ "$got" != "@@SIZE@@" ]; then
+  printf 'opsx-restore-incomplete got=%s want=@@SIZE@@\n' "$got" >&2
+  exit 3
+fi
+if [ -n "@@MODE@@" ]; then
+  chmod "@@MODE@@" "$tmp"
+elif [ "$had" = "1" ]; then
+  keep=$(stat -c %a -- "$p" 2>/dev/null || stat -f %Lp -- "$p" 2>/dev/null || echo "")
+  case "$keep" in
+    [0-7]*) chmod "$keep" "$tmp" ;;
+  esac
+else
+  chmod 600 "$tmp"
+fi
+mv -f "$tmp" "$p"
+tmp=
+printf 'opsx-restored had=%s size=%s mode=%s\n' "$had" "$got" "$(stat -c %a -- "$p" 2>/dev/null || stat -f %Lp -- "$p" 2>/dev/null || echo ?)"
+"""
+
+FALLBACK_MODE = "600"   # 重建文件且快照没记权限时的保守值
+_RENDER_RE = re.compile(r"@@(PATH|MODE|SIZE)@@")
+
+
+def _restore_mode(item: dict) -> tuple[str, str]:
+    """返回 (chmod 参数, 需要说明的补充文本)。空参数表示"沿用目标机当前权限"。"""
+    mode = item.get("mode")
+    if type(mode) is int and 0 <= mode <= 0o7777:
+        return format(mode, "o"), ""
+    return "", ("（快照未记录权限：覆盖已有文件时沿用目标机当前权限，"
+                f"重建时用 {FALLBACK_MODE}，请人工核对）")
+
+
+def _render_restore(path_str: str, mode_token: str, size: int) -> str:
+    """单遍渲染：路径里若含 `@@MODE@@` 之类字面量，也不会被后续替换改坏。"""
+    values = {"PATH": shlex.quote(path_str), "MODE": mode_token, "SIZE": str(size)}
+    return _RENDER_RE.sub(lambda m: values[m.group(1)], _RESTORE_TEMPLATE)
+
+
+def _parse_restore_info(stdout: bytes) -> dict:
+    """解析恢复脚本的后验行：`opsx-restored had=1 size=1234 mode=640`。
+
+    取**最后一条**匹配：登录 shell 的 MOTD/rc 文件里若恰好有同样前缀的输出，
+    第一条会把真实后验顶掉。
+    """
+    found = None
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line.startswith("opsx-restored "):
+            continue
+        # 不能按空白 split：BSD `wc` 会输出 "      10"，`size=      10` 会被切成
+        # "size=" 与 "10" 两段，于是 size 解析成空、校验被静默跳过。
+        fields = {}
+        for part in re.split(r"\s+(?=[a-z]+=)", line):
+            if "=" in part:
+                key, _, value = part.partition("=")
+                fields[key.strip()] = value.strip()
+        had = fields.get("had")
+        # BSD/macOS 的 wc 会对数字左填充空格（`wc -c` → "      12"）：不 strip 就会
+        # 把后验结果当成"没有大小"，于是校验被静默跳过。脚本侧也做了 tr -d ' '。
+        size = (fields.get("size") or "").strip()
+        mode = (fields.get("mode") or "").strip()
+        found = {"had": had == "1" if had in ("0", "1") else None,
+                 "size": int(size) if size.isdigit() else None,
+                 "mode": mode if re.fullmatch(r"[0-7]{3,4}", mode) else None}
+    return found or {"had": None, "size": None, "mode": None}
+
+
+def _parse_restore(stdout: bytes) -> tuple[bool | None, int | None]:
+    info = _parse_restore_info(stdout)
+    return info["had"], info["size"]
+
+
 def rollback(snapshot_id: str, confirm: bool = False) -> str:
     """回滚：远程快照推回目标机，本机快照交给 core.rollback。
 
     回滚是写操作：入口展示 rollback_plan 并由人确认后再传 confirm=True。
+    每一步都做后验（写入字节数必须等于快照字节数），失败时报告"恢复了几个文件"。
     """
+    import execution
     d, meta = core.load_snapshot(snapshot_id)
     target = meta.get("target")
     if not target:
@@ -341,39 +587,101 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
     if file_items and not confirm:
         raise core.OpsxError("回滚会覆盖目标机文件，属于写操作：请先预览并由人确认"
                             "（CLI: opsx rollback <id>）")
-    env = _snapshot_target_env(meta)
+    env = _snapshot_target_env(meta)  # 目标校验先做：校验失败不必占锁
+    rec = execution.begin("rollback", f"rollback {snapshot_id}", target, env,
+                          snapshot_id=snapshot_id, phase="backup")
     backup_sid = None
-    report = []
+    report: list[str] = []
+    restored = 0
+    if not meta.get("machine"):
+        # 快照时探测失败/旧快照：只能靠 targets.json 的环境比对，机器身份没校验过
+        core._safe_audit("rollback-no-machine", snapshot_id=snapshot_id, target=target)
+        report.append("注意：该快照未记录主机指纹，本次回滚跳过机器一致性校验"
+                      "（请自行确认目标仍是同一台机器）")
     try:
-        if file_items:
-            backup_sid = core._rollback_backup(
-                snapshot_id, target, file_items,
-                lambda src: _remote_read(target, src), meta_extra={"env": env})
-        for item in meta["items"]:
-            if item["type"] != "file":
-                out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
-                report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
-                continue
-            # 覆盖写保留原 inode/权限；文件已被删除时重建（权限为默认值）。
-            try:
-                r = _ssh(target, f"cat > {shlex.quote(item['src'])}",
-                         stdin=(d / item["dest"]).read_bytes(), timeout=IO_TIMEOUT)
-            except subprocess.TimeoutExpired as e:
-                raise RemoteError(f"远程回滚超时: {item['src']}") from e
-            if r.returncode != 0:
-                raise RemoteError(f"远程回滚失败({r.returncode}): {item['src']}: {_text(r)[:300]}")
-            report.append(f"已恢复远程文件: {target}:{item['src']}")
-    except (core.OpsxError, RemoteError) as e:
-        core.audit("rollback-failed", snapshot_id=snapshot_id, target=target,
-                   backup_snapshot_id=backup_sid, error=str(e))
+        with core.target_lock(target, actor="rollback", execution_id=rec["id"]):
+            if file_items:
+                backup_sid = core._rollback_backup(
+                    snapshot_id, target, file_items,
+                    lambda src: _remote_read(target, src),
+                    # 副本也记权限：之后回滚这份副本时要能还原同样的权限
+                    mode_of=lambda src: _target_mode(target, src),
+                    meta_extra={"env": env})
+                execution.update(rec["id"], phase="restore")
+            for item in meta["items"]:
+                if item["type"] != "file":
+                    out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
+                    report.append(f"捕获状态 [{item.get('name') or item['cmd']}]:\n{out}")
+                    continue
+                payload = (d / item["dest"]).read_bytes()
+                mode_arg, mode_note = _restore_mode(item)
+                script = _render_restore(item["src"], mode_arg, len(payload))
+                try:
+                    r = _ssh(target, script, stdin=payload, timeout=IO_TIMEOUT)
+                except subprocess.TimeoutExpired as e:
+                    # mv 可能已经完成：超时同样"无法确认"，不能报成明确的失败
+                    raise _UncertainChange(f"远程回滚超时: {item['src']}") from e
+                if r.returncode != 0:
+                    raise RemoteError(
+                        f"远程回滚失败({r.returncode}): {item['src']}: {_text(r)[:300]}")
+                info = _parse_restore_info(r.stdout)
+                if info["size"] is None:
+                    # 脚本退出 0 但没带回后验（输出被吞/MOTD 干扰/连接抖过）：
+                    # 当成"无法确认"，绝不能宣告校验通过——那是静默丢内容的入口。
+                    raise _UncertainChange(
+                        f"远程回滚无法确认写入结果: {item['src']}（缺少后验输出）")
+                if info["size"] != len(payload):
+                    raise RemoteError(
+                        f"远程回滚内容校验失败: {item['src']} 期望 {len(payload)} 字节，"
+                        f"实际 {info['size']} 字节")
+                perm = info["mode"] or "?"
+                line = f"已恢复远程文件: {target}:{item['src']}（权限 {perm}）"
+                if mode_note:
+                    line += mode_note
+                if info["had"] is False:
+                    # 已删除文件的恢复策略：按快照内容与权限重建；属主/属组需要 root，
+                    # 不假装能还原，明确告诉人去看一眼
+                    line += "；原文件此前已被删除，本次为重建"
+                    if item.get("owner"):
+                        line += (f"，属主/属组未还原（快照为 {item['owner']}，"
+                                 "当前为 SSH 登录用户，需要时人工 chown）")
+                report.append(line)
+                restored += 1
+    except core.TargetBusy as e:
+        core._safe_audit("rollback-abort", snapshot_id=snapshot_id, target=target,
+                   reason=str(e))
+        execution.finish(rec["id"], "aborted", error=str(e), phase="lock")
+        raise
+    except _UncertainChange as e:
+        core._safe_audit("rollback-unknown", snapshot_id=snapshot_id, target=target,
+                         backup_snapshot_id=backup_sid, error=str(e),
+                         execution_id=rec["id"])
+        error = f"{e}（已恢复 {restored}/{len(file_items)} 个文件，结果需核实）"
+        execution.finish(rec["id"], "unknown", error=error)
         if backup_sid:
-            raise RemoteError(f"{e}（回滚前副本: {backup_sid}）") from e
+            raise _UncertainChange(f"{error}（回滚前副本: {backup_sid}）") from e
+        raise
+    except (core.OpsxError, RemoteError) as e:
+        core._safe_audit("rollback-failed", snapshot_id=snapshot_id, target=target,
+                         backup_snapshot_id=backup_sid, error=str(e), execution_id=rec["id"])
+        error = f"{e}（已恢复 {restored}/{len(file_items)} 个文件）"
+        execution.finish(rec["id"], "failed", error=error)
+        if backup_sid:
+            raise RemoteError(f"{error}（回滚前副本: {backup_sid}）") from e
+        raise
+    except BaseException:
+        execution.finish(
+            rec["id"], "unknown",
+            error=f"回滚被中断，已恢复 {restored}/{len(file_items)} 个文件，需核实")
         raise
     if backup_sid:
         report.append(f"回滚前副本: {backup_sid}"
                       f"（如需撤销本次回滚: opsx rollback {backup_sid}）")
-    core.audit("rollback", snapshot_id=snapshot_id, target=target,
-               backup_snapshot_id=backup_sid, files=[i["src"] for i in file_items])
+    execution.finish(rec["id"], "succeeded", output="\n".join(report))
+    core._safe_audit("rollback", snapshot_id=snapshot_id, target=target,
+               backup_snapshot_id=backup_sid, execution_id=rec["id"],
+               files=[i["src"] for i in file_items])
+    execution.prune()
     return "\n".join(report)
 
 

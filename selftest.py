@@ -387,11 +387,12 @@ def test_mcp_tools_list():
     c = McpClient()
     try:
         tools = c.request("tools/list")["result"]["tools"]
-        assert len(tools) == 9
+        assert len(tools) == 10   # W5 新增 ops_executions（只读执行记录）
         by_name = {t["name"]: t for t in tools}
         assert set(by_name) == {
             "ops_check", "ops_snapshot_file", "ops_snapshot_cmd", "ops_approve",
-            "ops_revoke", "ops_exec", "ops_rollback", "ops_list", "ops_audit",
+            "ops_revoke", "ops_exec", "ops_rollback", "ops_executions",
+            "ops_list", "ops_audit",
         }
         assert by_name["ops_check"]["annotations"]["readOnlyHint"] is True
         assert by_name["ops_list"]["annotations"]["readOnlyHint"] is True
@@ -1135,6 +1136,11 @@ def test_remote_exec_snapshot_and_rollback():
             return subprocess.CompletedProcess([], 0, stdout=b"remote-v1\n", stderr=b"")
         if cmd.startswith("systemctl restart"):
             return subprocess.CompletedProcess([], 0, stdout=b"restarted\n", stderr=b"")
+        if ".opsx-restore." in cmd and stdin is not None:
+            # 模拟恢复脚本的后验输出（size 必须等于推上去的字节数）
+            return subprocess.CompletedProcess(
+                [], 0, stdout=f"opsx-restored had=1 size={len(stdin)} mode=640".encode(),
+                stderr=b"")
         return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
 
     orig = remote._ssh
@@ -1161,8 +1167,10 @@ def test_remote_exec_snapshot_and_rollback():
         report = remote.rollback(sid, confirm=True)
         assert "web1:/etc/nginx/nginx.conf" in report
         assert "回滚前副本" in report  # 先存副本再覆盖
-        pushed = [c for c in calls if c[1].startswith("cat >")]
-        assert pushed and pushed[0][2] == b"remote-v1\n"  # 回滚经 stdin 推回
+        pushed = [c for c in calls if c[2] is not None]
+        assert pushed and pushed[0][2] == b"remote-v1\n"   # 回滚经 stdin 推回
+        # 必须是"临时文件 + rename"的原子写：直接 cat > 目标时断线会留下半份配置
+        assert ".opsx-restore." in pushed[0][1] and "mv -f" in pushed[0][1]
 
         # 审计带目标，输出截断入库
         recs = [json.loads(line) for line in
@@ -1254,7 +1262,8 @@ def test_opsx_cli_remote_end_to_end():
         'case "$*" in\n'
         '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\' ;;\n'
         "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
-        '  *"cat > "*) cat > "$OPSX_TEST_PUSHED" ;;\n'
+        '  *".opsx-restore."*) cat > "$OPSX_TEST_PUSHED" ; '
+        'printf \'opsx-restored had=1 size=%s\\n\' "$(wc -c < "$OPSX_TEST_PUSHED" | tr -d \' \')" ;;\n'
         "  *) printf 'remote-ok\\n' ;;\n"
         'esac\n'
     )
@@ -1280,7 +1289,9 @@ def test_opsx_cli_remote_end_to_end():
     r = run("rollback", sid, "--yes")
     assert r.returncode == 0 and "web1:/etc/nginx/nginx.conf" in r.stdout, r.stderr
     assert pushed.read_bytes() == b"remote-v1\n"
-    assert "cat > /etc/nginx/nginx.conf" in log.read_text()
+    log_text = log.read_text()
+    assert ".opsx-restore." in log_text and "mv -f" in log_text
+    assert "cat > /etc/nginx/nginx.conf" not in log_text   # 不再直接截断覆盖
     # 独立远程快照（opsx snapshot --target --cmd）
     r = run("snapshot", "--target", "web1", "--cmd", "uptime", "--name", "up")
     assert r.returncode == 0 and r.stdout.strip(), r.stderr
@@ -1802,7 +1813,7 @@ def test_subagent_parallel_and_readonly():
         "ops_exec", {"command": "systemctl restart x"}, sub_ctx)
     names = {s["function"]["name"] for s in agent_tools.tool_schemas(sub_ctx)}
     # events 是只读时间线查询（W4），与 bash/read 同级；写工具仍不可见。
-    assert names == {"bash", "read", "skill", "events", "ops_list"}
+    assert names == {"bash", "read", "skill", "events", "ops_executions", "ops_list"}
     assert "subagent" not in names  # 不能继续嵌套派生
     # 空任务 / 超量
     assert "[错误]" in agent_tools.dispatch("subagent", {"tasks": []}, agent_tools.ToolContext())
@@ -2938,9 +2949,11 @@ def test_remote_rollback_target_check_and_backup():
             return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"archived-v1\n", stderr=b"")
-        if cmd.startswith("cat >"):
+        if ".opsx-restore." in cmd:      # 原子恢复脚本（mktemp → chmod → mv）
             pushed.append(stdin)
-            return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+            size = len(stdin or b"")
+            return subprocess.CompletedProcess(
+                [], 0, stdout=f"opsx-restored had=1 size={size}".encode(), stderr=b"")
         return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
 
     orig = remote._ssh
@@ -5694,7 +5707,10 @@ def test_review_exec_rechecks_approval_after_snapshot():
                 mock.patch.object(remote, "_ssh") as ssh:
             code, sid, _ = remote.exec_change("web1", remote_cmd,
                                                snapshot_files=["/etc/app.conf"])
-        assert code == 2 and sid and not ssh.called
+        assert code == 2 and sid
+        # 快照阶段会探测机器指纹（多一次只读 ssh），但变更命令一定没下发
+        sent = [call.args[1] if len(call.args) > 1 else "" for call in ssh.call_args_list]
+        assert not any(remote_cmd in cmd for cmd in sent), sent
 
 
 def test_review_sensitive_input_redirection():
@@ -6188,6 +6204,561 @@ def test_review_notify_old_runs_cannot_overwrite_new_observations():
     finally:
         notify._post = original
         _clean_notify()
+
+
+def test_execution_records_state_machine():
+    """每次变更都落一条执行记录：成功/失败都带退出码、耗时与证据入口。"""
+    import execution
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "a.txt"
+        ok = f"echo ok > {f}"
+        core.approve(ok, ttl_seconds=60)
+        code, sid, _ = core.exec_change(ok)
+        assert code == 0
+        rec = execution.find_latest(ok)
+        assert rec and rec["status"] == "succeeded" and rec["exit_code"] == 0
+        assert rec["finished"] and rec["duration_s"] is not None
+        assert rec["cmd_hash"] == core.cmd_hash(ok, None)
+        assert rec["pid"] == os.getpid()
+        # 记录文件 0600：里面有命令原文与输出片段，等同审计材料
+        path = Path(core.STATE_DIR, "executions", rec["id"] + ".json")
+        assert stat_mode(path) == 0o600, oct(stat_mode(path))
+
+        fail = "rm /nonexistent-opsx-w5-file"
+        core.approve(fail, ttl_seconds=60)
+        code, _, _ = core.exec_change(fail)
+        assert code == 1
+        rec = execution.find_latest(fail)
+        assert rec["status"] == "failed" and rec["exit_code"] == 1
+        # 展示时脱敏（记录里存原文，供人核对）
+        assert rec["id"] in execution.format_list([rec])
+
+
+def stat_mode(path) -> int:
+    import stat as stat_mod
+    return stat_mod.S_IMODE(Path(path).stat().st_mode)
+
+
+def test_target_lock_rejects_concurrent_change():
+    """同一目标不允许两个变更重叠：抢不到锁就明确失败，不排队也不静默执行。"""
+    import execution
+    cmd = "rm /nonexistent-opsx-w5-lock"
+    core.approve(cmd, ttl_seconds=60)
+    with core.target_lock(None):
+        code, sid, output = core.exec_change(cmd)
+    assert code == core.EXEC_ABORT_LOCK and sid is None
+    assert "正在被另一次变更占用" in output
+    rec = execution.find_latest(cmd)
+    assert rec and rec["status"] == "aborted" and rec["phase"] == "lock"
+    # 被挡下的执行不能消耗审批次数：锁释放后同一条命令仍可执行
+    code, _, _ = core.exec_change(cmd)
+    assert code == 1                      # rm 失败，但确实执行了
+    assert execution.find_latest(cmd)["status"] == "failed"
+
+
+def test_target_lock_across_processes():
+    """跨进程验证：另一个会话持锁期间，本次变更被拒（不靠进程内状态）。"""
+    import subprocess
+    import sys as sys_mod
+    script = (
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(core.REPO_DIR)!r})\n"
+        "import core\n"
+        "with core.target_lock('web1'):\n"
+        "    print('locked', flush=True)\n"
+        "    time.sleep(8)\n"
+    )
+    proc = subprocess.Popen([sys_mod.executable, "-c", script], env=dict(os.environ),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "locked"
+        try:
+            with core.target_lock("web1"):
+                raise AssertionError("另一个进程持锁时不该拿到锁")
+        except core.TargetBusy as e:
+            assert "web1" in str(e)
+        # 不同目标不受影响
+        with core.target_lock("db1"):
+            pass
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def test_remote_timeout_and_ssh255_become_unknown():
+    """断线/超时 → unknown（不是 failed），并且挡住同目标同命令的重放。"""
+    import subprocess
+    import execution
+    import remote
+    _write_targets()
+    cmd = "systemctl restart tricky-svc"
+    core.approve(cmd, ttl_seconds=60, target="web1")
+    orig = remote._ssh
+
+    def timeout_ssh(name, c, stdin=None, timeout=120):
+        raise subprocess.TimeoutExpired(c, timeout)
+
+    remote._ssh = timeout_ssh
+    try:
+        code, sid, out = remote.exec_change("web1", cmd, timeout=5)
+    finally:
+        remote._ssh = orig
+    assert code == 4 and "远端状态需确认" in out
+    rec = execution.find_latest(cmd, "web1")
+    assert rec and rec["status"] == "unknown"
+    assert "超时" in (rec["error"] or "")
+
+    # 不自动重放：再执行被拦，且一次 ssh 都没发
+    sent = []
+
+    def record_ssh(name, c, stdin=None, timeout=120):
+        sent.append(c)
+        return subprocess.CompletedProcess([], 0, b"", b"")
+
+    remote._ssh = record_ssh
+    try:
+        core.approve(cmd, ttl_seconds=60, target="web1")
+        code2, _, msg = remote.exec_change("web1", cmd)
+    finally:
+        remote._ssh = orig
+    assert code2 == core.EXEC_ABORT_UNKNOWN, code2
+    assert not sent, sent
+    assert "未核实" in msg and rec["id"] in msg
+
+    # 人核实"未生效"之后才允许重新执行
+    execution.resolve(rec["id"], "observed-failed", "确认服务未重启")
+    core.approve(cmd, ttl_seconds=60, target="web1")
+    remote._ssh = record_ssh
+    try:
+        code3, _, _ = remote.exec_change("web1", cmd)
+    finally:
+        remote._ssh = orig
+    assert code3 == 0
+    assert execution.find_latest(cmd, "web1")["status"] == "succeeded"
+
+    # SSH 255：同样无法确认，记 unknown 而不是 failed
+    cmd2 = "systemctl restart ssh255-svc"
+    core.approve(cmd2, ttl_seconds=60, target="web1")
+    remote._ssh = lambda *a, **k: subprocess.CompletedProcess(
+        [], 255, b"", b"Connection reset by peer")
+    try:
+        code4, _, out4 = remote.exec_change("web1", cmd2)
+    finally:
+        remote._ssh = orig
+    assert code4 == 255 and "无法确认" in out4
+    rec2 = execution.find_latest(cmd2, "web1")
+    assert rec2["status"] == "unknown"
+    execution.resolve(rec2["id"], "observed-ok", "确认已重启")
+
+
+def test_execution_reconcile_resolve_and_prune():
+    """进程被杀 → unknown；只有 unknown 能核实；未核实的 unknown 永不被清理。"""
+    import execution
+    dead = execution.begin("exec", "rm /nonexistent-opsx-w5-dead", None, core.local_env())
+    dead["pid"] = 99999999
+    with execution._locked():
+        execution._write(dead)
+    moved = execution.reconcile()
+    assert any(r["id"] == dead["id"] for r in moved)
+    got = execution.get(dead["id"])
+    assert got["status"] == "unknown" and "无法确认" in got["error"]
+
+    alive = execution.begin("exec", "rm /nonexistent-opsx-w5-alive", None, core.local_env())
+    assert execution.reconcile() == []          # 活着的记录不动
+    assert execution.get(alive["id"])["status"] == "running"
+
+    # 迟到收尾不能把 reconcile 的 unknown 改成 succeeded
+    execution.finish(dead["id"], "succeeded", exit_code=0)
+    assert execution.get(dead["id"])["status"] == "unknown"
+
+    try:
+        execution.resolve(alive["id"], "observed-ok")
+        raise AssertionError("非 unknown 不该能核实")
+    except core.OpsxError as e:
+        assert "只有 unknown" in str(e)
+    try:
+        execution.resolve(dead["id"], "not-a-real-outcome")
+        raise AssertionError("非法核实结论应被拒绝")
+    except core.OpsxError as e:
+        assert "observed-ok" in str(e)
+
+    execution.finish(alive["id"], "failed", exit_code=1)
+    assert execution.pending_unknown(None, core.cmd_hash("rm /nonexistent-opsx-w5-dead")) \
+        is not None
+    execution.resolve(dead["id"], "observed-failed", "确认没执行")
+    assert execution.pending_unknown(
+        None, core.cmd_hash("rm /nonexistent-opsx-w5-dead")) is None
+
+    # prune 只清已核实/终态记录，未核实的 unknown 必须保留
+    open_rec = execution.begin("exec", "rm /nonexistent-opsx-w5-open", None, core.local_env())
+    with execution._locked():
+        rec = execution._read(Path(core.STATE_DIR, "executions", open_rec["id"] + ".json"))
+        rec.update({"status": "unknown", "error": "测试：待核实"})
+        execution._write(rec)
+    for _ in range(4):
+        execution.begin("exec", "rm /nonexistent-opsx-w5-filler", None, core.local_env())
+    execution.prune(keep=2)
+    assert execution.get(open_rec["id"]) is not None, "未核实的 unknown 不能被清理"
+    execution.resolve(open_rec["id"], "observed-failed")
+
+
+def test_approval_uses_are_one_shot_and_atomic():
+    """一次批准只生效一次；并发消耗不会双花（超出的返回 None）。"""
+    import threading
+    cmd = "rm /nonexistent-opsx-w5-uses"
+    core.approve(cmd, ttl_seconds=60)
+    assert core.consume_stamp(cmd) == 0           # 最后一次机会
+    assert core.consume_stamp(cmd) is None
+    assert core.check(cmd)[0] == 2                 # 已用尽 → 拒绝
+    assert core.stamp_exhausted(cmd) is True
+    audit_text = Path(core.STATE_DIR, "audit.jsonl").read_text(encoding="utf-8")
+    assert "approve-consume" in audit_text
+
+    # uses=5 时并发 9 个消耗：恰好 5 个成功，剩余值互不重复
+    cmd2 = "rm /nonexistent-opsx-w5-uses2"
+    core.approve(cmd2, ttl_seconds=60, uses=5)
+    results = []
+    lock = threading.Lock()
+
+    def consume():
+        value = core.consume_stamp(cmd2)
+        with lock:
+            results.append(value)
+
+    threads = [threading.Thread(target=consume) for _ in range(9)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = sorted(v for v in results if v is not None)
+    assert ok == [0, 1, 2, 3, 4], ok           # 5 次成功，剩余次数不重复
+    assert results.count(None) == 4
+
+    try:
+        core.approve(cmd2, ttl_seconds=60, uses=0)
+        raise AssertionError("uses 必须 >= 1")
+    except core.OpsxError as e:
+        assert "1-" in str(e)
+
+
+def test_remote_restore_atomic_keeps_mode_and_rebuilds():
+    """恢复脚本实测：原子替换、按快照权限还原、失败不留半份文件与临时文件。"""
+    import shlex
+    import stat as stat_mod
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "app.conf"
+        target.write_text("old-content\n")
+        os.chmod(target, 0o640)
+        payload = b"new-content\n"
+        script = remote._render_restore(str(target), "640", len(payload))
+        r = subprocess.run(["/bin/sh", "-c", script], input=payload,
+                           capture_output=True)
+        assert r.returncode == 0, r.stderr
+        assert target.read_bytes() == payload, target.read_bytes()
+        assert stat_mod.S_IMODE(target.stat().st_mode) == 0o640, \
+            oct(stat_mod.S_IMODE(target.stat().st_mode))
+        had, size = remote._parse_restore(r.stdout)
+        assert had is True and size == len(payload), (had, size, r.stdout)
+        assert not list(Path(td).glob(".opsx-restore.*")), "临时文件必须清理"
+
+        # chmod 失败 → 原文件一个字节都没变，且不留临时文件
+        bad = script.replace('chmod "640"', 'chmod "9999"')
+        r2 = subprocess.run(["/bin/sh", "-c", bad], input=b"should-not-land",
+                            capture_output=True)
+        assert r2.returncode != 0
+        assert target.read_bytes() == payload, "恢复失败不能留下半份内容"
+        assert not list(Path(td).glob(".opsx-restore.*"))
+
+        # 文件此前被删除：按快照权限重建（不是默认 umask）
+        target.unlink()
+        r3 = subprocess.run(["/bin/sh", "-c", script], input=payload,
+                            capture_output=True)
+        assert r3.returncode == 0, r3.stderr
+        had3, _ = remote._parse_restore(r3.stdout)
+        assert had3 is False and target.read_bytes() == payload, (had3, r3.stdout)
+        assert stat_mod.S_IMODE(target.stat().st_mode) == 0o640, \
+            oct(stat_mod.S_IMODE(target.stat().st_mode))
+
+    # 快照没记录权限：覆盖已有文件时沿用目标当前权限，重建时用 600（不是统一降权到 600）
+    assert remote._restore_mode({"mode": 0o600}) == ("600", "")
+    mode, note = remote._restore_mode({})
+    assert mode == "" and "未记录权限" in note and remote.FALLBACK_MODE == "600"
+
+
+def test_opsx_executions_cli():
+    """CLI：执行记录可查、待核实项显眼、非 unknown 不能核实。"""
+    import subprocess
+    import sys as sys_mod
+    state = tempfile.mkdtemp(prefix="opsx-exe-")
+    env = dict(os.environ, OPSX_STATE_DIR=state)
+    opsx = str(core.REPO_DIR / "opsx")
+
+    def run(*a):
+        return subprocess.run([sys_mod.executable, opsx, *a], capture_output=True,
+                              text=True, env=env)
+
+    cmd = "rm /nonexistent-opsx-cli-w5"
+    assert run("approve", cmd).returncode == 0
+    r = run("exec", cmd)
+    assert r.returncode == 1, (r.stdout, r.stderr)      # rm 失败
+    m = re.search(r"execution_id: (exe-\S+?)（", r.stdout)
+    assert m, r.stdout
+    eid = m.group(1)
+    r = run("executions", "show", eid)
+    assert r.returncode == 0 and "failed" in r.stdout and eid in r.stdout
+    r = run("executions")
+    assert r.returncode == 0 and eid in r.stdout
+    r = run("executions", "resolve", eid, "--observed-ok")
+    assert r.returncode == 1 and "只有 unknown" in r.stderr
+    r = run("executions", "resolve", eid)
+    assert r.returncode == 1 and "observed-ok" in r.stderr
+
+
+def stat_mode(path) -> int:
+    import stat as stat_mod
+    return stat_mod.S_IMODE(Path(path).stat().st_mode)
+
+
+def test_remote_kubectl_approval_env_matches_execution():
+    """远程 kubectl：审批与执行必须用同一份 env（含 k8s 作用域），否则永远判环境变化。"""
+    import remote
+    _write_targets()
+    cmd = "kubectl -n prod rollout restart deploy/api --context prod-ctx"
+    core.approve(cmd, ttl_seconds=60, target="web1")
+    env = core.resolve_env(cmd, "web1")
+    assert "k8s" in env
+    assert core.check(cmd, "web1", env)[0] == 0        # 同源 → 放行
+    # target_env 缺 k8s 键：这正是修复前的对照（会被判"执行环境已变化"）
+    assert core.check(cmd, "web1", remote.target_env("web1"))[0] == 2
+
+
+def test_dead_process_running_blocks_replay_without_reconcile():
+    """进程被 kill 后记录仍是 running：门禁要直接拦住，不能等有人先查一次列表。"""
+    import execution
+    cmd = "rm /nonexistent-opsx-w5-killed"
+    core.approve(cmd, ttl_seconds=60)
+    rec = execution.begin("exec", cmd, None, core.local_env(), phase="exec")
+    rec["pid"] = 99999999
+    with execution._locked():
+        execution._write(rec)
+    code, msg = core._prepare_exec(cmd)[:2]
+    assert code == core.EXEC_ABORT_UNKNOWN and "未核实" in msg
+    # 同一条记录如果还在拿锁/做快照（phase=lock），命令一定没下发 → 明确中止、不阻断
+    other = "rm /nonexistent-opsx-w5-killed2"
+    core.approve(other, ttl_seconds=60)
+    rec2 = execution.begin("exec", other, None, core.local_env(), phase="lock")
+    rec2["pid"] = 99999999
+    with execution._locked():
+        execution._write(rec2)
+    assert core._prepare_exec(other)[0] == 0
+    shown = [r for r in execution.list_records(status="aborted") if r["id"] == rec2["id"]]
+    assert shown and shown[0]["error"].startswith("执行进程在命令下发前退出")
+    execution.resolve(rec["id"], "observed-failed", "确认未执行")
+
+
+def test_bad_lock_wait_does_not_create_unknown_record():
+    """参数写错不该制造"待核实"记录：校验必须在建记录之前。"""
+    import execution
+    cmd = "rm /nonexistent-opsx-w5-args"
+    core.approve(cmd, ttl_seconds=60)
+    before = len(execution.list_records(tail=-1))
+    try:
+        core.exec_change(cmd, lock_wait=-1)
+        raise AssertionError("负的锁等待必须拒绝")
+    except core.OpsxError as e:
+        assert "非负" in str(e)
+    assert len(execution.list_records(tail=-1)) == before, "不该留下执行记录"
+    assert core._prepare_exec(cmd)[0] == 0, "审批次数也不该被消耗"
+
+
+def test_command_exit_code_not_confused_with_gate():
+    """命令自身的非零退出码不能被当成"没执行"（agent 曾按 5/6 误判）。"""
+    import execution
+    for target_code in (5, 6):
+        cmd = f'sh -c "exit {target_code}"'
+        core.approve(cmd, ttl_seconds=60)
+        code, _, _ = core.exec_change(cmd)
+        assert code == target_code, (cmd, code)
+        rec = execution.find_latest(cmd)
+        assert rec["status"] == "failed" and rec["exit_code"] == target_code
+    # 门禁码与常见命令码不重叠（120/121 在运维工具里罕见）
+    assert core.EXEC_ABORT_UNKNOWN not in (1, 2, 3, 4, 5, 6, 126, 127)
+    assert core.EXEC_ABORT_LOCK not in (1, 2, 3, 4, 5, 6, 126, 127)
+
+
+def test_restore_follows_chained_symlinks():
+    """a → b → c 的多层软链：要改真正的目标文件，且不能把中间软链换成普通文件。"""
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        real = Path(td, "real.conf")
+        real.write_text("old\n")
+        link2 = Path(td, "link2.conf")
+        link2.symlink_to(real)
+        link1 = Path(td, "link1.conf")
+        link1.symlink_to(link2)
+        payload = b"new\n"
+        script = remote._render_restore(str(link1), "644", len(payload))
+        r = subprocess.run(["/bin/sh", "-c", script], input=payload, capture_output=True)
+        assert r.returncode == 0, r.stderr
+        assert real.read_bytes() == payload, real.read_bytes()
+        assert link1.is_symlink() and link2.is_symlink(), "中间软链不能被替换成普通文件"
+
+
+def test_restore_verifies_size_before_replacing():
+    """提前 EOF（只传到一半）必须在 rename 之前被拒绝，原文件一个字节都不动。"""
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td, "app.conf")
+        target.write_text("old-content\n")
+        payload = b"0123456789"
+        script = remote._render_restore(str(target), "600", len(payload))
+        r = subprocess.run(["/bin/sh", "-c", script], input=b"abc", capture_output=True)
+        assert r.returncode != 0
+        assert target.read_text() == "old-content\n", "截断内容不能覆盖目标"
+        assert not list(Path(td).glob(".opsx-restore.*"))
+
+
+def test_restore_without_mode_keeps_existing_permissions():
+    """旧快照没有 mode：覆盖已有文件要沿用目标当前权限（不能把 0755 降成 0600）。"""
+    import stat as stat_mod
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td, "run.sh")
+        target.write_text("old\n")
+        os.chmod(target, 0o755)
+        payload = b"new\n"
+        script = remote._render_restore(str(target), "", len(payload))
+        r = subprocess.run(["/bin/sh", "-c", script], input=payload, capture_output=True)
+        assert r.returncode == 0, r.stderr
+        assert stat_mod.S_IMODE(target.stat().st_mode) == 0o755
+        # 文件此前不存在（重建）→ 保守 600
+        target.unlink()
+        r2 = subprocess.run(["/bin/sh", "-c", script], input=payload, capture_output=True)
+        assert r2.returncode == 0, r2.stderr
+        assert stat_mod.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_exhausted_stamp_not_listed_and_r3_limited():
+    """已用尽的戳不再显示为可用授权；R3 不可逆操作只能用一次。"""
+    cmd = "rm /nonexistent-opsx-w5-exhausted"
+    core.approve(cmd, ttl_seconds=60)
+    assert any(a["cmd"] == cmd for a in core.collect_state()["approvals"])
+    assert core.consume_stamp(cmd) == 0
+    assert not any(a["cmd"] == cmd for a in core.collect_state()["approvals"]), \
+        "用尽的戳不能被列成可用授权"
+    assert core.stamp_exhausted(cmd) is True   # 但仍能给出"已用尽"的明确提示
+    try:
+        core.approve("kubectl delete pod r3-once", uses=2, force=True)
+        raise AssertionError("R3 不允许一次批准多次执行")
+    except core.OpsxError as e:
+        assert "R3" in str(e)
+
+
+def test_rollback_script_fully_rendered_and_verified():
+    """走真实 rollback 链路：下发的脚本必须已渲染（无 @@ 占位符），且后验字节数对上。"""
+    import subprocess
+    import remote
+    _write_targets()
+    real_run = subprocess.run
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        if cmd.startswith("systemctl restart"):
+            return subprocess.CompletedProcess([], 0, b"restarted\n", b"")
+        # 其余（快照拉取/stat/恢复脚本）真正执行：残留的 @@ 占位符会在这里炸出来
+        assert "@@" not in cmd, cmd[:400]
+        r = real_run(["/bin/sh", "-c", cmd], input=stdin or b"", capture_output=True)
+        return subprocess.CompletedProcess([], r.returncode, r.stdout, r.stderr)
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        core.approve("systemctl restart render-check", ttl_seconds=60, target="web1")
+        with tempfile.TemporaryDirectory(prefix="opsx-render-") as td:
+            f = Path(td) / "app.conf"
+            f.write_text("remote-v1\n")
+            os.chmod(f, 0o640)
+            code, sid, _ = remote.exec_change("web1", "systemctl restart render-check",
+                                              snapshot_files=[str(f)])
+            assert code == 0 and sid
+            meta = json.loads(Path(core.STATE_DIR, "snapshots", sid, "meta.json").read_text())
+            assert meta["items"][0]["mode"] == 0o640      # 快照记录了权限
+            f.write_text("changed\n")
+            report = remote.rollback(sid, confirm=True)
+            assert "已恢复远程文件" in report and "权限 640" in report, report
+            assert f.read_text() == "remote-v1\n"        # 内容确实被写回
+    finally:
+        remote._ssh = orig
+
+
+def test_rollback_without_backcast_is_uncertain():
+    """脚本退出 0 但没带回后验 → 记 unknown，不能宣称校验通过。"""
+    import subprocess
+    import execution
+    import remote
+    _write_targets()
+    core.approve("systemctl restart no-backcast", ttl_seconds=60, target="web1")
+
+    def fake_ssh(name, cmd, stdin=None, timeout=120):
+        if cmd.startswith("systemctl restart"):
+            return subprocess.CompletedProcess([], 0, b"restarted\n", b"")
+        if ".opsx-restore." in cmd:
+            return subprocess.CompletedProcess([], 0, b"", b"")   # 后验被吞掉
+        if "OPSX-EXISTS" in cmd:
+            # 目标机当前内容（回滚前副本要读它）
+            return subprocess.CompletedProcess([], 0, b"OPSX-EXISTS\nv2\n", b"")
+        return subprocess.CompletedProcess([], 0, b"ok\n", b"")
+
+    orig = remote._ssh
+    remote._ssh = fake_ssh
+    try:
+        with tempfile.TemporaryDirectory(prefix="opsx-nobc-") as td:
+            f = Path(td) / "app.conf"
+            f.write_text("v1\n")
+            code, sid, _ = remote.exec_change("web1", "systemctl restart no-backcast",
+                                              snapshot_files=[str(f)])
+            assert code == 0 and sid
+            try:
+                remote.rollback(sid, confirm=True)
+                raise AssertionError("缺少后验时不应宣告成功")
+            except remote.RemoteError as e:
+                assert "无法确认" in str(e)
+            rec = [r for r in execution.list_records(tail=10)
+                   if r["kind"] == "rollback" and r["snapshot_id"] == sid]
+            assert rec and rec[0]["status"] == "unknown", rec
+    finally:
+        remote._ssh = orig
+
+
+def test_execution_authorize_phase_is_not_unknown():
+    """快照已完成但授权还没消耗时进程被杀：命令没下发，应记 aborted 而不是 unknown。"""
+    import execution
+    cmd = "rm /nonexistent-opsx-w5-authorize"
+    core.approve(cmd, ttl_seconds=60)
+    rec = execution.begin("exec", cmd, None, core.local_env(), phase="authorize")
+    rec["pid"] = 99999999
+    with execution._locked():
+        execution._write(rec)
+    shown = execution.get(rec["id"])
+    assert shown["status"] == "aborted" and "命令未执行" in shown["error"]
+    assert core._prepare_exec(cmd)[0] == 0, "没下发的命令不该挡住重试"
+
+
+def test_agent_exec_reports_only_current_run():
+    """agent 侧：被门禁挡下时不能把上一条成功记录的状态贴到本次结果上。"""
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext()
+    cmd = "rm /nonexistent-opsx-agent-since"
+    core.approve(cmd, ttl_seconds=60)
+    out = agent_tools.dispatch("ops_exec", {"command": cmd}, ctx)
+    assert "[失败]" in out and "exe-" in out          # 第一次：真的执行了（失败）
+    out2 = agent_tools.dispatch("ops_exec", {"command": cmd}, ctx)
+    assert "[opsx 拒绝]" in out2, out2                 # 第二次：戳用尽，被挡
+    assert "exe-" not in out2, f"不该出现上一次的 execution_id: {out2}"
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

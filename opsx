@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -36,6 +37,32 @@ def _guarded_cli(command: str) -> bool:
                             "list", "targets", "audit", "selftest"})
 
 
+def _print_execution(cmd: str, target: str | None = None,
+                     since: float | None = None) -> None:
+    """打印**本次**变更的 execution_id：断线/超时之后，人靠它查"到底改完了没有"。
+
+    since 是调用前的时刻：被门禁挡下（审批用尽/锁冲突）时不会产生新记录，
+    此时不该把上一条成功记录当成"本次结果"打出来。
+    """
+    import execution
+    record = execution.find_latest(cmd, target)
+    if record is None:
+        return
+    if since is not None and float(record.get("started_ts") or 0) < since:
+        return
+    print(f"[opsx] execution_id: {record['id']}（{record['status']}；"
+          f"查看: opsx executions show {record['id']}）")
+
+
+def _print_rollback_execution(snapshot_id: str) -> None:
+    import execution
+    for record in execution.list_records(tail=20):
+        if record.get("snapshot_id") == snapshot_id and record.get("kind") == "rollback":
+            print(f"[opsx] execution_id: {record['id']}（{record['status']}；"
+                  f"查看: opsx executions show {record['id']}）")
+            return
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="opsx", description="运维变更守门：分类/审批戳/快照/回滚/审计")
     sub = p.add_subparsers(dest="sub", required=True)
@@ -48,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--ttl", type=int, default=900, help="有效期秒数")
     a.add_argument("--force", action="store_true", help="R3 不可逆操作必须显式加此 flag")
     a.add_argument("--target", default="", help="SSH 目标名（戳只对该目标有效）；省略=本机")
+    a.add_argument("--uses", type=int, default=1,
+                   help="该授权允许执行几次（默认 1：一次批准只生效一次）")
 
     rv = sub.add_parser("revoke", help="撤销审批戳（用户取消变更）")
     rv.add_argument("command", nargs="+")
@@ -59,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--snapshot-file", action="append", default=[])
     e.add_argument("--snapshot-cmd", action="append", default=[],
                    help="'name::command' 形式，可多次")
+    e.add_argument("--wait-lock", type=float, default=0.0, metavar="SECONDS",
+                   help="等待同目标其它变更结束的秒数（默认 0：立即失败）")
 
     s = sub.add_parser("snapshot", help="独立快照")
     g = s.add_mutually_exclusive_group(required=True)
@@ -66,6 +97,18 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--cmd")
     s.add_argument("--name", default="")
     s.add_argument("--target", default="", help="SSH 目标名；省略=本机")
+
+    ex = sub.add_parser("executions", help="变更执行记录：list / show / resolve（核实 unknown）")
+    ex.add_argument("action", nargs="?", default="list",
+                    choices=["list", "show", "resolve"])
+    ex.add_argument("execution_id", nargs="?", default="")
+    ex.add_argument("--tail", type=int, default=20)
+    ex.add_argument("--status", default="", choices=["", "running", "succeeded", "failed",
+                                                    "unknown", "aborted"])
+    ex.add_argument("--target", default="", help="只看某个目标")
+    ex.add_argument("--observed-ok", action="store_true", help="核实：变更已生效")
+    ex.add_argument("--observed-failed", action="store_true", help="核实：变更未生效")
+    ex.add_argument("--note", default="", help="核实备注（记入审计）")
 
     r = sub.add_parser("rollback")
     r.add_argument("snapshot_id")
@@ -111,9 +154,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.target:
                 remote.get_target(args.target)  # 只允许给注册过的目标建戳
             path = core.approve(_join(args.command), ttl_seconds=args.ttl,
-                                force=args.force, target=args.target or None)
+                                force=args.force, target=args.target or None,
+                                uses=args.uses)
             stamp = json.loads(path.read_text(encoding="utf-8"))
-            print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s，"
+            print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s，可用 {args.uses} 次，"
                   f"{core.format_env(stamp['env'])}）")
             return 0
 
@@ -133,16 +177,58 @@ def main(argv: list[str] | None = None) -> int:
                     raise core.OpsxError("快照命令不能为空")
                 snap_cmds.append((cmd, name))
             cmd = _join(args.command)
+            started = time.time()
             if args.target:
-                code, sid, output = remote.exec_change(args.target, cmd, args.snapshot_file, snap_cmds)
+                code, sid, output = remote.exec_change(args.target, cmd, args.snapshot_file,
+                                                       snap_cmds, lock_wait=args.wait_lock)
             else:
-                code, sid, output = core.exec_change(cmd, args.snapshot_file, snap_cmds)
+                code, sid, output = core.exec_change(cmd, args.snapshot_file, snap_cmds,
+                                                     lock_wait=args.wait_lock)
             if output:
                 output = core.redact(output)
                 print(output, end="" if output.endswith("\n") else "\n")
             if sid:
                 print(f"[opsx] snapshot_id: {sid}（回滚: opsx rollback {sid}）")
+            _print_execution(cmd, args.target or None, since=started)
             return code
+
+        if args.sub == "executions":
+            import execution
+            execution.reconcile()  # 先对账：daemon/进程被杀留下的 running 要变成 unknown
+            if args.action == "list":
+                if args.tail <= 0:
+                    raise core.OpsxError("tail 须为正整数（0 会显示「无执行记录」，误导）")
+                summary = execution.summary(target=args.target or None)
+                print(execution.format_list(execution.list_records(
+                    tail=args.tail, target=args.target or None,
+                    status=args.status or None)))
+                if summary["pending"]:
+                    # 待核实项必须显眼：它们会挡住同目标同命令的再次执行
+                    print(f"\n[opsx] 有 {summary['pending']} 条待核实（unknown）："
+                          f"{', '.join(summary['pending_ids'])}")
+                    print("[opsx] 同目标同命令的新执行会被拒绝，直到核实："
+                          "opsx executions resolve <id> --observed-ok|--observed-failed")
+                return 0
+            if not args.execution_id:
+                raise core.OpsxError("需要 execution_id")
+            record = execution.get(args.execution_id)
+            if record is None:
+                raise core.OpsxError(f"没有这条执行记录: {args.execution_id}")
+            if args.action == "show":
+                print(execution.format_record(record))
+                return 0
+            if args.observed_ok and args.observed_failed:
+                raise core.OpsxError("--observed-ok 与 --observed-failed 只能选一个")
+            if not (args.observed_ok or args.observed_failed):
+                raise core.OpsxError("核实必须明确 --observed-ok 或 --observed-failed")
+            outcome = "observed-ok" if args.observed_ok else "observed-failed"
+            execution.resolve(args.execution_id, outcome, args.note)
+            print(f"已核实 {args.execution_id}：{outcome}")
+            if outcome == "observed-failed":
+                print("该命令未生效；如需真正执行，请重新批准后再次执行（旧的审批戳已用掉）。")
+            else:
+                print("该命令已生效；不要重复执行同一条命令（会二次生效）。")
+            return 0
 
         if args.sub == "snapshot":
             if args.target:
@@ -169,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("[opsx] 已取消，文件未改动", file=sys.stderr)
                         return 1
             print(core.redact(remote.rollback(args.snapshot_id, confirm=True)))  # 远程推回
+            _print_rollback_execution(args.snapshot_id)
             return 0
 
         if args.sub == "targets":
@@ -199,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
     except (core.OpsxError, remote.RemoteError) as e:
         print(f"[opsx] 错误: {core.redact(str(e))}", file=sys.stderr)
-        return 1
+        return core.EXEC_ABORT_LOCK if isinstance(e, core.TargetBusy) else 1
 
 
 if __name__ == "__main__":

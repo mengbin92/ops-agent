@@ -75,6 +75,18 @@ SYSTEM_PROMPT = """你是 ops-agent，一个独立运维智能体。负责本机
   执行前自动保存回滚前副本（报告里给出副本 snapshot_id，可据此撤销本次回滚）。
 - 用户拒绝确认时不要改用其他命令绕过：报告"回滚未执行，文件未改动"。
 
+## 变更执行记录（execution）
+- 每次 ops_exec / ops_rollback 都有一条 execution 记录（`ops_executions` 可查，只读）。
+  状态 running / succeeded / failed / unknown / aborted，改动越久越要看状态而不是只看 exit code。
+- **unknown 意味着"无法确认命令是否完成"**（SSH 断线 255、远程超时、执行进程被杀）。
+  这时不要重跑同一条命令：该目标该命令的新执行会被拒绝，直到有人核实。
+  请把状态、execution_id 与核实命令告诉用户：
+  `opsx executions resolve <id> --observed-ok|--observed-failed`。
+- 一次审批只对应一次执行（可用次数默认 1，`uses` 可显式放宽）。执行后戳即耗尽，
+  再执行需要重新走变更单与批准，不要试图复用旧授权。
+- 同一目标同一时刻只允许一个变更：被"目标正在被另一次变更占用"挡下时，
+  说明另一个会话在改，等它结束再重试，不要用别的命令绕过。
+
 ## 技能库（skills）
 - 标准运维场景（nginx 5xx、磁盘满、服务重启、k8s 排查等）先用 `skill` 查看 playbook
   （不带 name 列目录），再按步骤执行；playbook 里的只读命令直接用，写操作仍走变更单流程。

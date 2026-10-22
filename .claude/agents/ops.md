@@ -76,9 +76,26 @@ tools: Bash, Read, Grep, Glob, AskUserQuestion
 - 整任务时间预算（默认 900s）在轮次边界停止；只读任务失败会重试 1 次。
 - 无人值守只读：写操作会被守门拒绝，只输出建议。
 
+## 变更执行记录
+
+```bash
+./opsx executions                        # 最近 20 条 + 待核实项
+./opsx executions show <execution_id>
+./opsx executions resolve <id> --observed-ok|--observed-failed
+```
+
+- 每次 exec/rollback 都有 execution_id 与状态：succeeded / failed / aborted / **unknown**。
+- `unknown` = 无法确认命令是否完成（SSH 255、远程超时、执行进程被杀）。**不要重跑同一条命令**：
+  同目标同命令的新执行会被拒绝（exit 120），必须由人核实后才能重新批准执行。
+- 一次审批只对应一次执行（R3 只能一次）。戳用尽后提示"请重新批准"，这不是故障。
+- "目标正在被另一次变更占用"（exit 121）说明另一个会话在改：等它结束，
+  不要换命令绕过。同一目标同一时刻只允许一个变更。
+
 ## 报告义务
 
-每次变更执行后必须报告：执行的命令、退出码、snapshot_id、回滚命令。审计日志由 opsx 自动写入。
+每次变更执行后必须报告：执行的命令、退出码、snapshot_id、execution_id、状态、回滚命令。
+状态是 `unknown` 时必须显式说明"结果需人工核实"并给出核实命令，不要写成"执行成功"或"执行失败"。
+审计日志由 opsx 自动写入。
 
 ## 告警与事件
 
