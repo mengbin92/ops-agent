@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +42,9 @@ _MARK = {OK: "✓", WARN: "⚠", FAIL: "✗"}
 
 
 def _item(name: str, status: str, detail: str, fix: str = "") -> dict:
+    key = os.environ.get("OPSAGENT_API_KEY", "")
+    if len(key) > 4:
+        detail = detail.replace(key, core.REDACTED)
     return {"name": name, "status": status, "detail": core.redact(detail), "fix": fix}
 
 
@@ -54,11 +59,16 @@ def _masked(key: str) -> str:
 def _check_llm_config() -> list[dict]:
     key = os.environ.get("OPSAGENT_API_KEY", "")
     provider = os.environ.get("OPSAGENT_PROVIDER", "openai").strip().lower() or "openai"
+    if provider not in {"openai", "anthropic"}:
+        return [_item("llm-config", FAIL, f"未知 provider: {provider}",
+                      "OPSAGENT_PROVIDER 可选 openai / anthropic")]
     model = os.environ.get("OPSAGENT_MODEL", "") or \
         ("claude-sonnet-4-5" if provider == "anthropic" else "deepseek-chat")
     base = os.environ.get("OPSAGENT_BASE_URL", "") or \
         ("https://api.anthropic.com" if provider == "anthropic"
          else "https://api.deepseek.com")
+    from agent.notify import redact_endpoint
+    base = redact_endpoint(base)
     if not key:
         return [_item("llm-config", FAIL,
                       f"provider={provider} model={model} base={base}；API key 未设置",
@@ -72,6 +82,8 @@ def _probe_llm_api() -> list[dict]:
     if not key:
         return [_item("llm-api", FAIL, "无 API key，跳过探活")]
     provider = os.environ.get("OPSAGENT_PROVIDER", "openai").strip().lower() or "openai"
+    if provider not in {"openai", "anthropic"}:
+        return [_item("llm-api", FAIL, f"未知 provider: {provider}，跳过探活")]
     if provider == "anthropic":
         base = os.environ.get("OPSAGENT_BASE_URL", "https://api.anthropic.com").rstrip("/")
         url = base + ("/models" if base.endswith("/v1") else "/v1/models")
@@ -83,7 +95,8 @@ def _probe_llm_api() -> list[dict]:
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=API_PROBE_TIMEOUT) as resp:
-            return [_item("llm-api", OK, f"GET {base}… 返回 {resp.status}")]
+            from agent.notify import redact_endpoint
+            return [_item("llm-api", OK, f"GET {redact_endpoint(base)}… 返回 {resp.status}")]
     except urllib.error.HTTPError as e:
         code = e.code
         if code in (401, 403):
@@ -94,7 +107,7 @@ def _probe_llm_api() -> list[dict]:
                           "临时性：provider 会自动退避重试；持续限流考虑降低巡检频率或预算")]
         return [_item("llm-api", WARN, f"HTTP {code}：端点可达但返回异常",
                       "偶发可忽略；持续出现核对 base_url 是否正确")]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as e:
         return [_item("llm-api", FAIL, f"网络不通: {type(e).__name__}: {e}",
                       "检查网络/代理（走 http_proxy/https_proxy；内网端点要设 no_proxy）"
                       "与 base_url")]
@@ -117,7 +130,7 @@ def _check_budget() -> list[dict]:
                           "调整上限: opsagent budget set --calls/--tokens；"
                           "LLM 解读暂停，规则检查照常")]
         return [_item("budget", OK, detail)]
-    except core.OpsxError as e:
+    except (core.OpsxError, OSError) as e:
         return [_item("budget", FAIL, f"预算配置损坏: {e}",
                       "修 ~/.ops-agent/budget.json 或删除后 opsagent budget set 重建")]
 
@@ -127,9 +140,11 @@ def _check_state_dir() -> list[dict]:
     d = core.STATE_DIR
     if not d.is_dir():
         return [_item("state-dir", FAIL, f"{d} 不存在", "任意 opsx 命令会自动创建")]
-    probe = d / ".doctor-probe"
     try:
-        probe.write_text("ok", encoding="utf-8")
+        fd, probe_path = tempfile.mkstemp(prefix=".doctor-probe-", dir=d)
+        probe = Path(probe_path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("ok")
     except OSError as e:
         out.append(_item("state-dir", FAIL, f"{d} 不可写: {e}",
                          "检查目录权限（应 0700 且属当前用户）"))
@@ -244,6 +259,8 @@ def _check_notify() -> list[dict]:
     if failed:
         return [_item("notify", WARN, f"{detail}；发件箱 {len(failed)} 条失败待重试",
                       "opsagent notify retry；持续失败核对 webhook 是否失效")]
+    if not cfg.get("enabled", True):
+        return [_item("notify", WARN, detail, "需要主动告警时启用通知渠道")]
     return [_item("notify", OK, detail)]
 
 
@@ -266,7 +283,7 @@ def run() -> tuple[list[tuple[str, list[dict]]], dict]:
         try:
             items = fn()
         except Exception as e:  # noqa: BLE001 —— 一个分组挂了也要给出其余诊断
-            items = [_item("internal", WARN,
+            items = [_item("internal", FAIL,
                            f"检查项内部错误: {type(e).__name__}: {e}")]
         for item in items:
             counts[item["status"]] += 1
@@ -298,6 +315,9 @@ def format_report(sections: list[tuple[str, list[dict]]], counts: dict) -> str:
 
 
 def cli(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(prog="opsagent doctor", description="检查 ops-agent 自身健康")
+    parser.parse_args(argv)
     sections, counts = run()
     print(format_report(sections, counts))
     return 1 if counts[FAIL] else 0

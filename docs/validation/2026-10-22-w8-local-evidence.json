@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "started_at_utc": "2026-10-22T15:35:52Z",
+  "finished_at_utc": "2026-10-22T15:35:53Z",
+  "local_status": "passed",
+  "overall_status": "blocked",
+  "environment": {
+    "python": "3.9.6",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "drill_source_sha256": "eb620ea11a7d9125794d0861ed345542bf51ba48f079347900264e01deb2f38b",
+    "transport": "local subprocesses and HTTP on 127.0.0.1 only",
+    "state_isolation": "TemporaryDirectory / OPSX_STATE_DIR",
+    "sandbox_removed": true,
+    "production_writes": false,
+    "real_ssh_executed": false
+  },
+  "checks": [
+    {
+      "id": "denied_authorization_no_write",
+      "status": "passed",
+      "evidence": {
+        "verdict": "approval_required",
+        "config_sha256": "63745aef95742025c6d7a1b4fc0e7107e6f3c3eb2e0cb290f33c46f176e6740d",
+        "mode": "0o640",
+        "execution_records": 0,
+        "precheck": [
+          {
+            "n": 1,
+            "cmd": "/Library/Developer/CommandLineTools/usr/bin/python3 /Users/mengbin/vscode/neo/ops-agent/scripts/w8_acceptance.py --_probe http://127.0.0.1:56943/health",
+            "exit": 0,
+            "passed": true,
+            "detail": "符合预期",
+            "output": "{\"healthy\": true}\n"
+          }
+        ]
+      }
+    },
+    {
+      "id": "approved_configuration_change",
+      "status": "passed",
+      "evidence": {
+        "execution_id": "exe-20261022-233552-302310",
+        "execution_status": "succeeded",
+        "exit_code": 0,
+        "snapshot_id": "20261022-233552-1ea8e1",
+        "config_sha256": "54326d7faad8457f010ef9addf8e419facee59a4799e9e6702f7a7af641a2c60",
+        "approval_reusable": false
+      }
+    },
+    {
+      "id": "exit_zero_unhealthy_application",
+      "status": "passed",
+      "evidence": {
+        "verdict": "verify_failed",
+        "postcheck": [
+          {
+            "n": 1,
+            "cmd": "/Library/Developer/CommandLineTools/usr/bin/python3 /Users/mengbin/vscode/neo/ops-agent/scripts/w8_acceptance.py --_probe http://127.0.0.1:56943/health",
+            "exit": 1,
+            "passed": false,
+            "detail": "exit=1: {\"healthy\": false}\n",
+            "output": "{\"healthy\": false}\n"
+          }
+        ],
+        "probe_allowlist": "exact command in isolated config.override.yaml"
+      }
+    },
+    {
+      "id": "rollback_requires_confirmation",
+      "status": "passed",
+      "evidence": {
+        "snapshot_id": "20261022-233552-1ea8e1",
+        "refusal": "回滚会覆盖当前文件，属于写操作：请先预览并由人确认（CLI: opsx rollback <id>；agent: ops_rollback 会展示差异并确认）",
+        "config_unchanged": true
+      }
+    },
+    {
+      "id": "confirmed_config_permission_and_service_recovery",
+      "status": "passed",
+      "evidence": {
+        "snapshot_id": "20261022-233552-1ea8e1",
+        "execution_id": "exe-20261022-233552-2cdc36",
+        "config_sha256": "63745aef95742025c6d7a1b4fc0e7107e6f3c3eb2e0cb290f33c46f176e6740d",
+        "mode_before": "0o600",
+        "mode_after": "0o640",
+        "health_exit_code": 0,
+        "health_body": "{\"healthy\": true}",
+        "rollback_evidence": "已恢复文件: /private/var/folders/c0/p2dg4tcn4fs99f5jr3mpylcc0000gn/T/opsx-w8-0j54e283/service.conf\n回滚前副本: 20261022-233552-ee95a6（如需撤销本次回滚: opsx rollback 20261022-233552-ee95a6）"
+      }
+    },
+    {
+      "id": "local_timeout_stops_child_writes",
+      "status": "passed",
+      "evidence": {
+        "exit_code": 4,
+        "execution_id": "exe-20261022-233552-d12211",
+        "execution_status": "failed",
+        "delayed_child_write": false,
+        "output": "[opsx] 超时：命令超过 0.05s 未结束，已终止进程组",
+        "scope": "local timeout; SSH disconnect remains external"
+      }
+    },
+    {
+      "id": "unknown_execution_blocks_replay",
+      "status": "passed",
+      "evidence": {
+        "execution_id": "exe-20261022-233552-4ed326",
+        "first_exit_code": -15,
+        "execution_status": "unknown",
+        "replay_exit_code": 120,
+        "write_count": 1,
+        "replay_output": "[opsx] 拒绝执行：本机 上有一条未核实的执行 exe-20261022-233552-4ed326（执行进程被信号终止（exit -15），执行状态未知）。\n命令可能已经生效一部分，自动重放会造成重复生效。请先核实实际状态，再决定：\n  opsx executions show exe-20261022-233552-4ed326\n  opsx executions resolve exe-20261022-233552-4ed326 --observed-ok|--observed-failed",
+        "fault": "actual local shell SIGTERM; no SSH transport was simulated"
+      }
+    },
+    {
+      "id": "llm_http_failure_and_recovery",
+      "status": "passed",
+      "evidence": {
+        "transport": "real urllib to loopback HTTP stub",
+        "failure": "LLM API HTTP 503: {\"error\": \"synthetic unavailable\"}",
+        "failure_http_status": 503,
+        "recovery_http_status": 200,
+        "failed_calls": 1,
+        "total_calls": 2,
+        "response": {
+          "role": "assistant",
+          "content": "local-stub-ok"
+        },
+        "real_provider_executed": false
+      }
+    },
+    {
+      "id": "notification_failure_retry_and_recovery",
+      "status": "passed",
+      "evidence": {
+        "transport": "real urllib to loopback webhook stub",
+        "failure": {
+          "id": "20261022-233553-ntf-382a5b",
+          "created": 1792683353.0159638,
+          "created_iso": "2026-10-22 23:35:53",
+          "kind": "anomaly",
+          "severity": "critical",
+          "title": "巡检告警 1 项",
+          "text": "[ops-agent] 巡检告警 1 项\n时间: 2026-10-22 23:35:53｜任务 w8-local｜run w8-failed｜会话 （未记录）\n\n1. [异常] 任务 w8-local 结论：异常：结论：异常\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [
+            {
+              "fingerprint": "task:w8-local",
+              "severity": "critical",
+              "title": "任务 w8-local 结论：异常",
+              "line": "结论：异常",
+              "command": "",
+              "output": "",
+              "transient": false
+            }
+          ],
+          "recoveries": [],
+          "task_id": "w8-local",
+          "run_id": "w8-failed",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:56943/…",
+          "status": "failed",
+          "attempts": 1,
+          "last_error": "HTTP 503: {\"ok\": true}",
+          "next_attempt_ts": 1792683413.017079,
+          "http_status": 503,
+          "last_attempt_iso": "2026-10-22 23:35:53"
+        },
+        "retry": {
+          "id": "20261022-233553-ntf-382a5b",
+          "created": 1792683353.0159638,
+          "created_iso": "2026-10-22 23:35:53",
+          "kind": "anomaly",
+          "severity": "critical",
+          "title": "巡检告警 1 项",
+          "text": "[ops-agent] 巡检告警 1 项\n时间: 2026-10-22 23:35:53｜任务 w8-local｜run w8-failed｜会话 （未记录）\n\n1. [异常] 任务 w8-local 结论：异常：结论：异常\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [
+            {
+              "fingerprint": "task:w8-local",
+              "severity": "critical",
+              "title": "任务 w8-local 结论：异常",
+              "line": "结论：异常",
+              "command": "",
+              "output": "",
+              "transient": false
+            }
+          ],
+          "recoveries": [],
+          "task_id": "w8-local",
+          "run_id": "w8-failed",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:56943/…",
+          "status": "sent",
+          "attempts": 2,
+          "last_error": null,
+          "next_attempt_ts": 0,
+          "http_status": 200,
+          "last_attempt_iso": "2026-10-22 23:35:53",
+          "sent_at": 1792683353.0190709,
+          "sent_iso": "2026-10-22 23:35:53"
+        },
+        "recovery": {
+          "id": "20261022-233553-ntf-fcf9de",
+          "created": 1792683353.019836,
+          "created_iso": "2026-10-22 23:35:53",
+          "kind": "recovery",
+          "severity": "info",
+          "title": "巡检恢复 1 项",
+          "text": "[ops-agent] 巡检恢复 1 项\n时间: 2026-10-22 23:35:53｜任务 w8-local｜run w8-recovered｜会话 （未记录）\n\n恢复:\n1. 任务 w8-local 结论：异常 已恢复正常（此前持续约 0s）\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [],
+          "recoveries": [
+            {
+              "fingerprint": "task:w8-local",
+              "title": "任务 w8-local 结论：异常",
+              "first_seen": 1792683353.0159638
+            }
+          ],
+          "task_id": "w8-local",
+          "run_id": "w8-recovered",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:56943/…",
+          "status": "sent",
+          "attempts": 1,
+          "last_error": null,
+          "next_attempt_ts": 0,
+          "http_status": 200,
+          "last_attempt_iso": "2026-10-22 23:35:53",
+          "sent_at": 1792683353.0206568,
+          "sent_iso": "2026-10-22 23:35:53"
+        },
+        "duplicate_recovery_sent": false,
+        "external_recipient_contacted": false
+      }
+    },
+    {
+      "id": "loopback_server_request_evidence",
+      "status": "passed",
+      "evidence": {
+        "server_pid_is_separate": true,
+        "bind_address": "127.0.0.1",
+        "requests": [
+          {
+            "at_utc": "2026-10-22T15:35:52Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-22T15:35:52Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-22T15:35:52Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-22T15:35:52Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-22T15:35:53Z",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-22T15:35:53Z",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-22T15:35:53Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-22T15:35:53Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-22T15:35:53Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 200
+          }
+        ]
+      }
+    }
+  ],
+  "external_gates": [
+    {
+      "id": "real_ssh_recovery",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "未提供真实测试 SSH 主机；本次未执行 SSH 或远程断线恢复。"
+      }
+    },
+    {
+      "id": "real_llm_provider",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "LLM 仅使用回环 HTTP 桩；未连接真实模型服务。"
+      }
+    },
+    {
+      "id": "real_notification_channel",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "通知仅发送到回环 HTTP 桩；未向外部接收人发送。"
+      }
+    },
+    {
+      "id": "seven_day_readonly_trial",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "本次短时演练不能替代修复后连续 7 天观察。"
+      }
+    }
+  ],
+  "evidence_retention": "配置、状态、服务进程均已清理；结构化证据保留在本报告。"
+}

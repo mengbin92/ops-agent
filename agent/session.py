@@ -71,7 +71,8 @@ class Session:
                 elif rec.get("role") not in {"user", "assistant", "tool", "system"}:
                     raise ValueError(f"会话消息缺少有效 role（第 {i + 1} 行）")
                 else:
-                    self.messages.append(rec)
+                    # 旧版本/手工导入的记录也会再次发给模型，读取时同样要脱敏。
+                    self.messages.append(core.redact_obj(rec))
                 offset += len(line)
             else:
                 if lines and not lines[-1].endswith(b"\n"):

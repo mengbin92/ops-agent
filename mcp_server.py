@@ -269,7 +269,7 @@ def handle_message(msg):
         except (core.OpsxError, remote.RemoteError) as e:
             result = _tool_error(str(e))
         except Exception as e:  # noqa: BLE001 —— 未预期异常走 JSON-RPC 层
-            traceback.print_exc(file=sys.stderr)
+            print(core.redact(traceback.format_exc()), file=sys.stderr)
             return _err(msg_id, -32603, core.redact(f"工具内部错误: {e}"))
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
     if method is None:
@@ -290,8 +290,9 @@ def serve():
         try:
             resp = handle_message(msg)
         except Exception as e:  # noqa: BLE001 —— 单条消息异常不崩循环
-            traceback.print_exc(file=sys.stderr)
-            resp = _err(msg.get("id") if isinstance(msg, dict) else None, -32603, str(e))
+            print(core.redact(traceback.format_exc()), file=sys.stderr)
+            resp = _err(msg.get("id") if isinstance(msg, dict) else None, -32603,
+                        core.redact(str(e)))
         if resp is not None:
             _send(resp)
 

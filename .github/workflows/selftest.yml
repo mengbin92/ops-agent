@@ -19,6 +19,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
-        run: python -m compileall -q core.py execution.py remote.py opsx opsagent mcp_server.py agent selftest.py
+        run: python -m compileall -q core.py execution.py remote.py scenario.py doctor.py usage.py state_backup.py opsx opsagent mcp_server.py agent selftest.py scripts tests
       - name: Selftest
         run: ./opsx selftest
+      - name: Roadmap review regressions
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: W8 local recovery drill
+        run: python scripts/w8_acceptance.py --output "$RUNNER_TEMP/w8-local-evidence.json"

@@ -15,7 +15,7 @@ import json
 import http.client
 import os
 
-from .llm import LLMError, _api_key, _request, _validate_message
+from .llm import LLMError, _api_key, _request, _usage_tokens, _validate_message
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -140,10 +140,11 @@ def _message(data: dict) -> dict:
     return _validate_message(msg)
 
 
-def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
+def _chat_stream(body: dict, timeout: int, on_delta, usage_out=None) -> dict:
     content_parts: list[str] = []
     tools_acc: dict[int, dict] = {}  # 块 index → 未完成的 tool_use
     finished = False
+    raw_usage = {}
     with _request(_endpoint(), body, _headers(), timeout) as resp:
         for raw in resp:
             line = raw.decode("utf-8").strip()
@@ -156,6 +157,13 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
             if not isinstance(event, dict):
                 raise LLMError("LLM 流式响应格式异常")
             etype = event.get("type")
+            if etype == "message_start":
+                part_usage = (event.get("message") or {}).get("usage")
+                if isinstance(part_usage, dict):
+                    raw_usage.update(part_usage)
+            elif etype == "message_delta":
+                if isinstance(event.get("usage"), dict):
+                    raw_usage.update(event["usage"])
             if etype == "error":
                 raise LLMError(f"LLM 流式错误: {json.dumps(event)[:500]}")
             if etype == "content_block_start":
@@ -191,6 +199,9 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
         raise LLMError("流式响应为空（端点可能不支持 stream，或返回了非 SSE 内容）")
     if not finished:
         raise LLMError("LLM 流式响应中断，未收到结束标记")
+    used = _usage_tokens(raw_usage, "input_tokens", "output_tokens")
+    if used is not None and usage_out is not None:
+        usage_out["tokens"] = used
     msg: dict = {"role": "assistant", "content": "".join(content_parts)}
     if tools_acc:
         msg["tool_calls"] = []
@@ -207,12 +218,14 @@ def chat_once(messages: list[dict], tools: list[dict] | None = None,
               on_delta=None) -> tuple[dict, tuple[int, int] | None]:
     """单次调用（预算/退避/记账由 llm.chat 统一负责）。
 
-    返回 (message, (input_tokens, output_tokens) | None)；流式响应无 usage 字段。
+    返回 (message, (input_tokens, output_tokens) | None)。
     """
     body = _body(messages, tools, model, stream=on_delta is not None)
     try:
         if on_delta is not None:
-            return _chat_stream(body, timeout, on_delta), None
+            used_stream = {}
+            msg = _chat_stream(body, timeout, on_delta, used_stream)
+            return msg, used_stream.get("tokens")
         with _request(_endpoint(), body, _headers(), timeout) as resp:
             data = json.loads(resp.read().decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -223,8 +236,4 @@ def chat_once(messages: list[dict], tools: list[dict] | None = None,
         raise LLMError(f"LLM 流式响应格式异常: {e}") from e
     msg = _message(data)
     raw_usage = data.get("usage") if isinstance(data, dict) else None
-    used = None
-    if isinstance(raw_usage, dict):
-        used = (int(raw_usage.get("input_tokens") or 0),
-                int(raw_usage.get("output_tokens") or 0))
-    return msg, used
+    return msg, _usage_tokens(raw_usage, "input_tokens", "output_tokens")

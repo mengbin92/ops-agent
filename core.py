@@ -142,7 +142,25 @@ def sensitive_dir(path: str) -> bool:
     snapshots = os.path.realpath(STATE_DIR / "snapshots")
     return (real == os.path.realpath(STATE_DIR) or real == snapshots or
             real.startswith(snapshots + os.sep) or
+            _protected_state_copy(real) or
             any(re.search(p, path) for p in _SENSITIVE_DIR_PATTERNS))
+
+
+def _protected_state_copy(path: str) -> bool:
+    """备份和恢复副本含未脱敏原件，尚未切换状态目录时也保护读取出口。"""
+    candidate = Path(path)
+    for directory in (candidate, *candidate.parents):
+        try:
+            # manifest is published last; an interrupted backup still contains raw
+            # credentials in state.tar and needs the same read protection.
+            if (directory / "state.tar").is_file():
+                return True
+            if ((directory / ".ops-agent-recovered").is_file()
+                    and directory != Path(os.path.realpath(STATE_DIR))):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _path_probes(cand: str) -> list[str]:
@@ -411,8 +429,6 @@ def normalize(cmd: str) -> str:
 
 _SEGMENT_RE = re.compile(r"&&|\|\||[;|\n]|(?<!>)&(?!>)")
 _KUBECTL_SEG_RE = re.compile(r"(?:^|[\s/\"'])kubectl(?=[\s\"']|$)")
-_KUBECTL_CONTEXT = re.compile(r"(?:^|\s)--context(?:=|\s+)(\"[^\"]*\"|'[^']*'|\S+)")
-_KUBECTL_NAMESPACE = re.compile(r"(?:^|\s)(?:--namespace(?:=|\s+)|-n\s+)(\"[^\"]*\"|'[^']*'|\S+)")
 
 
 def _segments(cmd: str) -> list[str]:
@@ -434,6 +450,9 @@ _KUBECTL_FLAGS_WITH_VALUE = frozenset({
     "-n", "--namespace", "--context", "--kubeconfig", "-o", "--output", "--cluster",
     "--user", "--server", "--token", "--as", "--as-group", "--request-timeout", "-s",
     "--certificate-authority", "--client-certificate", "--client-key", "--cache-dir",
+    "-f", "--filename", "-k", "--kustomize", "-l", "--selector", "--field-selector",
+    "--field-manager", "--dry-run", "--timeout", "--grace-period", "--replicas",
+    "--revision", "--image", "--type", "-p", "--patch", "--patch-file",
 })
 _KUBECTL_READ_VERBS = frozenset({"get", "describe", "logs", "top", "api-resources",
                                  "explain", "version", "cluster-info"})
@@ -463,14 +482,48 @@ def _kubectl_read_only(seg: str) -> bool:
     return False
 
 
+def _kubectl_scope_values(seg: str) -> tuple[list[str], list[str]]:
+    """只采集 kubectl 的实际 argv 参数，字符串内容不能冒充作用域选项。"""
+    try:
+        words = shlex.split(seg, comments=True)
+    except ValueError:
+        return [], []
+    start = next((i + 1 for i, word in enumerate(words)
+                  if Path(word).name == "kubectl"), None)
+    if start is None:
+        # sh -c 的内层脚本不属于已解析的 argv，不能据此声称绑定了实际 context。
+        return [], []
+    contexts, namespaces = [], []
+    i = start
+    while i < len(words):
+        word = words[i]
+        if word == "--":
+            break
+        if word in ("--context", "--namespace", "-n"):
+            values = contexts if word == "--context" else namespaces
+            values.append(words[i + 1] if i + 1 < len(words) else "")
+            i += 2
+            continue
+        if word.startswith("--context="):
+            contexts.append(word.partition("=")[2])
+        elif word.startswith("--namespace="):
+            namespaces.append(word.partition("=")[2])
+        elif word.startswith("-n") and len(word) > 2:
+            namespaces.append(word[2:].removeprefix("="))
+        elif word in _KUBECTL_FLAGS_WITH_VALUE:
+            i += 2
+            continue
+        i += 1
+    return contexts, namespaces
+
+
 def k8s_scope(cmd: str) -> dict:
     segments = _kubectl_segments(cmd)
     changes = [seg for seg in segments if not _kubectl_read_only(seg)]
     for seg in changes or segments:
-        ctx = list(_KUBECTL_CONTEXT.finditer(seg))
-        ns = list(_KUBECTL_NAMESPACE.finditer(seg))
-        return {"context": ctx[-1].group(1).strip("\"'") if ctx else "",
-                "namespace": ns[-1].group(1).strip("\"'") if ns else ""}
+        ctx, ns = _kubectl_scope_values(seg)
+        return {"context": ctx[-1] if ctx else "",
+                "namespace": ns[-1] if ns else ""}
     return {"context": "", "namespace": ""}
 
 
@@ -513,16 +566,16 @@ def cmd_hash(cmd: str, target: str | None = None) -> str:
 
 def _validate_k8s_change_scope(cmd: str) -> None:
     kubectl = [seg for seg in _kubectl_segments(cmd) if not _kubectl_read_only(seg)]
-    contexts = [[m.group(1).strip("\"'") for m in _KUBECTL_CONTEXT.finditer(seg)]
-                for seg in kubectl]
+    scopes = [_kubectl_scope_values(seg) for seg in kubectl]
+    contexts = [context for context, _ in scopes]
     if any(not values or any(not value or any(ch in value for ch in "$`\\")
                              for value in values) for values in contexts):
         raise OpsxError("kubectl 变更须在命令中显式指定非空、无变量展开的 --context："
                         "审批绑定实际 context，不能用当前默认 context 执行")
     if len({value for values in contexts for value in values}) > 1:
         raise OpsxError("同一命令里的 kubectl 段使用了不同 --context：请拆开分别审批执行")
-    if any(not m.group(1).strip("\"'") or any(ch in m.group(1) for ch in "$`\\")
-           for seg in kubectl for m in _KUBECTL_NAMESPACE.finditer(seg)):
+    if any(not value or any(ch in value for ch in "$`\\")
+           for _, namespaces in scopes for value in namespaces):
         raise OpsxError("kubectl 变更的 namespace 须为非空、无变量展开的固定值")
 
 
@@ -1239,10 +1292,19 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
     if file_items and not confirm:
         raise OpsxError("回滚会覆盖当前文件，属于写操作：请先预览并由人确认"
                         "（CLI: opsx rollback <id>；agent: ops_rollback 会展示差异并确认）")
+    if file_items:
+        code, message = _check_pending_unknown(f"rollback {snapshot_id}", None)
+        if code:
+            raise OpsxError(message)
     rec = execution.begin("rollback", f"rollback {snapshot_id}", None,
                           local_env(), snapshot_id=snapshot_id, phase="lock")
     try:
         with target_lock(None, actor="rollback", execution_id=rec["id"]):
+            if file_items:
+                code, message = _check_pending_unknown(f"rollback {snapshot_id}", None)
+                if code:
+                    execution.finish(rec["id"], "aborted", error=message, phase="lock")
+                    raise OpsxError(message)
             execution.update(rec["id"], phase="backup")
             backup_sid = None
             report = []
@@ -1257,16 +1319,25 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
                     if item["type"] == "file":
                         staged = None
                         try:
+                            try:
+                                current_stat = Path(item["src"]).stat()
+                            except FileNotFoundError:
+                                current_stat = None
                             with tempfile.NamedTemporaryFile(dir=Path(item["src"]).parent,
                                                              delete=False) as f:
                                 staged = Path(f.name)
                             shutil.copy2(d / item["dest"], staged)
+                            if current_stat is not None:
+                                staged_stat = staged.stat()
+                                if (staged_stat.st_uid, staged_stat.st_gid) != (
+                                        current_stat.st_uid, current_stat.st_gid):
+                                    # 原子 rename 会换 inode；须先还原已有文件的属主/组，
+                                    # 不能把服务账户的配置静默变成执行 opsx 的账户所有。
+                                    os.chown(staged, current_stat.st_uid, current_stat.st_gid)
                             mode = item.get("mode")
                             if mode is None:
-                                try:
-                                    mode = stat.S_IMODE(Path(item["src"]).stat().st_mode)
-                                except FileNotFoundError:
-                                    mode = 0o600
+                                mode = (stat.S_IMODE(current_stat.st_mode)
+                                        if current_stat is not None else 0o600)
                             os.chmod(staged, mode)
                             execution.update(rec["id"], phase="restore")
                             restoring = True
@@ -1356,27 +1427,33 @@ EXEC_ABORT_UNKNOWN = 120
 EXEC_ABORT_LOCK = 121
 
 
+def _check_pending_unknown(cmd: str, target: str | None = None,
+                           env: dict | None = None) -> tuple[int, str]:
+    """所有写入口共用的防重放门禁；回滚以 snapshot_id 标识恢复动作。"""
+    import execution
+    blocked = execution.pending_unknown(target, cmd_hash(cmd, target),
+                                        env=env or resolve_env(cmd, target), command=cmd)
+    if blocked is None:
+        return 0, ""
+    where = f"目标 {target}" if target else "本机"
+    return EXEC_ABORT_UNKNOWN, (
+        f"[opsx] 拒绝执行：{where} 上有一条未核实的执行 {blocked['id']}"
+        f"（{blocked.get('error') or '无法确认命令是否完成'}）。\n"
+        "命令可能已经生效一部分，自动重放会造成重复生效。请先核实实际状态，再决定：\n"
+        f"  opsx executions show {blocked['id']}\n"
+        f"  opsx executions resolve {blocked['id']} --observed-ok|--observed-failed")
+
+
 def _prepare_exec(cmd: str, target: str | None = None) -> tuple[int, str]:
     """执行前的统一门禁：守门 + 同目标同命令是否有未核实的 unknown。
 
     "不自动重放"落在这里：只要上一条执行还是 unknown（可能改了一半），就不放行
     同一条命令再跑一次。核实由人做（opsx executions resolve），不提供自动动作。
     """
-    import execution  # 延迟导入：execution 依赖本模块
     code, msg = check(cmd, target)
     if code != 0:
         return code, msg
-    blocked = execution.pending_unknown(target, cmd_hash(cmd, target),
-                                        env=resolve_env(cmd, target), command=cmd)
-    if blocked is not None:
-        where = f"目标 {target}" if target else "本机"
-        return EXEC_ABORT_UNKNOWN, (
-            f"[opsx] 拒绝执行：{where} 上有一条未核实的执行 {blocked['id']}"
-            f"（{blocked.get('error') or '无法确认命令是否完成'}）。\n"
-            "命令可能已经生效一部分，自动重放会造成重复生效。请先核实实际状态，再决定：\n"
-            f"  opsx executions show {blocked['id']}\n"
-            f"  opsx executions resolve {blocked['id']} --observed-ok|--observed-failed")
-    return 0, ""
+    return _check_pending_unknown(cmd, target)
 
 
 def exec_change(
@@ -1493,6 +1570,11 @@ def _run_change(cmd: str, timeout: int) -> tuple[int, str, str, str | None]:
     try:
         r = run_shell(cmd, timeout=timeout)
         output = redact(r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else ""))
+        if r.returncode < 0:
+            return (r.returncode, "unknown",
+                    output + f"\n[opsx] 执行进程被信号终止（exit {r.returncode}），"
+                    "无法确认子进程是否完成，需先核实再决定是否重试",
+                    f"执行进程被信号终止（exit {r.returncode}），执行状态未知")
         return r.returncode, "succeeded" if r.returncode == 0 else "failed", output, None
     except subprocess.TimeoutExpired:
         return (4, "failed",

@@ -40,7 +40,13 @@ _HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
 
 
 class LLMError(Exception):
-    pass
+    def __init__(self, message):
+        # 代理的错误正文可能原样回显密钥；已知配置值不依赖正则格式识别。
+        message = str(message)
+        key = os.environ.get("OPSAGENT_API_KEY", "")
+        if len(key) > 4:
+            message = message.replace(key, core.REDACTED)
+        super().__init__(core.redact(message))
 
 
 class BudgetExhausted(LLMError):
@@ -94,7 +100,9 @@ def _request(url: str, body: dict, headers: dict, timeout: int):
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
         raise LLMError(f"LLM API HTTP {e.code}: {detail}") from e
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+    except ValueError as e:
+        raise LLMError(f"LLM API 配置无效: {e}") from e
+    except (urllib.error.URLError, TimeoutError) as e:
         raise LLMError(f"LLM API 请求失败: {e}") from e
 
 
@@ -144,7 +152,18 @@ def _validate_message(msg: dict) -> dict:
     return msg
 
 
-def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
+def _usage_tokens(raw, input_key="prompt_tokens", output_key="completion_tokens"):
+    """usage 是不可信的 provider 数据；非法/缺字段时退回估算而非跳过记账。"""
+    if not isinstance(raw, dict):
+        return None
+    values = (raw.get(input_key), raw.get(output_key))
+    if any(type(value) is not int or not 0 <= value <= usage.MAX_RECORDED_TOKENS
+           for value in values):
+        return None
+    return values
+
+
+def _chat_stream(body: dict, timeout: int, on_delta, usage_out=None) -> dict:
     content_parts: list[str] = []
     tools_acc: dict[int, dict] = {}
     finished = False
@@ -163,6 +182,9 @@ def _chat_stream(body: dict, timeout: int, on_delta) -> dict:
                 raise LLMError(f"LLM 流式响应解析失败: {e}") from e
             if not isinstance(event, dict) or event.get("error"):
                 raise LLMError(f"LLM 流式错误: {json.dumps(event)[:500]}")
+            used = _usage_tokens(event.get("usage"))
+            if used is not None and usage_out is not None:
+                usage_out["tokens"] = used
             choice = (event.get("choices") or [{}])[0]
             if choice.get("finish_reason"):
                 if choice["finish_reason"] in {"length", "content_filter"}:
@@ -191,8 +213,7 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
                timeout: int, on_delta) -> tuple[dict, tuple[int, int] | None]:
     """单次调用（不重试）。返回 (message, (prompt_tokens, completion_tokens) | None)。
 
-    provider 由 OPSAGENT_PROVIDER 选择；usage 信息只有非流式响应才有，
-    流式返回 None（调用方按字符粗估）。
+    provider 由 OPSAGENT_PROVIDER 选择；未返回有效 usage 时由调用方按字符粗估。
     """
     provider = os.environ.get("OPSAGENT_PROVIDER", "openai").strip().lower() or "openai"
     if provider == "anthropic":
@@ -209,7 +230,9 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
         body["tools"] = tools
     try:
         if on_delta is not None:
-            return _chat_stream(body, timeout, on_delta), None
+            used_stream = {}
+            msg = _chat_stream(body, timeout, on_delta, used_stream)
+            return msg, used_stream.get("tokens")
         with _post(body, timeout) as resp:
             data = json.loads(resp.read().decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -226,11 +249,7 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         raise LLMError(f"LLM 响应格式异常: {json.dumps(data)[:500]}") from e
     raw_usage = data.get("usage") if isinstance(data, dict) else None
-    used = None
-    if isinstance(raw_usage, dict):
-        used = (int(raw_usage.get("prompt_tokens") or 0),
-                int(raw_usage.get("completion_tokens") or 0))
-    return msg, used
+    return msg, _usage_tokens(raw_usage)
 
 
 def chat(messages: list[dict], tools: list[dict] | None = None,
@@ -238,20 +257,10 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
          deadline: float | None = None) -> dict:
     """调用当前 provider，返回 OpenAI 形状的 message dict（含可选 tool_calls）。
 
-    统一入口：预算检查（耗尽即 BudgetExhausted，不重试）→ 瞬时错误退避重试
-    → 成功后记账。deadline（monotonic 秒）是任务级时间预算：单次尝试的超时与
+    统一入口：锁内预留预算（耗尽即 BudgetExhausted，不重试）→ 瞬时错误退避重试
+    → 每次尝试记账。deadline（monotonic 秒）是任务级时间预算：单次尝试的超时与
     退避都会裁剪到剩余时间内，累计等待不会突破任务预算。
     """
-    try:
-        reason = usage.check_budget()
-    except core.OpsxError as e:
-        # 预算配置损坏不能让交互入口 traceback：包成 LLMError，文案可行动
-        raise LLMError(f"调用预算配置异常（无法判断是否超限，已停止调用）: {e}。"
-                       "修 ~/.ops-agent/budget.json / usage-state.json，"
-                       "或删除后 opsagent budget set 重建") from e
-    if reason:
-        _alert_budget_once(reason)
-        raise BudgetExhausted(reason)  # reason 已含恢复方式，不再重复拼接
     # 流式：第一次尝试可能已把半段内容推给用户，已发过内容后绝不重试（防重复输出）
     emitted = {"any": False}
 
@@ -261,6 +270,10 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
 
     cb = tracked_delta if on_delta is not None else None
     attempt = 0
+    actual_model = model or os.environ.get(
+        "OPSAGENT_MODEL", "claude-sonnet-4-5"
+        if os.environ.get("OPSAGENT_PROVIDER", "").strip().lower() == "anthropic"
+        else DEFAULT_MODEL)
     while True:
         attempt_timeout = timeout
         if deadline is not None:
@@ -268,10 +281,22 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
             if remaining <= 0:
                 raise LLMError("LLM 调用超出任务时间预算（deadline）")
             # 重试与超时都受任务预算约束：单次尝试最多用掉剩余时间
-            attempt_timeout = max(1, min(timeout, int(remaining)))
+            attempt_timeout = min(timeout, remaining)
+        try:
+            reserved_day, reason = usage.reserve_call()
+        except (core.OpsxError, OSError) as e:
+            raise LLMError(f"调用预算配置异常（无法判断是否超限，已停止调用）: {e}。"
+                           "修 ~/.ops-agent/budget.json / usage-state.json，"
+                           "或删除后 opsagent budget set 重建") from e
+        if reason:
+            _alert_budget_once(reason)
+            raise BudgetExhausted(reason)
         try:
             msg, used = _chat_once(messages, tools, model, attempt_timeout, cb)
         except LLMError as e:
+            prompt, completion = usage.estimate_tokens(messages, "", tools)
+            usage.record(actual_model, prompt, completion, estimated=True,
+                         reserved_day=reserved_day, failed=True)
             if attempt >= TRANSIENT_RETRIES or not is_transient(e) or emitted["any"]:
                 raise
             delay = _backoff(attempt)
@@ -283,13 +308,10 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
             time.sleep(delay)
             attempt += 1
             continue
-        actual_model = model or os.environ.get(
-            "OPSAGENT_MODEL",
-            "claude-sonnet-4-5"
-            if os.environ.get("OPSAGENT_PROVIDER") == "anthropic" else DEFAULT_MODEL)
         if used is None:
-            prompt, completion = usage.estimate_tokens(messages, msg.get("content"))
-            usage.record(actual_model, prompt, completion, estimated=True)
+            prompt, completion = usage.estimate_tokens(messages, msg, tools)
+            usage.record(actual_model, prompt, completion, estimated=True,
+                         reserved_day=reserved_day)
         else:
-            usage.record(actual_model, used[0], used[1])
+            usage.record(actual_model, used[0], used[1], reserved_day=reserved_day)
         return msg

@@ -824,7 +824,16 @@ def _recoverable(fp: str, signal: dict | None, rec: dict) -> bool:
             and (signal is None or signal.get("complete") is True))
 
 
-def _observation_ts(rec: dict, now: float) -> float:
+def _observation_ts(rec: dict, now: float, signal: dict | None = None,
+                    scope: str | None = None) -> float:
+    if scope and scope.startswith("check:") and signal \
+            and _finite(rec.get("started_ts")) is not None:
+        # 检查证据先于模型产生。慢模型的结束时间不能把旧证据变成新观测，
+        # 否则其他任务已确认恢复后，迟到的旧异常还会重新打开告警。
+        sampled = _finite((signal.get("scope_observed_ts") or {}).get(scope[len("check:"):]),
+                          _finite(signal.get("created_ts")))
+        if sampled is not None:
+            return sampled
     return _finite(rec.get("finished_ts"), _finite(rec.get("started_ts"), now))
 
 
@@ -834,10 +843,11 @@ def _observation_scope(fp: str) -> str:
     return "task:" + fp.split(":", 1)[-1]
 
 
-def _older_observation(state: dict, fp: str, rec: dict, now: float) -> bool:
+def _older_observation(state: dict, fp: str, rec: dict, now: float,
+                       signal: dict | None = None) -> bool:
     return (not fp.startswith("missed:") and
             (state.get("observations") or {}).get(_observation_scope(fp), 0)
-            > _observation_ts(rec, now))
+            > _observation_ts(rec, now, signal, scope=_observation_scope(fp)))
 
 
 def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
@@ -849,7 +859,7 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
     counts = {"suppressed": 0, "new": 0, "escalated": 0, "changed": 0,
               "reminder": 0, "recovered": 0, "cleared": 0}
     for fp, item in current.items():
-        if _older_observation(state, fp, rec, now):
+        if _older_observation(state, fp, rec, now, signal):
             counts["suppressed"] += 1
             continue
         prev = items.get(fp) if isinstance(items.get(fp), dict) else None
@@ -913,10 +923,22 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
         scope = fp.split(":", 1)[1] if fp.startswith(("run:", "task:")) else None
         if scope is not None and scope != rec.get("task_id"):
             continue
-        if _older_observation(state, fp, rec, now):
+        if _older_observation(state, fp, rec, now, signal):
             continue
         if not _recoverable(fp, signal, rec):
             continue
+        if (entry.get("pending_recovery") and not entry.get("needs_notify")
+                and cfg and _suppression_reason(cfg, "info", now) is None):
+            notification_id = entry.get("notification_id")
+            if isinstance(notification_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}",
+                                                                 notification_id):
+                pending = _read_notification(_outbox_dir() / f"{notification_id}.json")
+                if pending and pending.get("status") == "failed" and any(
+                        item.get("fingerprint") == fp for item in pending.get("recoveries") or []):
+                    # 已进入持久发件箱：交给 retry_pending 的退避/次数上限，
+                    # 不能每轮健康检查另建通知把 attempts 重新清零。
+                    counts["suppressed"] += 1
+                    continue
         counts["recovered"] += 1
         if _finite(entry.get("delivered_at", entry.get("notified_at")), None) is None:
             # 从没真正告诉过用户（未配置/停用/静默期间发现的）：静默清状态，
@@ -1185,7 +1207,6 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
         # 静默清掉的"从没通知过"的条目也要落盘，否则下一轮会重复清
         dirty = bool(current) or counts.get("cleared", 0) > 0
         # 补发积压或配置修复后的旧记录，不能覆盖后来观测到的异常/恢复。
-        observed = _observation_ts(rec, now)
         scopes = [] if rec.get("status") == "missed" else [f"task:{rec.get('task_id') or '?'}"]
         for target in (signal or {}).get("targets") or []:
             groups = ((signal or {}).get("target_groups") or {}).get(target,
@@ -1193,6 +1214,7 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
             scopes += [f"check:{target}/{group}" for group in groups]
         observations = state.setdefault("observations", {})
         for scope in scopes:
+            observed = _observation_ts(rec, now, signal, scope=scope)
             if observed > observations.get(scope, 0):
                 observations[scope] = observed
                 dirty = True

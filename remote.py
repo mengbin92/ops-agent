@@ -666,6 +666,10 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
         raise core.OpsxError("回滚会覆盖目标机文件，属于写操作：请先预览并由人确认"
                             "（CLI: opsx rollback <id>）")
     env = _snapshot_target_env(meta)  # 目标校验先做：校验失败不必占锁
+    if file_items:
+        code, message = core._check_pending_unknown(f"rollback {snapshot_id}", target, env)
+        if code:
+            raise core.OpsxError(message)
     rec = execution.begin("rollback", f"rollback {snapshot_id}", target, env,
                           snapshot_id=snapshot_id, phase="backup")
     backup_sid = None
@@ -682,7 +686,12 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
     try:
         with _fixed_target(target), core.target_lock(
                 target, actor="rollback", execution_id=rec["id"]):
-            _snapshot_target_env(meta)  # 等锁或确认期间注册表/实际机器可能已经变化。
+            env = _snapshot_target_env(meta)  # 等锁或确认期间注册表/实际机器可能已经变化。
+            execution.update(rec["id"], env=env, host=env.get("host"))
+            if file_items:
+                code, message = core._check_pending_unknown(f"rollback {snapshot_id}", target, env)
+                if code:
+                    raise core.OpsxError(message)
             if file_items:
                 resolved_paths = {item["src"]: _target_resolved_path(target, item["src"])
                                   for item in file_items}

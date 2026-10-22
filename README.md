@@ -222,19 +222,49 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
 ```
 
 - **doctor**：每项检查给 ✓/⚠/✗ + 证据 + 修复建议——LLM 分"key 缺失 / 鉴权失败(401/403) /
-  限流(429) / 网络不通"；SSH 逐台探活；心跳过期（任务执行期间不刷心跳，阈值按启用任务的
-  最大超时 + 300s 计算，不会被慢任务误报）；通知渠道显示脱敏后的 endpoint 与失败待发数。
+  限流(429) / 网络不通"；SSH 逐台探活；心跳在扫描和每次执行尝试前刷新，过期阈值按启用任务的
+  最大超时 + 300s 计算；通知渠道显示脱敏后的 endpoint 与失败待发数。
 - **provider 临时错误退避**：429/408/5xx/网络瞬断在 `llm.chat` 内重试 2 次
   （指数退避 3s/6s + 抖动，封顶 30s），401/400 等永久错误绝不重试；
   退避与单次超时都裁剪到任务 deadline 内，累计等待不突破任务预算；流式已输出内容后不重试
   （防止重复推送文本）。
-- **usage/调用预算**：每次调用记账（usage.jsonl + 按日聚合）；超限立即拒绝新的 LLM 调用
+- **usage/调用预算**：每次请求尝试先在锁内占用调用次数，失败和重试也计入，完成后记账
+  （usage.jsonl + 按日聚合）；超限立即拒绝新的 LLM 调用
   （`BudgetExhausted`，跨天自动恢复），**确定性规则检查（inspect/场景/通知）不受影响**；
-  状态文件损坏时 fail-closed（备份 .corrupt 并报错，不静默清零）。
+  token 优先采用 provider usage，缺失时估算并计入工具定义和调用参数；token 上限在完成记账后
+  阻断后续请求，不能预知并发在途请求的实际用量。状态文件损坏时备份 `.corrupt-*` 并阻断本次
+  调用、写事件，随后重建计数；这是告警后恢复策略，不是永久阻断。
 - **心跳过期告警**：调度 daemon 启动/`--once` 运行时检查上次心跳；过期经通知状态机告警
   （自动去重），恢复时自动发"已恢复"。
 - **常驻部署**：`docs/ops/` 提供 systemd service（+ timer 替代方案）与 launchd plist
   示例，含加固指令与环境变量文件说明。
+
+### 恢复准备与演练（W8）
+
+技能库新增 K8s CrashLoop、Docker 重启循环、DNS/TLS、备份新鲜度与恢复演练，
+每份包含证据清单、停止条件、审批和可重复验收。
+
+```bash
+# 先停止全部调度、Agent、MCP/RPC 与其他状态写入者，再由人执行离线备份。
+./opsx state backup /secure/new-backup --quiesced
+./opsx state verify /secure/new-backup
+./opsx state restore /secure/new-backup --to /isolated/new-state --quiesced
+
+# 可重复的本机隔离演练：实际进程/文件/HTTP，LLM 和通知使用本地桩。
+python3 scripts/w8_acceptance.py --output /tmp/w8-local-evidence.json
+```
+
+备份含完整原始秘密与快照，使用私有目录、清单和逐文件 SHA-256。恢复目标必须全新，
+旧审批隔离，running 执行转 unknown、调度记录转 interrupted，排期与通知停用，active 长目标暂停并保留轮次。
+`--quiesced` 是停写声明，不提供在线全局事务锁；详见[状态恢复操作文档](docs/ops/state-backup-recovery.md)。
+
+本地演练退出 0 仅代表本地通过，JSON 同时列出尚未通过的真实 SSH/LLM/通知和 7 天观察门禁；
+`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-23-w8-local-evidence.json)
+为 10/10 通过，整体仍待外部验收。见[测试环境验收步骤](docs/ops/w8-real-environment.md)和
+[受控变更候选版](docs/releases/2026-10-22-controlled-change-candidate.md)。
+
+2026-10-23 W8 独立复审修复中断残留、归档资源边界、恢复状态有效性与演练隔离/证据完整性；
+既有自检 309/309、独立回归 168/168（本轮新增 64 项），详见[复审记录](docs/reviews/2026-10-23-week8-followup-review.md)。
 
 ### 变更场景（W6）：预检 → 快照 → 执行 → 后验 → 回滚建议
 
@@ -266,9 +296,12 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   预检/后验探针强制只读（R0）。
 - 结论分清六种"没执行"：需审批（2）、守门拒绝（2）、预检未过（3）、快照未建成（4）、
   目标被占（121）、结果未知（120）——都能直接进脚本。
+- 后验不通过或自定义场景未配置后验均退出 7；Docker healthcheck 的 `starting` 不算验证通过。
+  预检/后验使用完整输出判断，报告保留脱敏证据；远程场景与回滚后验固定在同一 SSH 端点。
 - agent 侧用 `scenario_run` 工具：先展示完整命令与全部探针请求确认，批准后执行；
   无人值守（定时巡检/子代理）不可用。
 - 回滚后验证**只作证据不判定**：配置已恢复旧版时，变更后验失败可能正是回滚生效的表现。
+  恢复本身失败时不运行后验或写“已回滚”事件；CLI 对失败/未知分别退出 1/120。
 
 ### 变更执行记录与并发控制（W5）
 
@@ -588,6 +621,9 @@ W6（`300/300`）、W7（`309/309`）：详细问题、修复与验证见
 [W5 复审记录](docs/reviews/2026-10-22-week5-change-safety-review.md) 与
 [W6 复审记录](docs/reviews/2026-10-22-week6-scenario-review.md) 与
 [W7 复审记录](docs/reviews/2026-10-22-week7-reliability-review.md)。
+
+本次对当前 W1–W7 再次复审后，既有自检 **309/309**、新增回归 **60/60** 通过；
+问题与兼容行为调整见[路线图后续复审记录](docs/reviews/2026-10-22-roadmap-followup-review.md)。
 
 W5 再次复审修复后：`./opsx selftest` **292/292 passed**，新增 31 项回归，
 详见[二次审查记录](docs/reviews/2026-10-22-week5-followup-review.md)。升级前请结束在途变更；

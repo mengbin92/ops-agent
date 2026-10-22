@@ -1,29 +1,54 @@
 ---
-description: 安全重启服务的变更流程（快照 → 审批 → 执行 → 验证 → 回滚预案）
+description: 安全重启服务：只读证据、一次工具内审批、快照、独立后验与经确认回滚
 ---
 
 # 安全重启服务
 
-## 适用
-改配置后需要 `systemctl restart/reload`、`docker restart` 等 R1 操作；
-或服务异常需要重启恢复。
+## 适用与证据清单
 
-## 流程
+服务异常或配置变更后需要重启/reload。先确认注册 target 对应的实际主机、cwd、
+服务名和启动方式，记录采样时间、依赖、最近变更、配置路径、预期业务健康指标、
+允许的中断窗口、快照 id 和 execution_id。日志可能含秘密，只取必要窗口并脱敏。
 
-1. **摸清现状（只读）**：`systemctl status <svc>`、`journalctl -u <svc> -n 50`、
-   `ps aux`；确认服务名、启动方式（systemd / docker / supervisor）、依赖。
-2. **快照**：配置文件是影响面最大的部分，用 `snapshot_file` 记录：
-   `/etc/<svc>/...`（systemd unit 变体也一并拍）。
-   unit 文件路径用 `systemctl show -p FragmentPath <svc>` 确认（只读）。
-3. **变更单**：目标（本机/远程 target）、完整命令、风险（重启期间不可用窗口）、
-   回滚计划（恢复配置 + 再重启；快照 id）、验证命令。
-4. **确认与审批**：ask_user 让用户确认 → `ops_approve`（R3 才需 `force=true`）。
-5. **执行**：`ops_exec`（带 `snapshot_file`）执行重启；输出与 exit code 一并汇报。
-6. **验证（只读）**：`systemctl status <svc>`、`journalctl -u <svc> -n 100`、
-   端口/进程检查；确认业务恢复。
-7. **失败则回滚**：`ops_rollback <snapshot_id>` 恢复配置，再重启；把失败证据一并报告。
+## 只读命令
 
-## 禁止
-- 不拍快照就改配置；`reload` 失败的场景也按重启处理（保留回滚路径）。
-- 用 `&&` 把重启和验证/清理串成一条命令——验证必须能看到独立的结果。
-- 远程目标：必须用注册过的 target，`ops_approve`/`ops_exec` 的 target 要一致。
+以下以测试服务 nginx 为例，替换成已确认的具体服务；每条独立通过 `bash` 守门，
+远程用注册 target，不把 SSH/写命令拼入诊断。非 R0 命令停止并走工具内审批。
+
+```bash
+date -u
+systemctl status nginx --no-pager
+systemctl show nginx -p FragmentPath -p ActiveState -p SubState -p Result
+journalctl -u nginx -n 100 --no-pager
+```
+
+## 变更与审批
+
+1. 列变更单：实际目标、完整命令、风险、维护窗口、配置路径、快照/无文件快照原因、
+   只读后验和预期结果。文件快照不等于服务或数据备份；不要承诺能撤销重启本身。
+2. 优先 `scenario_run` 的 `systemd-restart`、`nginx-reload`、`docker-restart`。
+   它会展示完整命令、预检、快照和后验并请求人工确认；不再先额外调用 `ask_user`。
+   内置场景的探针只是最低限度，还需执行变更单中的业务后验。
+3. 非固定场景：调用 `ops_approve` 请求具体命令审批，再用相同命令与 target 的
+   `ops_exec` 执行；文件变更传 `snapshot_file`，多文件改动须使用能覆盖全部文件的
+   受控场景/CLI。`ops_approve` 自带确认，`ask_user` 仅用来澄清；拒绝或无确认通道即停止。
+4. 记录退出码和执行状态；`exit=0` 只说明命令完成。独立执行后验，不用 `&&` 把
+   重启、验证和清理绑为一条命令。
+5. 后验失败先保存证据并提出恢复方案。`ops_rollback` 会展示实际目标、文件差异并
+   再次请求人工确认，执行前保存回滚前副本。回滚后的重启/reload 是新变更，另行
+   审批。恢复配置后重跑同样的只读后验，不能仅凭“已恢复”宣称业务恢复。
+
+## 停止条件
+
+目标/服务/配置范围不明确，缺少可用快照或合理的无快照说明，依赖故障、数据损坏、
+权限不足、预检失败、用户拒绝时停止。出现 running/unknown 或超时断线时，先用
+`ops_executions` 查询并只读核实，由人处理 `opsx executions resolve`；不自动重放，
+也不自动回滚或重复重启。禁止裸 `bash` 执行写操作或扩大白名单绕审批。
+
+## 可重复验收
+
+在同一测试主机/服务上，保存变更前、变更后、观察窗结束的时间戳与独立输出。
+事先约定观察窗口（建议至少 5 分钟且覆盖启动/健康探针周期）与业务探针成功标准。
+窗口内服务持续 active、无新增失败、业务探针达到预期才通过；缺探针或采样失败为
+unverified/unknown。拒绝审批应无新写执行；构造命令成功但业务不健康，应验证失败；
+经确认恢复后，配置内容、权限和业务探针均需与恢复目标一致。

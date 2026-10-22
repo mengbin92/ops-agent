@@ -723,7 +723,12 @@ def _run_preset_checks(entry: dict, session_id: str,
             + (f"完整报告: {path}（用 read 查看，不要重复跑同样的探针）。" if path else "")
             + "\n你的任务是解读这份结果、指出需要人工确认的点，不得与之冲突，也不得把"
               "未采集项说成正常。\n")
-    error = "规则结果摘要写入失败，无法保存检查证据" if signal_path is None else None
+    error = None
+    if path is None:
+        error = "规则完整报告写入失败，无法保存完整检查证据"
+        note += f"本次完整规则结果（报告保存失败）：\n{text}\n"
+    if signal_path is None:
+        error = "规则结果摘要写入失败，无法保存检查证据"
     return note, str(signal_path) if signal_path else None, error
 
 
@@ -912,9 +917,27 @@ def _execute_run(entry: dict, model: str | None) -> dict:
     每条尝试用独立会话；会话 id 在建好时就写进记录，这样即使 LLM 调用失败，
     也能按会话找回此前已跑完的规则检查摘要（通知不依赖模型是否活着）。
     """
-    from . import loop  # 延迟导入
     deadline = time.monotonic() + _task_timeout(entry)
     rec = _begin_run(entry, None)
+    try:
+        return _execute_started_run(entry, model, rec, deadline)
+    except Exception as e:  # noqa: BLE001 —— 准备/收尾也必须结束已经创建的 running 记录
+        signal = None
+        if rec.get("session_id"):
+            try:
+                signal = checks.load_signal(rec["session_id"])
+            except Exception:  # noqa: BLE001 —— 证据读取错误不能掩盖原始失败
+                pass
+        return _finish_run(rec, entry, "failed",
+                           error=f"{type(e).__name__}: {e}",
+                           attempts=rec.get("attempts", 0),
+                           attempt_errors=rec.get("attempt_errors"), signal=signal)
+
+
+def _execute_started_run(entry: dict, model: str | None, rec: dict,
+                         deadline: float) -> dict:
+    """执行已落 running 记录的任务；意外错误由外层在同一记录上收尾。"""
+    from . import loop  # 延迟导入
     text, attempt_errors, attempts = None, [], 0
     sessions: list[str] = []
     # 先把会话建好并回写 running 记录：进程被 kill 时也能按会话找回规则摘要
@@ -938,6 +961,7 @@ def _execute_run(entry: dict, model: str | None) -> dict:
     _touch_heartbeat()
     for attempt in range(1, RUN_RETRIES + 2):
         attempts = attempt
+        rec["attempts"] = attempt
         _touch_heartbeat()
         # 每次尝试独立会话：重试不重复追加同一条 prompt，也不复用上次的半截历史
         session = first_session if attempt == 1 else sess_mod.Session()
@@ -954,6 +978,7 @@ def _execute_run(entry: dict, model: str | None) -> dict:
             break
         except Exception as e:  # noqa: BLE001 —— 瞬时失败有限重试；仍是只读操作
             attempt_errors.append(f"{type(e).__name__}: {e}")
+            rec["attempt_errors"] = attempt_errors
             from . import llm as llm_mod
             if llm_mod.is_budget_exhausted(e):
                 # 预算跨天才恢复：重试只会白花钱白花时间，直接按失败收尾。

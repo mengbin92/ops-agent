@@ -11,8 +11,9 @@
 预算：`~/.ops-agent/budget.json`（0600）：{"enabled": true, "daily_calls": 500,
 "daily_tokens": 500000}。0/None 表示该项不限。
 
-已知边界：预算是本机自我约束，不是账单对账——多进程并发下计数可能差几次；
-token 数以 provider 返回的 usage 为准，流式响应没有 usage 时按字符粗估。
+已知边界：预算是本机自我约束，不是账单对账。每次尝试（含失败和重试）先在锁内
+占用调用次数；token 数以 provider 返回的 usage 为准，缺少 usage 时按字符粗估。
+token 上限在完成记账后阻断后续请求，不能预知在途请求的最终 token 数。
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -46,7 +48,7 @@ def _budget_file() -> Path:
 
 
 def _day_key(ts: float | None = None) -> str:
-    return time.strftime("%Y-%m-%d", time.localtime(ts or time.time()))
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() if ts is None else ts))
 
 
 def _state_lock():
@@ -108,6 +110,8 @@ def load_budget() -> dict:
 def save_budget(cfg: dict) -> Path:
     if not isinstance(cfg, dict):
         raise core.OpsxError("预算配置须为对象")
+    if "enabled" in cfg and type(cfg["enabled"]) is not bool:
+        raise core.OpsxError("enabled 须为布尔值")
     for key in ("daily_calls", "daily_tokens"):
         value = cfg.get(key)
         if value is not None and (type(value) is not int or value < 0):
@@ -117,11 +121,7 @@ def save_budget(cfg: dict) -> Path:
     out = {"enabled": bool(cfg.get("enabled", True)),
            "daily_calls": cfg.get("daily_calls") or None,
            "daily_tokens": cfg.get("daily_tokens") or None}
-    tmp = path.with_name(f".budget-{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(out, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _atomic_json(path, out)
     return path
 
 
@@ -168,21 +168,35 @@ def _load_state(strict: bool = False) -> dict:
         if strict:
             _backup_corrupt(path, "结构非法（days 字段缺失）")
         return {"version": 1, "days": {}}
+    for key, day in raw["days"].items():
+        if (not isinstance(key, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", key)
+                or not isinstance(day, dict)
+                or any(type(day.get(field)) is not int or day[field] < 0
+                       for field in ("calls", "tokens"))):
+            if strict:
+                _backup_corrupt(path, "结构非法（每日 calls/tokens 须为非负整数）")
+            return {"version": 1, "days": {}}
     return raw
 
 
-def _save_state(state: dict) -> None:
-    path = _state_file()
+def _atomic_json(path: Path, value: dict) -> None:
     core._ensure_state_dir()
-    tmp = path.with_name(f".usage-state-{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _save_state(state: dict) -> None:
+    _atomic_json(_state_file(), state)
 
 
 def record(model: str, prompt_tokens=None, completion_tokens=None,
-           source: str = "agent", *, estimated: bool = False) -> None:
+           source: str = "agent", *, estimated: bool = False,
+           reserved_day: str | None = None, failed: bool = False) -> None:
     """记一条调用。失败不外抛：记账是旁路，不能让"记账坏了"变成"模型坏了"。"""
     try:
         prompt = int(prompt_tokens or 0)
@@ -192,13 +206,27 @@ def record(model: str, prompt_tokens=None, completion_tokens=None,
             return  # provider 返回的垃圾：不记账，比记错强
         total = prompt + completion
         now = time.time()
-        rec = {"ts": round(now, 3), "day": _day_key(now), "model": str(model or "?")[:80],
+        day_key = reserved_day or _day_key(now)
+        rec = {"ts": round(now, 3), "day": day_key, "model": core.redact(str(model or "?"))[:80],
                "prompt_tokens": prompt, "completion_tokens": completion,
                "source": str(source)[:40]}
         if estimated:
             rec["estimated"] = True
+        if failed:
+            rec["failed"] = True
         path = _usage_file()
         core._ensure_state_dir()
+        with _state_lock():
+            state = _load_state(strict=True)
+            day = state["days"].setdefault(day_key, {"calls": 0, "tokens": 0})
+            if reserved_day is None:
+                day["calls"] += 1
+            day["tokens"] += total
+            # 只保留最近 31 天聚合
+            if len(state["days"]) > 31:
+                for old_day in sorted(state["days"])[:-31]:
+                    state["days"].pop(old_day, None)
+            _save_state(state)
         if path.exists() and path.stat().st_size > USAGE_ROTATE_BYTES:
             try:
                 path.replace(path.with_suffix(".jsonl.1"))
@@ -207,16 +235,6 @@ def record(model: str, prompt_tokens=None, completion_tokens=None,
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        with _state_lock():
-            state = _load_state()
-            day = state["days"].setdefault(_day_key(now), {"calls": 0, "tokens": 0})
-            day["calls"] += 1
-            day["tokens"] += total
-            # 只保留最近 31 天聚合
-            if len(state["days"]) > 31:
-                for old_day in sorted(state["days"])[:-31]:
-                    state["days"].pop(old_day, None)
-            _save_state(state)
     except Exception:  # noqa: BLE001 —— 记账旁路失败静默（审计无意义，重试浪费）
         pass
 
@@ -237,11 +255,12 @@ def mark_budget_alerted() -> bool:
         return True
 
 
-def estimate_tokens(messages: list[dict] | None, output: str) -> tuple[int, int]:
+def estimate_tokens(messages: list[dict] | None, output, tools=None) -> tuple[int, int]:
     """流式响应没有 usage 字段时的粗估（4 字符 ≈ 1 token）。"""
     try:
-        text = json.dumps(messages or [], ensure_ascii=False)
-        return max(1, len(text) // 4), max(1, len(output or "") // 4)
+        text = json.dumps({"messages": messages or [], "tools": tools or []}, ensure_ascii=False)
+        result = output if isinstance(output, str) else json.dumps(output or {}, ensure_ascii=False)
+        return max(1, len(text) // 4), max(1, len(result) // 4)
     except Exception:  # noqa: BLE001
         return 1, 1
 
@@ -249,9 +268,11 @@ def estimate_tokens(messages: list[dict] | None, output: str) -> tuple[int, int]
 # ---------------------------------------------------------------- 预算检查
 
 def today() -> dict:
-    state = _load_state(strict=True)  # 预算判定路径：损坏即报错，不静默清零
-    day = state["days"].get(_day_key(), {"calls": 0, "tokens": 0})
-    return {"calls": day["calls"], "tokens": day["tokens"], "day": _day_key()}
+    with _state_lock():
+        state = _load_state(strict=True)  # 预算判定路径：损坏即报错，不静默清零
+        key = _day_key()
+        day = state["days"].get(key, {"calls": 0, "tokens": 0})
+        return {"calls": day["calls"], "tokens": day["tokens"], "day": key}
 
 
 def check_budget() -> str | None:
@@ -259,7 +280,10 @@ def check_budget() -> str | None:
     cfg = load_budget()
     if not cfg["enabled"]:
         return None
-    used = today()
+    return _budget_reason(cfg, today())
+
+
+def _budget_reason(cfg: dict, used: dict) -> str | None:
     reasons = []
     calls_limit = cfg.get("daily_calls")
     tokens_limit = cfg.get("daily_tokens")
@@ -273,6 +297,27 @@ def check_budget() -> str | None:
             + "）。已停止新的 LLM 调用；确定性规则检查不受影响。"
               "按本机自然日跨天自动恢复；如需立即调整: opsagent budget set "
               "--calls/--tokens；查看: opsagent budget status")
+
+
+def reserve_call() -> tuple[str | None, str | None]:
+    """在同一把进程锁内检查并预留一次尝试，防止并发穿透次数上限。
+
+    返回 (记账日期, 阻断原因)。在发起请求前持久化失败则拒绝发起请求。
+    """
+    with _state_lock():
+        cfg = load_budget()
+        state = _load_state(strict=True)
+        key = _day_key()
+        day = state["days"].setdefault(key, {"calls": 0, "tokens": 0})
+        reason = _budget_reason(cfg, day) if cfg["enabled"] else None
+        if reason:
+            return None, reason
+        day["calls"] += 1
+        try:
+            _save_state(state)
+        except OSError as e:
+            raise core.OpsxError(f"无法预留调用预算: {e}") from e
+        return key, None
 
 
 def ensure_budget() -> None:
@@ -314,6 +359,8 @@ def format_status() -> str:
 
 
 def recent(tail: int = 20) -> list[dict]:
+    if tail <= 0:
+        return []
     lines: list[str] = []
     for candidate in (_usage_file().with_suffix(".jsonl.1"), _usage_file()):
         # 轮转后的旧文件在前：recent 要能跨轮转往回看

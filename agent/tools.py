@@ -122,13 +122,19 @@ def _bash(args: dict, ctx: ToolContext) -> str:
     code, msg = core.check(cmd, target=target)  # R0 直接放行（check 内会写审计）
     if code != 0:
         return f"[opsx 拒绝] {msg}"
+    timeout = BASH_TIMEOUT
+    if ctx.deadline is not None:
+        remaining = ctx.deadline - time.monotonic()
+        if remaining <= 0:
+            return "[任务超时] 时间预算耗尽，命令未执行"
+        timeout = min(timeout, remaining)
     if target:  # 远程只读：经 SSH 目标执行
-        code, out = remote.run(target, cmd)
+        code, out = remote.run(target, cmd, timeout=timeout)
         return f"[target={target} exit={code}]\n" + _cap(out, f"bash-{target}")
     try:
-        r = core.run_shell(cmd, timeout=BASH_TIMEOUT)
+        r = core.run_shell(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"[超时] 命令超过 {BASH_TIMEOUT}s 未结束，已终止"
+        return f"[超时] 命令超过 {timeout:g}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
     return f"[exit={r.returncode}]\n" + _cap(out, "bash")
 
@@ -170,18 +176,37 @@ def _read(args: dict, ctx: ToolContext) -> str:
     if limit <= 0:
         return "[错误] limit 必须是正整数"
     lines, size = [], 0
+    key_open, key_tail = False, ""
+
+    def contains_private_key(part: str) -> bool:
+        # offset/limit 会切掉 PEM 包围标记，必须在跳过前文时仍跟踪私钥状态。
+        # 只保留标记所需的小段上下文，长行读取仍然有界。
+        nonlocal key_open, key_tail
+        was_open = key_open
+        scan = key_tail + part
+        markers = [m for m in re.finditer(r"-----(BEGIN|END)[ A-Z0-9]*PRIVATE KEY-----", scan)
+                   if m.end() > len(key_tail)]
+        for marker in markers:
+            key_open = marker.group(1) == "BEGIN"
+        key_tail = scan[-128:]
+        return was_open or any(m.group(1) == "BEGIN" for m in markers)
+
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for _ in range(offset - 1):
                 part = f.readline(OUTPUT_LIMIT + 2)
+                contains_private_key(part)
                 if not part:
                     return f"[错误] offset={offset} 超出文件行数"
                 while part and not part.endswith("\n"):
                     part = f.readline(OUTPUT_LIMIT + 2)
+                    contains_private_key(part)
             for _ in range(limit):
                 line = f.readline(OUTPUT_LIMIT - size + 2)
                 if not line:
                     break
+                if contains_private_key(line):
+                    return "[已脱敏] 读取范围含私钥内容，不返回分页片段。"
                 line = line.rstrip("\r\n")
                 size += len(line) + bool(lines)
                 lines.append(line)

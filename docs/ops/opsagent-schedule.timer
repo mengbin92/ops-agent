@@ -5,6 +5,7 @@ Description=ops-agent scheduled inspection (one-shot)
 
 # 与 opsagent-schedule-oneshot.service 配套安装
 [Timer]
+Unit=opsagent-schedule-oneshot.service
 OnCalendar=*:0/5
 Persistent=true
 

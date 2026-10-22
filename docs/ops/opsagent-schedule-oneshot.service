@@ -6,10 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# 与常驻 service 使用同一个运行用户；系统服务不设 User 会以 root 运行。
+# User=yourname
 ExecStart=/usr/local/bin/opsagent schedule run --once
 EnvironmentFile=-/etc/ops-agent/env
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=false
-ReadWritePaths=%h/.ops-agent

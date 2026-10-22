@@ -5392,7 +5392,7 @@ def test_schedule_checks_target_validated():
 
 
 def test_notify_recovery_retried_after_failure():
-    """恢复消息发送失败时不能先清状态：下一轮要能补发，否则"恢复"永久丢失。"""
+    """恢复发送失败保留状态并经发件箱补发，健康轮次不能绕过退避重置次数。"""
     from agent import notify
     orig = notify._post
     try:
@@ -5409,9 +5409,10 @@ def test_notify_recovery_retried_after_failure():
             "恢复消息没发出去就不能清成已恢复"
         assert state["items"]["check:web1/resources/磁盘 /data"].get("pending_recovery")
         notify._post = _FakePost()
-        retried = notify.process_run(ok)
-        assert retried["actions"]["recovered"] == 1
-        assert retried["notification"]["severity"] == "info"
+        assert notify.process_run(ok)["notification"] is None
+        retried = notify.retry_pending(notif_id=failed["notification"]["id"])[0]
+        assert retried["status"] == "sent"
+        assert retried["severity"] == "info"
         assert notify._load_state()["items"]["check:web1/resources/磁盘 /data"][
             "severity"] is None
     finally:
@@ -7547,6 +7548,8 @@ def test_w5_review_remote_restore_checks_permission_postconditions():
             records = [r for r in execution.list_records(tail=500)
                        if r['kind'] == 'rollback' and r.get('snapshot_id') == sid]
             assert records[0]['status'] == 'unknown'
+            # 此桩没有执行恢复写入，逐条核实后才能继续下一种后验损坏场景。
+            execution.resolve(records[0]['id'], 'observed-failed')
 
 
 

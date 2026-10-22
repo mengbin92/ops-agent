@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -393,6 +394,11 @@ def _probe(target, cmd: str, timeout: int, budget: dict | None = None) -> tuple:
         return 126, f"[守门失败] {e}"
     if code != 0:
         return 126, f"[拒绝] {msg}"
+    if budget is not None and budget.get("deadline") is not None:
+        remaining = budget["deadline"] - time.monotonic()
+        if remaining <= 0:
+            return 127, "[预算] 单目标检查时间预算已用尽，未执行"
+        timeout = min(timeout, remaining)
     return _exec(target, cmd, timeout)
 
 
@@ -451,7 +457,7 @@ def parse_meminfo(text: str) -> tuple:
     meminfo 的键名固定是英文，解析不受环境影响。
     """
     values = {}
-    for line in (text or "").splitlines():
+    for line in _stdout_only(text).splitlines():
         m = _MEMINFO_RE.match(line.strip())
         if not m:
             continue
@@ -517,7 +523,7 @@ def parse_load(text: str):
 
 def parse_systemd_show(text: str) -> dict:
     values = {}
-    for line in (text or "").splitlines():
+    for line in _stdout_only(text).splitlines():
         key, sep, val = line.partition("=")
         if sep:
             values[key.strip()] = val.strip()
@@ -531,7 +537,7 @@ def parse_docker_inspect(text: str):
     分隔符用逗号而不是竖线：`|` 是 shell 管道符，会先把命令切成多段，
     让 `docker inspect` 之外的片段落进未知命令（R2）而被守门拒绝。
     """
-    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    lines = [ln for ln in _stdout_only(text).splitlines() if ln.strip()]
     if not lines:
         return None
     fields = lines[0].split(",")
@@ -773,7 +779,8 @@ def _docker_item(item: dict, cfg: dict, svc: dict, ts: str, budget: dict) -> dic
     elif health == "unhealthy":
         status = CRITICAL
     elif state == "running":
-        status = WARN if health == "starting" else OK
+        status = WARN if health == "starting" else (
+            OK if health in ("healthy", "none") else UNKNOWN)
     elif state in ("restarting", "dead", "exited", "paused", "removing"):
         status = CRITICAL
     elif state == "created":
@@ -1123,9 +1130,10 @@ def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
     for name in report.get("target_names") or []:
         target_complete.setdefault(name, report.get("complete") is True
                                    and set(groups) == set(GROUPS))
+    observed_ts = time.time()
     return {
         "version": 1,
-        "created_ts": time.time(),
+        "created_ts": observed_ts,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "report_id": report.get("report_id"),
         "verdict": report.get("verdict"),
@@ -1134,6 +1142,8 @@ def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
         "targets": report.get("target_names") or [],
         "target_verdicts": target_verdicts,
         "target_groups": target_groups,
+        "scope_observed_ts": {f"{target}/{group}": observed_ts
+                              for target, picked in target_groups.items() for group in picked},
         "target_complete": target_complete,
         "check_statuses": check_statuses,
         "summary": report.get("summary") or {},
@@ -1148,6 +1158,17 @@ def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
 def _merge_signal(previous: dict, current: dict) -> dict:
     """同一会话可以分批巡检；只替换这次实际采样的目标与分组。"""
     targets, groups = set(current["targets"]), set(current["groups"])
+    observed_ts = dict(previous.get("scope_observed_ts") or {})
+    for target in previous.get("targets") or []:
+        for group in (previous.get("target_groups") or {}).get(target,
+                                                              previous.get("groups") or []):
+            observed_ts.setdefault(f"{target}/{group}", previous.get("created_ts", 0))
+    incoming_ts = current.get("scope_observed_ts") or {
+        f"{target}/{group}": current.get("created_ts", 0)
+        for target in current["targets"]
+        for group in current["target_groups"].get(target, current["groups"])}
+    observed_ts.update(incoming_ts)
+    current["scope_observed_ts"] = observed_ts
 
     def sampled(key):
         parts = key.split("/", 2)
@@ -1270,6 +1291,12 @@ def load_signal(session_id: str | None) -> dict | None:
     for key in ("target_verdicts", "target_groups", "target_complete", "check_statuses"):
         if key in data and not isinstance(data[key], dict):
             return None
+    observed_ts = data.get("scope_observed_ts", {})
+    if not isinstance(observed_ts, dict) or any(
+            not isinstance(scope, str) or isinstance(ts, bool)
+            or not isinstance(ts, (int, float)) or not math.isfinite(ts)
+            for scope, ts in observed_ts.items()):
+        return None
     if any(not isinstance(value, list) or any(group not in GROUPS for group in value)
            for value in (data.get("target_groups") or {}).values()):
         return None

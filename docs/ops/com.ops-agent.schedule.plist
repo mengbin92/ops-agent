@@ -20,8 +20,8 @@
         <key>OPSAGENT_API_KEY</key>
         <string>换成真实密钥</string>
     </dict>
-    <!-- 只在"异常退出"时拉起：配置错误（假 key 秒退）或另一实例持锁（exit 3）
-         不会进入 10 秒一次的空转刷屏 -->
+    <!-- 异常退出时拉起；包括持锁退出（exit 3），每次至少间隔 60 秒。
+         不要同时运行另一份 daemon 或 timer。 -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>

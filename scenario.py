@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,10 +38,12 @@ MAX_SNAPSHOT_FILES = 20
 
 # 场景结论。verify_failed 是本模块存在的意义：命令 exit=0 但后验不通过。
 VERDICTS = ("ok", "verify_failed", "exec_failed", "precheck_failed",
-            "approval_required", "gate_denied", "busy", "uncertain")
+            "approval_required", "gate_denied", "busy", "uncertain",
+            "snapshot_failed", "unverified")
 VERDICT_LABEL = {
     "ok": "通过（后验全部健康）",
     "verify_failed": "验证失败（命令退出码为 0，但后验不健康）",
+    "unverified": "未验证（命令完成，未配置后验）",
     "exec_failed": "执行失败",
     "precheck_failed": "预检未通过（未执行任何变更）",
     "approval_required": "需要人工审批（未执行任何变更）",
@@ -287,16 +290,17 @@ def resolve_params(scen: dict, overrides: dict) -> dict:
 def _evaluate(check: dict, output: str) -> tuple[bool, str]:
     """按期望字段评估探针输出（多字段 AND；无期望字段 = 只要求 exit 0）。"""
     text = (output or "").strip()
+    shown = core.redact(output or "").strip()[:120]
     if "expect" in check and text != check["expect"]:
-        return False, f"期望精确匹配 {check['expect']!r}，实际 {text[:120]!r}"
+        return False, f"期望精确匹配 {check['expect']!r}，实际 {shown!r}"
     if "expect_contains" in check and check["expect_contains"] not in output:
-        return False, f"期望包含 {check['expect_contains']!r}，实际 {text[:120]!r}"
+        return False, f"期望包含 {check['expect_contains']!r}，实际 {shown!r}"
     if "expect_not" in check and text == check["expect_not"]:
         return False, f"期望不等于 {check['expect_not']!r}，但实际就是"
     if "expect_not_contains" in check and check["expect_not_contains"] in output:
         return False, f"期望不包含 {check['expect_not_contains']!r}，但出现了"
     if "expect_regex" in check and not re.search(check["expect_regex"], output):
-        return False, f"期望匹配 /{check['expect_regex']}/，实际 {text[:120]!r}"
+        return False, f"期望匹配 /{check['expect_regex']}/，实际 {shown!r}"
     return True, "符合预期"
 
 
@@ -317,7 +321,7 @@ def _probe(target: str | None, cmd: str, timeout: int = PROBE_TIMEOUT) -> tuple[
         output = r.stdout.decode("utf-8", "replace")
         if r.stderr.strip():
             output += "\n[stderr]\n" + r.stderr.decode("utf-8", "replace")
-        return r.returncode, core.redact(output)[:EVIDENCE_LIMIT]
+        return r.returncode, output
     try:
         r = core.run_shell(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -327,7 +331,7 @@ def _probe(target: str | None, cmd: str, timeout: int = PROBE_TIMEOUT) -> tuple[
     output = r.stdout or ""
     if (r.stderr or "").strip():
         output += "\n[stderr]\n" + r.stderr
-    return r.returncode, core.redact(output)[:EVIDENCE_LIMIT]
+    return r.returncode, output
 
 
 def _run_checks(checks: list[dict], params: dict, target: str | None) -> tuple[bool, list[dict]]:
@@ -336,24 +340,28 @@ def _run_checks(checks: list[dict], params: dict, target: str | None) -> tuple[b
     for i, check in enumerate(checks, 1):
         cmd = substitute(check["cmd"], params)
         code, output = _probe(target, cmd)
+        safe_output = core.redact(output)
         if code != 0:
-            passed, detail = False, f"exit={code}: {output[:200]}"
+            passed, detail = False, f"exit={code}: {safe_output[:200]}"
         else:
             passed, detail = _evaluate(check, output)
         results.append({"n": i, "cmd": core.redact(cmd), "exit": code,
-                        "passed": passed, "detail": detail, "output": output})
+                        "passed": passed, "detail": core.redact(detail),
+                        "output": safe_output})
         if not passed:
             all_ok = False
     return all_ok, results
 
 
-def _render_checks(results: list[dict]) -> list[str]:
+def _render_checks(results: list[dict], full_output: bool = False) -> list[str]:
     lines = []
     for r in results:
         mark = "✓" if r["passed"] else "✗"
         lines.append(f"- {mark} [{r['n']}] exit={r['exit']} `{r['cmd']}`"
                      + (f" — {r['detail']}" if r["detail"] else ""))
-        if not r["passed"] and r.get("output"):
+        if full_output and r.get("output"):
+            lines.extend(["```", r["output"], "```"])
+        elif not r["passed"] and r.get("output"):
             excerpt = " / ".join(r["output"].splitlines()[:4])[:400]
             lines.append(f"  输出: {excerpt}")
     return lines
@@ -382,7 +390,7 @@ def save_report(slug: str, text: str) -> Path | None:
                                 f"{uuid.uuid4().hex[:6]}.md")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text + "\n")
+            handle.write(core.redact(text) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         _prune_reports()
@@ -409,12 +417,12 @@ def _exec_target(scen: dict, target_override: str | None) -> str | None:
     """合并场景声明的 target 与调用方 --target：显式传入优先，但固定目标不许改指向
     （防止把 A 机的场景打到 B 机）。"""
     target = target_override or scen["target"]
-    if target in (None, "", "local"):
-        return None
     if target_override and scen["target"] not in (None, "", "local") \
             and target_override != scen["target"]:
         raise ScenarioError(f"场景 {scen['name']} 固定在目标 {scen['target']}，"
                             f"不能再用 --target {target_override} 改指向")
+    if target in (None, "", "local"):
+        return None
     remote.get_target(target)  # 未注册目标名先报出来，别等到探针才炸
     return target
 
@@ -426,10 +434,18 @@ def run(name: str, params: dict | None = None, target: str | None = None,
     守门/审批/锁/快照/执行记录全部由 core/remote.exec_change 负责，这里不复制
     任何安全逻辑。返回结构化结果；报告落 ~/.ops-agent/reports/。
     """
-    from agent import events  # 延迟导入：事件时间线在 agent 包内
     scen = load(name)
     resolved = resolve_params(scen, params or {})
     tgt = _exec_target(scen, target)
+    # 预检、变更和后验必须针对同一端点，注册表中途改向不能让别的机器代为通过。
+    with remote._fixed_target(tgt) if tgt else nullcontext():
+        return _run_scenario(scen, resolved, tgt, actor, lock_wait)
+
+
+def _run_scenario(scen: dict, resolved: dict, tgt: str | None,
+                  actor: str, lock_wait: float | None) -> dict:
+    from agent import events
+    name = scen["name"]
     result = {
         "scenario": name, "description": scen["description"], "target": tgt or "local",
         "params": resolved, "verdict": None, "execution_id": None,
@@ -444,7 +460,7 @@ def run(name: str, params: dict | None = None, target: str | None = None,
             result["verdict"] = "precheck_failed"
             result["suggestion"] = ("预检未通过，未执行任何变更。先解决预检项"
                                     "（不要绕过预检直接跑命令）。")
-            report = save_report(f"scenario-{name}", format_result(result, True))
+            report = save_report(f"scenario-{name}", format_result(result, True, full_output=True))
             result["report_path"] = str(report) if report else None
             events.append("scenario-precheck-failed", scenario=name,
                           target=result["target"],
@@ -529,6 +545,7 @@ def run(name: str, params: dict | None = None, target: str | None = None,
                 "被守门拒绝（未执行、未写入；这不是重新批准能解决的问题，"
                 "请核对场景里的快照命令或命令本身）。\n"
                 + core.redact((output or str(gate_msg) or "")[:400]))
+        _finalize(result, [], verify=None)
         return result
 
     if status == "unknown":
@@ -573,6 +590,11 @@ def run(name: str, params: dict | None = None, target: str | None = None,
                       target=result["target"], failed=failed)
         return result
 
+    if not scen["postcheck"]:
+        result["verdict"] = "unverified"
+        result["suggestion"] = "命令执行完成，但场景未配置后验；尚未验证服务健康。"
+        _finalize(result, [], verify=None)
+        return result
     result["verdict"] = "ok"
     _finalize(result, result["postcheck"], verify="passed")
     return result
@@ -593,7 +615,8 @@ def _finalize(result: dict, post_results: list[dict], verify: str | None) -> Non
         _attach(result["execution_id"],
                 postcheck=verify or ("passed" if all(r["passed"] for r in post_results)
                                      else "failed"))
-    report = save_report(f"scenario-{result['scenario']}", format_result(result, True))
+    report = save_report(f"scenario-{result['scenario']}",
+                         format_result(result, True, full_output=True))
     result["report_path"] = str(report) if report else None
 
 
@@ -613,7 +636,6 @@ def rollback(execution_id: str, confirm: bool = False) -> dict:
     core/remote.rollback 的锁、执行记录与原子恢复。
     """
     import execution
-    from agent import events
     record = execution.get(execution_id)
     if record is None:
         raise ScenarioError(f"没有这条执行记录: {execution_id!r}")
@@ -628,18 +650,40 @@ def rollback(execution_id: str, confirm: bool = False) -> dict:
         except ScenarioError:
             scen = None  # 场景定义被删/改坏：回滚照做，只是没有后验可重跑
 
+    with remote._fixed_target(target) if target else nullcontext():
+        return _rollback_scenario(record, scen, confirm)
+
+
+def _rollback_scenario(record: dict, scen: dict | None, confirm: bool) -> dict:
+    import execution
+    from agent import events
+    execution_id = record["id"]
+    sid, target = record["snapshot_id"], record.get("target") or None
+
     rb_started = time.time()
-    result_text = remote.rollback(sid, confirm=confirm) if target \
-        else core.rollback(sid, confirm=confirm)
+    try:
+        result_text = remote.rollback(sid, confirm=confirm) if target \
+            else core.rollback(sid, confirm=confirm)
+    except remote._UncertainChange as e:
+        # 保留 unknown 执行记录与场景报告，CLI 能返回 120 而非普通失败。
+        result_text = str(e)
     rollback_record = execution.find_latest(f"rollback {sid}", target,
                                             since=rb_started, pid=os.getpid(),
                                             kind="rollback")
     result = {
         "scenario": record.get("scenario"), "execution_id": execution_id,
         "rollback_execution_id": rollback_record["id"] if rollback_record else None,
+        "rollback_status": rollback_record["status"] if rollback_record else "unknown",
         "snapshot_id": sid, "target": target or "local", "verify": [],
         "verify_note": "", "report_path": None, "text": core.redact(result_text or ""),
     }
+
+    # 部分恢复/未知结果不能追加成功事件，也不能把此时的健康证据当作恢复已完成。
+    if not confirm or rollback_record is None or rollback_record["status"] != "succeeded":
+        result["verify_note"] = "回滚未确认完成，未执行恢复后验证；请核实回滚执行记录。"
+        report = save_report(f"scenario-rollback-{sid}", _format_rollback(result))
+        result["report_path"] = str(report) if report else None
+        return result
 
     # ---- 回滚后验证：重跑场景后验。默认只作证据不判定——回滚把配置恢复成旧版，
     # 变更后验（如"新配置语法 ok"）在回滚后失败可能正是生效的表现，自动判失败会误导。
@@ -675,7 +719,8 @@ def rollback(execution_id: str, confirm: bool = False) -> dict:
 
 # ---------------------------------------------------------------- 渲染与 CLI
 
-def format_result(result: dict, with_suggestion: bool = False) -> str:
+def format_result(result: dict, with_suggestion: bool = False,
+                  full_output: bool = False) -> str:
     label = VERDICT_LABEL.get(result["verdict"], result["verdict"] or "?")
     where = f"目标 {result['target']}" if result["target"] != "local" else "本机"
     lines = [
@@ -686,7 +731,7 @@ def format_result(result: dict, with_suggestion: bool = False) -> str:
     ]
     if result["precheck"]:
         lines.append("## 预检")
-        lines += _render_checks(result["precheck"])
+        lines += _render_checks(result["precheck"], full_output)
     if result["output"]:
         lines.append("## 执行输出（截断，完整见审计）")
         lines.append("```")
@@ -694,13 +739,13 @@ def format_result(result: dict, with_suggestion: bool = False) -> str:
         lines.append("```")
     if result["postcheck"]:
         lines.append("## 后验（命令退出后的健康验证）")
-        lines += _render_checks(result["postcheck"])
+        lines += _render_checks(result["postcheck"], full_output)
     if with_suggestion and result.get("suggestion"):
         lines.append("## 建议")
         lines.append(result["suggestion"])
     if result.get("report_path"):
         lines.append(f"\n[完整报告] {result['report_path']}")
-    return "\n".join(lines)
+    return core.redact("\n".join(lines))
 
 
 def _format_rollback(result: dict) -> str:
@@ -715,7 +760,7 @@ def _format_rollback(result: dict) -> str:
     ]
     if result["verify"]:
         lines.append("## 回滚后验证（证据，不判定）")
-        lines += _render_checks(result["verify"])
+        lines += _render_checks(result["verify"], full_output=True)
     if result["verify_note"]:
         lines.append(result["verify_note"])
     return "\n".join(lines)

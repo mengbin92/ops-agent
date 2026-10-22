@@ -11,10 +11,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 # 换成 opsagent 的实际路径与运行用户。
-# 注意：不设 User 会以 root 运行，%h 展开为 /root，状态目录落到 /root/.ops-agent——
+# 注意：不设 User 会以 root 运行，状态目录落到 /root/.ops-agent——
 # 与你在家目录配的 targets/通知不是同一份。建议二选一：
 #   a) 取消下一行注释并改成你的用户名（状态目录 = 该用户家目录下 .ops-agent）；
-#   b) 改用用户级服务：cp 本文件到 ~/.config/systemd/user/ 后 systemctl --user enable。
+#   b) 改用用户级服务：复制到 ~/.config/systemd/user/，将下方 WantedBy 改为
+#      default.target 后，使用 systemctl --user enable --now opsagent-schedule。
 # User=yourname
 ExecStart=/usr/local/bin/opsagent schedule run
 EnvironmentFile=-/etc/ops-agent/env
@@ -25,7 +26,8 @@ UMask=0077
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=false
-ReadWritePaths=%h/.ops-agent
+# ProtectHome=false 已允许用户家目录中的状态读写；系统服务的 %h 是 /root，
+# 不随 User= 改变，不能用它指向运行用户的状态目录。
 
 [Install]
 WantedBy=multi-user.target

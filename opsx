@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     sc = sub.add_parser(
         "scenario", help="固定变更场景：预检→快照→执行→后验→回滚建议",
         epilog="run 退出码：0 通过｜1 执行失败｜2 需审批/守门拒绝/需确认动作｜"
-               "3 预检未通过｜4 快照未建成｜7 验证失败（exit=0 但后验不健康）｜"
+               "3 预检未通过｜4 快照未建成｜7 验证失败或未配置后验｜"
                "120 结果未知或有未核实执行｜121 目标被占用")
     sc.add_argument("action", choices=["list", "show", "run", "rollback"])
     sc.add_argument("name", nargs="?", default="",
@@ -136,6 +136,21 @@ def main(argv: list[str] | None = None) -> int:
     at = sub.add_parser("audit")
     at.add_argument("--tail", type=int, default=20)
 
+    state = sub.add_parser("state", help="离线状态备份、完整性校验与恢复到全新目录")
+    state_sub = state.add_subparsers(dest="state_action", required=True)
+    state_backup = state_sub.add_parser("backup", help="备份当前 OPSX_STATE_DIR（含原始快照和秘密）")
+    state_backup.add_argument("backup_dir", help="新建的私有备份目录，不能已存在")
+    state_backup.add_argument("--quiesced", action="store_true",
+                              help="确认已停止所有调度、Agent、RPC、MCP 和状态写入者")
+    state_verify = state_sub.add_parser("verify", help="校验备份清单与所有文件哈希")
+    state_verify.add_argument("backup_dir")
+    state_restore = state_sub.add_parser("restore", help="校验后恢复到全新目录，默认停用自动执行")
+    state_restore.add_argument("backup_dir")
+    state_restore.add_argument("--to", required=True, dest="restore_dir",
+                               help="全新且不存在的恢复目录，不覆盖当前状态")
+    state_restore.add_argument("--quiesced", action="store_true",
+                               help="确认已停止所有调度、Agent、RPC、MCP 和状态写入者")
+
     sub.add_parser("selftest", help="运行内置自检")
 
     sub.add_parser("hook", help="Claude Code PreToolUse hook 入口（stdin 读 JSON）")
@@ -144,6 +159,22 @@ def main(argv: list[str] | None = None) -> int:
     started = None
 
     try:
+        if args.sub == "state":
+            import state_backup as state_store
+            try:
+                if args.state_action == "backup":
+                    result = state_store.backup_state(core.STATE_DIR, args.backup_dir,
+                                                      quiesced=args.quiesced)
+                elif args.state_action == "verify":
+                    result = state_store.verify_backup(args.backup_dir)
+                else:
+                    result = state_store.restore_state(args.backup_dir, args.restore_dir,
+                                                       quiesced=args.quiesced)
+            except OSError as exc:
+                raise core.OpsxError(f"状态备份/恢复失败: {exc}") from exc
+            print(core.redact(json.dumps(result, ensure_ascii=False, indent=2)))
+            return 0
+
         if args.sub == "hook":
             try:
                 data = json.load(sys.stdin)
@@ -313,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                 # 121 目标被占用。gate_denied 复用 2（都是"需要人工动作"）。
                 return {"ok": 0, "exec_failed": 1, "approval_required": 2,
                         "gate_denied": 2, "precheck_failed": 3,
-                        "snapshot_failed": 4, "verify_failed": 7,
+                        "snapshot_failed": 4, "verify_failed": 7, "unverified": 7,
                         "busy": 121, "uncertain": 120}.get(result["verdict"], 1)
             # rollback：先展示计划再要 --yes（与 opsx rollback 同确认语义）
             import execution
@@ -329,7 +360,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             result = scenario.rollback(args.name, confirm=True)
             print(scenario._format_rollback(result))
-            return 0
+            status = result.get("rollback_status", "unknown")
+            return (0 if status == "succeeded" else
+                    120 if status in {"unknown", "running"} else 1)
 
         if args.sub == "targets":
             print("\n".join(remote.describe()) or "(未注册目标)")
@@ -350,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             lines = f.read_text(encoding="utf-8").strip().splitlines()
             for line in lines[-args.tail:] if args.tail else []:
-                print(line)
+                print(core.redact(line))
             return 0
 
         if args.sub == "selftest":

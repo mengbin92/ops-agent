@@ -1,5 +1,5 @@
 {
-  "description": "重启 docker 容器并验证 running 且健康（有 healthcheck 时等它给出结论，starting 也算进行中）",
+  "description": "重启 docker 容器并验证 running 且健康；healthcheck 仍为 starting 时验证不通过，需稍后核实",
   "params": {
     "container": {"required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
                   "description": "容器名"}
@@ -12,6 +12,6 @@
   },
   "postcheck": [
     {"cmd": "docker inspect --format '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' {container}",
-     "expect_regex": "^running/(healthy|none|starting)$"}
+     "expect_regex": "^running/(healthy|none)$"}
   ]
 }
