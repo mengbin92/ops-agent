@@ -443,7 +443,8 @@ def test_mcp_write_cycle():
             assert "已恢复文件" in payload["report"]
             assert f.read_text() == "v1"
             _, payload = c.call_tool("ops_list")
-            assert payload["snapshots"] and payload["approvals"]
+            assert payload["snapshots"]
+            assert all(a["cmd"] != cmd for a in payload["approvals"])
             cmd2 = f"echo v3 > {f}"
             _, payload = c.call_tool("ops_exec", {"command": cmd2})  # 无戳 → exit 2
             assert payload["exit_code"] == 2
@@ -1170,6 +1171,15 @@ def test_remote_target_fields_cannot_inject_options():
             pass
 
 
+def _fake_resolved_response(cmd):
+    if 'OPSX-RESOLVED' not in cmd:
+        return None
+    import shlex
+    import subprocess
+    path = shlex.split(cmd.splitlines()[1])[0][2:]
+    return subprocess.CompletedProcess([], 0, b'OPSX-RESOLVED\0' + path.encode() + b'\0', b'')
+
+
 def test_remote_exec_snapshot_and_rollback():
     import subprocess
     import remote
@@ -1177,6 +1187,9 @@ def test_remote_exec_snapshot_and_rollback():
     calls = []
 
     def fake_ssh(name, cmd, stdin=None, timeout=120):
+        resolved = _fake_resolved_response(cmd)
+        if resolved is not None:
+            return resolved
         calls.append((name, cmd, stdin))
         if "OPSX-EXISTS" in cmd:
             return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nremote-v1\n", stderr=b"")
@@ -1308,10 +1321,11 @@ def test_opsx_cli_remote_end_to_end():
         "#!/bin/sh\n"
         f'echo "$@" >> "{log}"\n'
         'case "$*" in\n'
+        '  *"OPSX-RESOLVED"*) printf \'OPSX-RESOLVED\\000/etc/nginx/nginx.conf\\000\' ;;\n'
         '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\' ;;\n'
         "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
         '  *".opsx-restore."*) cat > "$OPSX_TEST_PUSHED" ; '
-        'printf \'opsx-restored had=1 size=%s\\n\' "$(wc -c < "$OPSX_TEST_PUSHED" | tr -d \' \')" ;;\n'
+        'printf \'opsx-restored had=1 size=%s mode=600\\n\' "$(wc -c < "$OPSX_TEST_PUSHED" | tr -d \' \')" ;;\n'
         "  *) printf 'remote-ok\\n' ;;\n"
         'esac\n'
     )
@@ -1363,12 +1377,14 @@ def test_snapshot_cmds_also_guarded():
         code, sid, _ = core.exec_change(main, snapshot_cmds=[(f"rm -rf {cap_target}", "")])
         assert code == 2 and sid is None
         assert not Path(cap_target).exists()
-        # 已单独审批过的抓取命令可以使用
+        # 即使获批，非R0命令也不能通过采集入口绕开执行协议
         core.approve("printf cap-ok", ttl_seconds=60)
         code, sid, _ = core.exec_change(main, snapshot_cmds=[("printf cap-ok", "cap")])
+        assert code == 2 and sid is None
+        code, sid, _ = core.exec_change(main, snapshot_cmds=[("echo captured", "cap")])
         assert code == 0 and sid
         cap = Path(core.STATE_DIR, "snapshots", sid, "cmd-cap.txt")
-        assert "cap-ok" in cap.read_text()
+        assert "captured" in cap.read_text()
 
 
 def test_snapshot_id_path_traversal_rejected():
@@ -1428,6 +1444,9 @@ def test_remote_rollback_failure_reported():
     core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
 
     def fake_ssh(name, cmd, stdin=None, timeout=120):
+        resolved = _fake_resolved_response(cmd)
+        if resolved is not None:
+            return resolved
         if "OPSX-EXISTS" in cmd:
             return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nv1", stderr=b"")
         if cmd.startswith("cat --"):
@@ -2993,6 +3012,9 @@ def test_remote_rollback_target_check_and_backup():
     pushed = []
 
     def fake(name, cmd, stdin=None, timeout=120):
+        resolved = _fake_resolved_response(cmd)
+        if resolved is not None:
+            return resolved
         if "OPSX-EXISTS" in cmd:
             return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n", stderr=b"")
         if cmd.startswith("cat --"):
@@ -3001,7 +3023,7 @@ def test_remote_rollback_target_check_and_backup():
             pushed.append(stdin)
             size = len(stdin or b"")
             return subprocess.CompletedProcess(
-                [], 0, stdout=f"opsx-restored had=1 size={size}".encode(), stderr=b"")
+                [], 0, stdout=f"opsx-restored had=1 size={size} mode=600".encode(), stderr=b"")
         return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
 
     orig = remote._ssh
@@ -6411,7 +6433,7 @@ def test_execution_reconcile_resolve_and_prune():
     got = execution.get(dead["id"])
     assert got["status"] == "unknown" and "无法确认" in got["error"]
 
-    alive = execution.begin("exec", "rm /nonexistent-opsx-w5-alive", None, core.local_env())
+    alive = execution.begin("exec", "rm /nonexistent-opsx-w5-alive", None, core.local_env(), phase="lock")
     assert execution.reconcile() == []          # 活着的记录不动
     assert execution.get(alive["id"])["status"] == "running"
 
@@ -6752,6 +6774,9 @@ def test_rollback_without_backcast_is_uncertain():
     core.approve("systemctl restart no-backcast", ttl_seconds=60, target="web1")
 
     def fake_ssh(name, cmd, stdin=None, timeout=120):
+        resolved = _fake_resolved_response(cmd)
+        if resolved is not None:
+            return resolved
         if cmd.startswith("systemctl restart"):
             return subprocess.CompletedProcess([], 0, b"restarted\n", b"")
         if ".opsx-restore." in cmd:
@@ -6807,6 +6832,891 @@ def test_agent_exec_reports_only_current_run():
     out2 = agent_tools.dispatch("ops_exec", {"command": cmd}, ctx)
     assert "[opsx 拒绝]" in out2, out2                 # 第二次：戳用尽，被挡
     assert "exe-" not in out2, f"不该出现上一次的 execution_id: {out2}"
+
+
+# W5 review regressions: core
+def test_w5_review_corrupt_approval_counts_fail_closed():
+    from unittest.mock import patch
+    cmd = 'printf w5-count-sentinel'
+    core.approve(cmd, ttl_seconds=60)
+    path = core.STATE_DIR / 'approvals' / (core.cmd_hash(cmd) + '.json')
+    original = json.loads(path.read_text())
+    for fields in ({'used': -1}, {'used': '1'}, {'used': True}, {'uses': 0},
+                   {'uses': False}, {'uses': 101}, {'cmd': 1}):
+        path.write_text(json.dumps(dict(original, **fields)))
+        assert not core.check_stamp(cmd), fields
+        assert core.consume_stamp(cmd) is None, fields
+    # 老格式缺计数字段只兼容一次，不能因损坏计数重新获得额度。
+    legacy = dict(original)
+    legacy.pop('used'); legacy.pop('uses')
+    path.write_text(json.dumps(legacy))
+    assert core.consume_stamp(cmd) == 0 and core.consume_stamp(cmd) is None
+    irreversible = 'rm -rf /nonexistent-w5-review-r3'
+    core.approve(irreversible, force=True)
+    path = core.STATE_DIR / 'approvals' / (core.cmd_hash(irreversible) + '.json')
+    record = json.loads(path.read_text()); record['uses'] = 2
+    path.write_text(json.dumps(record))
+    assert not core.check_stamp(irreversible)
+    assert core.consume_stamp(irreversible) is None
+
+
+def test_w5_review_approval_rechecks_environment_after_snapshot():
+    from unittest.mock import patch
+    import execution
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td, 'app.conf'); target.write_text('before')
+        command = f'echo after > {target}'
+        core.approve(command)
+        original = core._snapshot_file_into
+        def change_context(*args):
+            original(*args)
+            os.environ['KUBECONFIG'] = str(Path(td, 'other-context'))
+        with patch.dict(os.environ), patch.object(core, '_snapshot_file_into', side_effect=change_context):
+            code, sid, output = core.exec_change(command, snapshot_files=[str(target)])
+        assert code == 2 and sid and target.read_text() == 'before', (code, output)
+        assert execution.find_latest(command)['status'] == 'aborted'
+        assert core.check_stamp(command), '没有下发，审批次数应保留'
+
+
+def test_w5_review_target_aliases_share_lock():
+    restore = _with_targets({'w5-a': {'host': 'same.example.', 'user': 'ops'},
+                             'w5-b': {'host': 'SAME.EXAMPLE', 'user': 'deploy', 'port': 22},
+                             'w5-c': {'host': 'SAME.EXAMPLE', 'port': 2222}})
+    try:
+        assert core._lock_path('w5-a') == core._lock_path('w5-b')
+        assert core._lock_path('w5-a') != core._lock_path('w5-c')
+        with core.target_lock('w5-a'):
+            try:
+                with core.target_lock('w5-b'):
+                    raise AssertionError('相同host+port的不同名称不能并发写')
+            except core.TargetBusy:
+                pass
+            with core.target_lock('w5-c'):
+                pass
+    finally:
+        restore()
+
+
+def test_w5_review_target_lock_released_on_setup_interrupt():
+    from unittest.mock import patch
+    # 在yield以前被中断也要解锁，否则REPL继续存活时该目标永久卡住。
+    with patch.object(core, '_safe_audit', side_effect=KeyboardInterrupt):
+        try:
+            with core.target_lock(None):
+                raise AssertionError('不应进入调用体')
+        except KeyboardInterrupt:
+            pass
+    with core.target_lock(None):
+        pass
+    # 等待flock时中断，同样需要关闭已打开的fd。
+    opened = []
+    real_open = os.open
+    def capture(*args, **kwargs):
+        fd = real_open(*args, **kwargs); opened.append(fd); return fd
+    with patch.object(core.os, 'open', side_effect=capture), \
+            patch.object(core.fcntl, 'flock', side_effect=BlockingIOError), \
+            patch.object(core.time, 'sleep', side_effect=KeyboardInterrupt):
+        try:
+            with core.target_lock(None, wait=1):
+                raise AssertionError('不应进入调用体')
+        except KeyboardInterrupt:
+            pass
+    assert opened
+    try:
+        os.fstat(opened[-1])
+        raise AssertionError('等待中断后fd泄漏')
+    except OSError:
+        pass
+
+
+def test_w5_review_prune_cannot_delete_concurrent_new_approval():
+    import threading
+    from unittest.mock import patch
+    command = 'printf w5-prune-race'
+    core.approve(command)
+    path = core.STATE_DIR / 'approvals' / (core.cmd_hash(command) + '.json')
+    old = json.loads(path.read_text()); old['created'] -= 3600; path.write_text(json.dumps(old))
+    reading, release, attempting, finished = [threading.Event() for _ in range(4)]
+    errors = []
+    live = core._stamp_live
+    def slow_live(stamp):
+        if isinstance(stamp, dict) and stamp.get('cmd') == command and stamp['created'] == old['created']:
+            reading.set()
+            if not release.wait(3):
+                raise AssertionError('test release timeout')
+        return live(stamp)
+    def prune():
+        try: core.prune_approvals()
+        except BaseException as error: errors.append(error)
+    def approve():
+        attempting.set()
+        try: core.approve(command)
+        except BaseException as error: errors.append(error)
+        finally: finished.set()
+    with patch.object(core, '_stamp_live', side_effect=slow_live):
+        cleaner = threading.Thread(target=prune); writer = threading.Thread(target=approve)
+        cleaner.start()
+        try:
+            assert reading.wait(3)
+            writer.start(); assert attempting.wait(3)
+            assert not finished.wait(0.1), '清理未与批准互斥，会删除新授权'
+        finally:
+            release.set(); cleaner.join(3)
+            if writer.ident is not None: writer.join(3)
+    assert not errors, errors
+    assert not cleaner.is_alive() and not writer.is_alive()
+    assert core.check_stamp(command), '并发新批准不能被旧清理删除'
+
+
+def test_w5_review_snapshot_commands_cannot_bypass_execution_protocol():
+    from unittest.mock import patch
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        victim = Path(td, 'must-not-write')
+        command = f'echo changed > {victim}'
+        core.approve(command)
+        try:
+            core.snapshot_cmd(command)
+            raise AssertionError('已批准的写命令也不能作为采集执行')
+        except core.OpsxError as error:
+            assert 'R0' in str(error)
+        assert not victim.exists() and core.check_stamp(command)
+        restore = _with_targets({'w5-snapshot': {'host': 'fake.example'}})
+        try:
+            core.approve(command, target='w5-snapshot')
+            with patch.object(remote, '_ssh') as ssh:
+                try:
+                    remote.snapshot_cmd('w5-snapshot', command)
+                    raise AssertionError('远程写采集也必须拒绝')
+                except remote.RemoteError as error:
+                    assert 'R0' in str(error)
+                ssh.assert_not_called()
+        finally:
+            restore()
+
+
+def test_w5_review_local_rollback_permissions_and_lock_record():
+    import execution
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td, 'app.conf'); target.write_text('before'); target.chmod(0o755)
+        sid = core.snapshot_file(str(target)); target.write_text('after'); target.chmod(0o751)
+        metadata = core.STATE_DIR / 'snapshots' / sid / 'meta.json'
+        record = json.loads(metadata.read_text()); record['items'][0].pop('mode')
+        metadata.write_text(json.dumps(record))
+        core.rollback(sid, confirm=True)
+        assert target.read_text() == 'before' and stat_mode(target) == 0o751
+        target.unlink(); core.rollback(sid, confirm=True)
+        assert stat_mode(target) == 0o600
+        record['items'][0]['mode'] = 0; metadata.write_text(json.dumps(record))
+        core.rollback(sid, confirm=True)
+        assert stat_mode(target) == 0
+        target.chmod(0o600); target.write_text('unchanged')
+        with core.target_lock(None):
+            try:
+                core.rollback(sid, confirm=True)
+                raise AssertionError('回滚不能并发修改本机')
+            except core.TargetBusy:
+                pass
+        latest = execution.find_latest(f'rollback {sid}', kind='rollback')
+        assert latest['status'] == 'aborted' and target.read_text() == 'unchanged'
+
+
+def test_w5_review_unknown_retains_snapshots_and_rollback_backup():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        target = Path(td, 'app'); target.write_text('old')
+        sid = core.snapshot_file(str(target))
+        target.write_text('current')
+        _, meta = core.load_snapshot(sid)
+        backup = core._rollback_backup(sid, None, meta['items'], core._local_read_state)
+        record = execution.begin('exec', 'printf uncertain', phase='exec', snapshot_id=sid)
+        execution.finish(record['id'], 'unknown')
+        core.prune_snapshots(keep=0)
+        assert core.snapshot_dir(sid).is_dir() and core.snapshot_dir(backup).is_dir()
+        execution.resolve(record['id'], 'observed-failed')
+        core.prune_snapshots(keep=0)
+        assert not core.snapshot_dir(sid).exists() and not core.snapshot_dir(backup).exists()
+
+
+
+
+# W5 review regressions: execution
+def test_w5_review_execution_records_redact_before_storage_and_clipping():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        secret = 'EXECUTION-SECRET-SENTINEL'
+        cmd = 'printf password=' + secret
+        rec = execution.begin('exec', cmd, env={'host': 'test', 'auth': secret})
+        path = execution._path(rec['id'])
+        assert secret not in path.read_text()
+        assert execution.get(rec['id'])['cmd_hash'] == core.cmd_hash(cmd)
+        pem = '-----BEGIN PRIVATE KEY-----\n' + 'PRIVATE-BODY-SENTINEL\n' * 100 + '-----END PRIVATE KEY-----'
+        execution.finish(rec['id'], 'failed', output=pem, error='password=' + secret)
+        assert 'PRIVATE-BODY-SENTINEL' not in path.read_text()
+        assert secret not in path.read_text()
+        # 历史明文记录也不能通过新查询出口读进模型。
+        rec.update(status='failed', error='password=' + secret)
+        path.write_text(json.dumps(rec))
+        assert secret not in json.dumps(execution.get(rec['id']))
+        assert secret not in json.dumps(execution.list_records())
+        # 同 pid 遗留临时文件权限不应被 rename 带到正式记录。
+        tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+        tmp.write_text('old')
+        tmp.chmod(0o644)
+        with execution._locked():
+            execution._write(rec)
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+
+def test_w5_review_corrupt_execution_records_block_replay_and_survive_pruning():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'systemctl restart protected-test-service'
+        rec = execution.begin('exec', cmd, env=core.local_env())
+        execution.finish(rec['id'], 'unknown')
+        rec = execution.get(rec['id'])
+        path = execution._path(rec['id'])
+        corrupt = ['{broken', json.dumps(dict(rec, id='exe-other-record')),
+                   json.dumps(dict(rec, started_ts='soon')),
+                   json.dumps(dict(rec, started_ts=float('nan'))),
+                   json.dumps(dict(rec, started_ts=10 ** 1000)),
+                   json.dumps(dict(rec, cmd_hash=None)), json.dumps(dict(rec, env=[]))]
+        for text in corrupt:
+            path.write_text(text)
+            os.utime(path, (1, 1))
+            assert execution.list_records(tail=-1) == []
+            try:
+                execution.pending_unknown(None, core.cmd_hash(cmd))
+                raise AssertionError('坏记录不能当作没有未核实变更')
+            except core.OpsxError as e:
+                assert str(path) in str(e) and '拒绝执行' in str(e)
+            execution.prune(keep=0)
+            assert path.is_file(), '不能随时间清除不确定性，自动放开重放'
+        path.write_text(json.dumps(rec))
+        assert execution.pending_unknown(None, core.cmd_hash(cmd))['id'] == rec['id']
+
+
+
+def test_w5_review_invalid_resolution_does_not_clear_unknown():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'systemctl restart unresolved-test-service'
+        rec = execution.begin('exec', cmd, env=core.local_env())
+        execution.finish(rec['id'], 'unknown')
+        path = execution._path(rec['id'])
+        original = json.loads(path.read_text())
+        for invalid in (True, 'yes', [True], {'outcome': 'observed-ok'},
+                        {'outcome': 'anything', 'at': '2026-10-22 10:00:00'}):
+            path.write_text(json.dumps(dict(original, resolved=invalid)))
+            assert execution.pending_unknown(None, core.cmd_hash(cmd))['id'] == rec['id']
+        execution.resolve(rec['id'], 'observed-failed', '确认未生效')
+        assert execution.pending_unknown(None, core.cmd_hash(cmd)) is None
+
+
+
+def test_w5_review_unknown_blocks_same_host_aliases_and_legacy_secret_commands():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'systemctl restart app password=ALIAS-SECRET-SENTINEL'
+        env = {'scope': 'remote', 'host': 'Host.Example.', 'port': 22, 'user': 'ops'}
+        rec = execution.begin('exec', cmd, 'first', env)
+        execution.finish(rec['id'], 'unknown')
+        alias_env = dict(env, host='host.example', port='22', user='admin')
+        def pending(candidate=alias_env, command=cmd):
+            return execution.pending_unknown('alias', core.cmd_hash(command, 'alias'),
+                                             env=candidate, command=command)
+        assert pending()['id'] == rec['id']
+        assert pending(dict(alias_env, host='other.example')) is None
+        assert pending(dict(alias_env, port=2222)) is None
+        assert pending(command='systemctl restart other') is None
+        # 旧记录不含 independent hash；即使 cmd 已脱敏，也应按本次原文匹配旧 target hash。
+        legacy = execution.get(rec['id'])
+        legacy.pop('command_hash')
+        with execution._locked():
+            execution._write(legacy)
+        assert 'ALIAS-SECRET-SENTINEL' not in execution._path(rec['id']).read_text()
+        assert pending()['id'] == rec['id']
+        # target=None 是本机，不是“所有远程目标”。
+        assert execution.pending_unknown(None) is None
+
+
+
+def test_w5_review_find_latest_filters_process_kind_and_invocation_start():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'systemctl restart correlated-test-service'
+        mine = execution.begin('exec', cmd, env=core.local_env())
+        other = execution.begin('exec', cmd, env=core.local_env())
+        rollback = execution.begin('rollback', cmd, env=core.local_env())
+        for rec, offset in ((mine, 0), (other, 1), (rollback, 2)):
+            rec.update(started_ts=mine['started_ts'] + offset, status='aborted')
+            if rec is other:
+                rec['pid'] = os.getpid() + 100000
+            with execution._locked():
+                execution._write(rec)
+        assert execution.find_latest(cmd)['id'] == rollback['id']
+        filtered = execution.find_latest(cmd, since=mine['started_ts'],
+                                         pid=os.getpid(), kind='exec')
+        assert filtered['id'] == mine['id']
+        assert execution.find_latest(cmd, since=mine['started_ts'] + .5,
+                                     pid=os.getpid(), kind='exec') is None
+
+
+
+
+
+# W5 review regressions: interfaces
+def test_w5_review_mcp_rejected_exec_never_reuses_old_execution():
+    import mcp_server
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory(prefix='opsx-w5-mcp-current-') as td, \
+            patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'printf w5-mcp-current'
+        core.approve(cmd)
+        first = json.loads(mcp_server.call_tool('ops_exec', {'command': cmd})['content'][0]['text'])
+        assert first['exit_code'] == 0 and first['execution_status'] == 'succeeded'
+        second = json.loads(mcp_server.call_tool('ops_exec', {'command': cmd})['content'][0]['text'])
+        assert second['exit_code'] == 2
+        assert 'execution_id' not in second and 'execution_status' not in second
+
+
+
+def test_w5_review_execution_interfaces_ignore_another_process_record():
+    import execution
+    import mcp_server
+    import runpy
+    from unittest.mock import patch
+    from agent import tools as agent_tools
+    cli = runpy.run_path(str(core.REPO_DIR / 'opsx'))
+    own, other = [], []
+
+    def fake_change(cmd, *args, **kwargs):
+        current = execution.begin('exec', cmd, env=core.local_env())
+        execution.finish(current['id'], 'succeeded', exit_code=0)
+        foreign = execution.begin('exec', cmd, env=core.local_env(), phase='lock')
+        foreign['pid'] = os.getpid() + 100000
+        with execution._locked():
+            execution._write(foreign)
+        execution.finish(foreign['id'], 'aborted', error='another process could not acquire lock')
+        own.append(current['id'])
+        other.append(foreign['id'])
+        return 0, None, 'done'
+
+    with tempfile.TemporaryDirectory(prefix='opsx-w5-own-record-') as td, \
+            patch.object(core, 'STATE_DIR', Path(td)), \
+            patch.object(core, 'exec_change', side_effect=fake_change):
+        cmd = 'systemctl restart w5-own-record'
+        agent = agent_tools.dispatch('ops_exec', {'command': cmd}, agent_tools.ToolContext())
+        assert own[-1] in agent and other[-1] not in agent and '[完成]' in agent
+        payload = json.loads(mcp_server.call_tool('ops_exec', {'command': cmd})['content'][0]['text'])
+        assert payload['execution_id'] == own[-1] and payload['execution_status'] == 'succeeded'
+        stdout = io.StringIO()
+        with patch.object(sys, 'stdout', stdout):
+            assert cli['main'](['exec', cmd]) == 0
+        assert own[-1] in stdout.getvalue() and other[-1] not in stdout.getvalue()
+
+
+
+def test_w5_review_execution_queries_reject_zero_and_negative_tail():
+    import mcp_server
+    from agent import tools as agent_tools
+    for tail in (0, -1):
+        text = agent_tools.dispatch('ops_executions', {'tail': tail}, agent_tools.ToolContext())
+        assert 'tail 须为正整数' in text
+        result = mcp_server.handle_message({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                           'params': {'name': 'ops_executions',
+                                                      'arguments': {'tail': tail}}})['result']
+        assert result['isError'] and 'tail 须为正整数' in result['content'][0]['text']
+
+
+
+def test_w5_review_agent_unknown_and_aborted_results_are_distinct():
+    import execution
+    from unittest.mock import patch
+    from agent import tools as agent_tools
+    created = []
+
+    def fake_change(cmd, *args, **kwargs):
+        unknown = 'unknown' in cmd
+        rec = execution.begin('exec', cmd, env=core.local_env(), phase='exec' if unknown else 'authorize')
+        execution.finish(rec['id'], 'unknown' if unknown else 'aborted', error='not confirmed')
+        created.append(rec['id'])
+        return (255 if unknown else 2), (None if unknown else 'snapshot-preserved'), 'not confirmed'
+
+    with tempfile.TemporaryDirectory(prefix='opsx-w5-result-label-') as td, \
+            patch.object(core, 'STATE_DIR', Path(td)), \
+            patch.object(core, 'exec_change', side_effect=fake_change):
+        unknown = agent_tools.dispatch('ops_exec', {'command': 'systemctl restart unknown'},
+                                       agent_tools.ToolContext())
+        assert unknown.startswith('[结果未知]') and '[失败]' not in unknown
+        assert created[-1] in unknown
+        aborted = agent_tools.dispatch('ops_exec', {'command': 'systemctl restart aborted'},
+                                       agent_tools.ToolContext())
+        assert '本次未执行' in aborted and created[-1] in aborted
+        assert 'snapshot-preserved' in aborted
+
+
+
+def test_w5_review_rollback_interfaces_report_current_execution_on_failure():
+    import execution
+    import mcp_server
+    import remote
+    import runpy
+    from unittest.mock import patch
+    from agent import tools as agent_tools
+    cli = runpy.run_path(str(core.REPO_DIR / 'opsx'))
+    sid = 'snapshot-w5-interface'
+    ids, fail = [], [False]
+
+    def fake_rollback(snapshot_id, confirm=False):
+        assert confirm
+        rec = execution.begin('rollback', f'rollback {snapshot_id}', env=core.local_env(),
+                              snapshot_id=snapshot_id, phase='restore')
+        ids.append(rec['id'])
+        execution.finish(rec['id'], 'unknown' if fail[0] else 'succeeded')
+        if fail[0]:
+            raise remote.RemoteError('写入结果无法确认')
+        return '已恢复'
+
+    plan = {'target': None, 'snapshot_id': sid, 'files': [], 'commands': []}
+    with tempfile.TemporaryDirectory(prefix='opsx-w5-rollback-reference-') as td, \
+            patch.object(core, 'STATE_DIR', Path(td)), \
+            patch.object(remote, 'rollback_plan', return_value=plan), \
+            patch.object(remote, 'rollback', side_effect=fake_rollback):
+        for failure in (False, True):
+            fail[0] = failure
+            text = agent_tools.dispatch('ops_rollback', {'snapshot_id': sid},
+                                        agent_tools.ToolContext())
+            assert ids[-1] in text and ('unknown' if failure else 'succeeded') in text
+            result = mcp_server.call_tool('ops_rollback', {'snapshot_id': sid, 'confirm': True})
+            if failure:
+                assert result['isError'] and ids[-1] in result['content'][0]['text']
+            else:
+                payload = json.loads(result['content'][0]['text'])
+                assert payload['execution_id'] == ids[-1] and payload['execution_status'] == 'succeeded'
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(sys, 'stdout', stdout), patch.object(sys, 'stderr', stderr):
+                assert cli['main'](['rollback', sid, '--yes']) == (1 if failure else 0)
+            assert ids[-1] in stdout.getvalue() and ('unknown' if failure else 'succeeded') in stdout.getvalue()
+
+
+
+def test_w5_review_hook_requires_guarded_exec_even_with_approval():
+    import shlex
+    import subprocess
+    with tempfile.TemporaryDirectory(prefix='opsx-w5-hook-') as td:
+        target = Path(td) / 'app.conf'
+        target.write_text('before')
+        state = Path(td) / 'state'
+        env = dict(os.environ, OPSX_STATE_DIR=str(state))
+        entry = str(core.REPO_DIR / 'opsx')
+        command = f'printf after > {shlex.quote(str(target))}'
+        approved = subprocess.run([sys.executable, entry, 'approve', command], env=env,
+                                   capture_output=True, text=True)
+        assert approved.returncode == 0, approved.stderr
+        stamp = next((state / 'approvals').glob('*.json'))
+        for _ in range(2):
+            denied = subprocess.run([sys.executable, entry, 'hook'], env=env,
+                                    input=json.dumps({'tool_input': {'command': command}}),
+                                    capture_output=True, text=True)
+            assert denied.returncode == 2 and '必须通过 opsx exec' in denied.stderr
+            assert json.loads(stamp.read_text())['used'] == 0
+        wrapper = shlex.join([sys.executable, entry, 'exec', command])
+        allowed = subprocess.run([sys.executable, entry, 'hook'], env=env,
+                                 input=json.dumps({'tool_input': {'command': wrapper}}),
+                                 capture_output=True, text=True)
+        assert allowed.returncode == 0 and json.loads(stamp.read_text())['used'] == 0
+        readonly = subprocess.run([sys.executable, entry, 'hook'], env=env,
+                                  input=json.dumps({'tool_input': {'command': 'uname -s'}}),
+                                  capture_output=True, text=True)
+        assert readonly.returncode == 0 and target.read_text() == 'before'
+        executed = subprocess.run([sys.executable, entry, 'exec', command], env=env,
+                                  capture_output=True, text=True)
+        assert executed.returncode == 0 and target.read_text() == 'after'
+        assert json.loads(stamp.read_text())['used'] == 1
+
+
+
+
+
+# W5 review regressions: remote
+def test_w5_review_remote_symlink_snapshots_keep_real_file_mode():
+    import subprocess
+    from unittest.mock import patch
+    import remote
+    _write_targets()
+    def local_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.run(['/bin/sh', '-c', cmd], input=stdin or b'', capture_output=True)
+    with tempfile.TemporaryDirectory() as td, patch.object(remote, '_ssh', side_effect=local_ssh):
+        real = Path(td, 'secret.conf')
+        real.write_bytes(b'original')
+        real.chmod(0o600)
+        link = Path(td, 'link.conf')
+        link.symlink_to(real)
+        sid = remote.snapshot_file('web1', str(link))
+        _, meta = core.load_snapshot(sid)
+        assert meta['items'][0]['mode'] == 0o600
+        real.write_bytes(b'changed')
+        report = remote.rollback(sid, confirm=True)
+        assert real.read_bytes() == b'original' and link.is_symlink()
+        assert real.stat().st_mode & 0o7777 == 0o600
+        backup = re.search(r'回滚前副本: ([^（\s]+)', report).group(1)
+        _, backup_meta = core.load_snapshot(backup)
+        assert backup_meta['machine'] == meta['machine']
+
+
+
+def test_w5_review_remote_transport_stays_on_approved_target():
+    import subprocess
+    from unittest.mock import patch
+    import execution
+    import remote
+    for change in (False, True):
+        registry = _write_targets()
+        hosts = []
+        def ssh(name, cmd, stdin=None, timeout=120):
+            host = remote.ssh_argv(name, cmd)[-2]
+            hosts.append(host)
+            if 'OPSX-RESOLVED' in cmd:
+                data = b'OPSX-RESOLVED\x00/etc/app.conf\x00'
+            elif cmd.startswith('cat --'):
+                targets = json.loads(registry.read_text())
+                targets[name]['host'] = '10.0.0.99'
+                registry.write_text(json.dumps(targets))
+                data = b'original'
+            elif cmd.startswith('stat '):
+                data = b'600 ops:ops\n'
+            elif 'OPSX-HOST ' in cmd:
+                data = f'OPSX-HOST {host}\nOPSX-MACHINE-ID abcdef0123456789\n'.encode()
+            else:
+                data = b'changed'
+            return subprocess.CompletedProcess([], 0, data, b'')
+        cmd = 'systemctl restart fixed-target-review'
+        with patch.object(remote, '_ssh', side_effect=ssh):
+            if change:
+                core.approve(cmd, ttl_seconds=60, target='web1')
+                code, sid, _ = remote.exec_change('web1', cmd, snapshot_files=['/etc/app.conf'])
+                assert code == 0
+                assert execution.find_latest(cmd, 'web1')['env']['host'] == '10.0.0.11'
+            else:
+                sid = remote.snapshot_file('web1', '/etc/app.conf')
+        assert hosts and set(hosts) == {'10.0.0.11'}, hosts
+        assert core.load_snapshot(sid)[1]['env']['host'] == '10.0.0.11'
+        assert remote.get_target('web1')['host'] == '10.0.0.99'
+    _write_targets()
+
+
+
+def test_w5_review_remote_machine_probe_must_match_and_parse_markers():
+    import subprocess
+    from unittest.mock import patch
+    import remote
+    _write_targets()
+    sid, directory = core.begin_snapshot()
+    data = directory / 'data'
+    data.write_bytes(b'archived')
+    meta = {'id': sid, 'target': 'web1', 'env': remote.target_env('web1'), 'machine': 'node/id',
+            'items': [{'type': 'file', 'src': '/etc/app.conf', 'dest': 'data', 'mode': 0o600}]}
+    (directory / 'meta.json').write_text(json.dumps(meta))
+    with patch.object(remote, '_target_machine', return_value=''), patch.object(remote, '_ssh') as ssh:
+        try:
+            remote.rollback(sid, confirm=True)
+            raise AssertionError('已记录指纹但当前无法采集时必须拒绝回滚')
+        except remote.RemoteError as error:
+            assert '无法确认' in str(error)
+        ssh.assert_not_called()
+    response = subprocess.CompletedProcess([], 0,
+        b'identical login banner\nidentical footer\nOPSX-HOST node-a\nOPSX-MACHINE-ID abcdef0123456789\n', b'')
+    with patch.object(remote, '_ssh', return_value=response):
+        assert remote._target_machine('web1') == 'node-a/abcdef012345'
+    response = subprocess.CompletedProcess([], 0, b'888 impossible-mode\n', b'')
+    with patch.object(remote, '_ssh', return_value=response):
+        assert remote._target_stat('web1', '/etc/app.conf') == (None, '')
+
+
+
+def test_w5_review_restore_rejects_deep_links_and_preserves_zero_mode():
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        real = Path(td, 'real')
+        real.write_bytes(b'old')
+        current = real
+        for index in range(10):
+            link = Path(td, f'link-{index}')
+            link.symlink_to(current)
+            current = link
+        response = subprocess.run(['/bin/sh', '-c', remote._render_restore(str(current), '600', 3)],
+                                  input=b'new', capture_output=True)
+        assert response.returncode != 0 and real.read_bytes() == b'old'
+        assert all(Path(td, f'link-{i}').is_symlink() for i in range(10))
+        response = subprocess.run(['/bin/sh', '-c', remote._render_restore(td, '600', 3)],
+                                  input=b'new', capture_output=True)
+        assert response.returncode != 0 and not list(Path(td).glob('.opsx-restore.*'))
+        response = subprocess.run(['/bin/sh', '-c', remote._render_restore(str(real), '0', 3)],
+                                  input=b'new', capture_output=True)
+        assert response.returncode == 0 and real.stat().st_mode & 0o7777 == 0
+        assert remote._parse_restore_info(response.stdout)['mode'] == '0'
+        real.chmod(0o600)
+
+
+
+def test_w5_review_restore_owner_failure_keeps_original_file():
+    import subprocess
+    import remote
+    with tempfile.TemporaryDirectory() as td:
+        real = Path(td, 'app.conf')
+        real.write_bytes(b'old')
+        bindir = Path(td, 'bin')
+        bindir.mkdir()
+        chown = bindir / 'chown'
+        chown.write_text('#!/bin/sh\nexit 1\n')
+        chown.chmod(0o755)
+        environment = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
+        response = subprocess.run(['/bin/sh', '-c', remote._render_restore(str(real), '600', 3)],
+                                  input=b'new', capture_output=True, env=environment)
+        assert response.returncode != 0
+        assert real.read_bytes() == b'old' and not list(Path(td).glob('.opsx-restore.*'))
+
+
+
+def test_w5_review_remote_rollback_disconnection_is_unknown():
+    import subprocess
+    from unittest.mock import patch
+    import execution
+    import remote
+    _write_targets()
+    def local_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.run(['/bin/sh', '-c', cmd], input=stdin or b'', capture_output=True)
+    with tempfile.TemporaryDirectory() as td:
+        source = Path(td, 'app.conf')
+        source.write_bytes(b'archived')
+        with patch.object(remote, '_ssh', side_effect=local_ssh):
+            sid = remote.snapshot_file('web1', str(source))
+        def disconnect(name, cmd, stdin=None, timeout=120):
+            if '.opsx-restore.' in cmd:
+                return subprocess.CompletedProcess([], 255, b'', b'connection reset')
+            return local_ssh(name, cmd, stdin, timeout)
+        with patch.object(remote, '_ssh', side_effect=disconnect):
+            try:
+                remote.rollback(sid, confirm=True)
+                raise AssertionError('断线后必须要求核实恢复结果')
+            except remote._UncertainChange:
+                pass
+        records = [r for r in execution.list_records(tail=500)
+                   if r['kind'] == 'rollback' and r.get('snapshot_id') == sid]
+        assert records[0]['status'] == 'unknown'
+    with patch.object(remote, '_ssh', return_value=subprocess.CompletedProcess([], -15, b'', b'')):
+        assert remote._run_remote_change('web1', 'true', 1)[1] == 'unknown'
+
+
+
+def test_w5_review_remote_restore_checks_permission_postconditions():
+    import subprocess
+    from unittest.mock import patch
+    import execution
+    import remote
+    _write_targets()
+    def local_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.run(['/bin/sh', '-c', cmd], input=stdin or b'', capture_output=True)
+    with tempfile.TemporaryDirectory() as td:
+        source = Path(td, 'app.conf')
+        source.write_bytes(b'archived')
+        source.chmod(0o600)
+        with patch.object(remote, '_ssh', side_effect=local_ssh):
+            sid = remote.snapshot_file('web1', str(source))
+        for suffix in ('had=1 size=8', 'had=1 size=8 mode=644', 'size=8 mode=600',
+                       'had=1 size=7 mode=600'):
+            def invalid_postcondition(name, cmd, stdin=None, timeout=120):
+                if '.opsx-restore.' in cmd:
+                    return subprocess.CompletedProcess([], 0, ('opsx-restored ' + suffix).encode(), b'')
+                return local_ssh(name, cmd, stdin, timeout)
+            with patch.object(remote, '_ssh', side_effect=invalid_postcondition):
+                try:
+                    remote.rollback(sid, confirm=True)
+                    raise AssertionError('后验不完整或权限不匹配不能宣告成功')
+                except remote._UncertainChange:
+                    pass
+            records = [r for r in execution.list_records(tail=500)
+                       if r['kind'] == 'rollback' and r.get('snapshot_id') == sid]
+            assert records[0]['status'] == 'unknown'
+
+
+
+def test_w5_review_remote_backup_interruption_is_aborted():
+    import subprocess
+    from unittest.mock import patch
+    import execution
+    import remote
+    _write_targets()
+    def local_ssh(name, cmd, stdin=None, timeout=120):
+        return subprocess.run(['/bin/sh', '-c', cmd], input=stdin or b'', capture_output=True)
+    with tempfile.TemporaryDirectory() as td, patch.object(remote, '_ssh', side_effect=local_ssh):
+        source = Path(td, 'app.conf')
+        source.write_bytes(b'archived')
+        sid = remote.snapshot_file('web1', str(source))
+        with patch.object(core, '_rollback_backup', side_effect=KeyboardInterrupt):
+            try:
+                remote.rollback(sid, confirm=True)
+                raise AssertionError('用户中断应传给调用方')
+            except KeyboardInterrupt:
+                pass
+        records = [r for r in execution.list_records(tail=500)
+                   if r['kind'] == 'rollback' and r.get('snapshot_id') == sid]
+        assert records[0]['status'] == 'aborted'
+
+
+
+
+
+def test_w5_review_failed_terminal_write_blocks_live_process_replay():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        cmd = 'systemctl restart terminal-write-test'
+        core.approve(cmd, uses=2)
+        write = execution._write
+        sent = []
+        def fail_finish(record):
+            if record['status'] != 'running':
+                raise OSError('disk full')
+            return write(record)
+        def fake_backend(command, timeout):
+            sent.append(command)
+            current = execution.find_latest(command)
+            assert current['status'] == 'running', '正常持锁的执行不能误报unknown'
+            try:
+                execution.resolve(current['id'], 'observed-failed')
+                raise AssertionError('活动执行不能提前核实')
+            except core.OpsxError:
+                pass
+            return 0, 'succeeded', 'done', None
+        with patch.object(core, '_run_change', side_effect=fake_backend), \
+                patch.object(execution, '_write', side_effect=fail_finish):
+            try:
+                core.exec_change(cmd)
+                raise AssertionError('终态写盘失败应显式报错')
+            except OSError:
+                pass
+        assert execution.find_latest(cmd)['status'] == 'unknown'
+        with patch.object(core, '_run_change', side_effect=fake_backend):
+            assert core.exec_change(cmd)[0] == core.EXEC_ABORT_UNKNOWN
+        assert sent == [cmd], '同一活pid下的遗留running不能重放'
+        # 即使另一条新调用已经持有同一目标锁，也不能把它当成旧执行仍然活动。
+        with core.target_lock(None, execution_id='exe-different-owner'):
+            assert execution.find_latest(cmd)['status'] == 'unknown'
+
+
+
+def test_w5_review_execution_lock_probe_is_read_only_and_supports_legacy():
+    import execution
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td, patch.object(core, 'STATE_DIR', Path(td)):
+        env = {'scope': 'remote', 'host': 'original.example', 'port': 22}
+        rec = execution.begin('exec', 'systemctl restart legacy-active', 'old-name', env)
+        assert execution.get(rec['id'])['status'] == 'unknown'
+        assert not (core.STATE_DIR / 'locks').exists(), '只读查询不能创建锁文件'
+        legacy = core.STATE_DIR / 'locks' / 'old-name.lock'
+        legacy.parent.mkdir()
+        fd = os.open(legacy, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            execution.fcntl.flock(fd, execution.fcntl.LOCK_EX)
+            os.write(fd, json.dumps({'pid': os.getpid(), 'execution_id': rec['id']}).encode())
+            assert execution.get(rec['id'])['status'] == 'running'
+            # 旧锁没有execution_id时仍认pid，兼容已运行的旧版本。
+            os.ftruncate(fd, 0); os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, json.dumps({'pid': os.getpid()}).encode())
+            assert execution.get(rec['id'])['status'] == 'running'
+        finally:
+            os.close(fd)
+        assert execution.get(rec['id'])['status'] == 'unknown'
+        execution.resolve(rec['id'], 'observed-failed')
+        assert execution.get(rec['id'])['resolved']['outcome'] == 'observed-failed'
+
+
+
+def test_w5_review_remote_rollback_rejects_retargeted_file_and_parent_links():
+    import subprocess
+    from unittest.mock import patch
+    import remote
+    _write_targets()
+    for kind in ('file', 'directory', 'late'):
+        with tempfile.TemporaryDirectory() as td:
+            directory_a, directory_b = Path(td, 'a'), Path(td, 'b')
+            directory_a.mkdir()
+            directory_b.mkdir()
+            file_a, file_b = directory_a / 'app.conf', directory_b / 'app.conf'
+            file_a.write_bytes(b'archived A')
+            file_b.write_bytes(b'unrelated B')
+            link = Path(td, 'current')
+            link.symlink_to(directory_a if kind == 'directory' else file_a)
+            source = link / 'app.conf' if kind == 'directory' else link
+            def retarget():
+                link.unlink()
+                link.symlink_to(directory_b if kind == 'directory' else file_b)
+            def local_ssh(name, cmd, stdin=None, timeout=120):
+                if kind == 'late' and '.opsx-restore.' in cmd:
+                    retarget()
+                return subprocess.run(['/bin/sh', '-c', cmd], input=stdin or b'', capture_output=True)
+            with patch.object(remote, '_ssh', side_effect=local_ssh):
+                sid = remote.snapshot_file('web1', str(source))
+                assert core.load_snapshot(sid)[1]['items'][0]['resolved_path'] == str(file_a.resolve())
+                file_a.write_bytes(b'current A')
+                if kind != 'late':
+                    retarget()
+                try:
+                    remote.rollback(sid, confirm=True)
+                    raise AssertionError('软链改向必须拒绝，不能把 A 的旧内容写进 B')
+                except remote.RemoteError as error:
+                    assert '真实路径已改变' in str(error) or 'opsx-restore-path-changed' in str(error)
+            assert file_a.read_bytes() == b'current A'
+            assert file_b.read_bytes() == b'unrelated B'
+            assert link.is_symlink()
+
+
+
+def test_w5_review_legacy_alias_lock_and_owner_write_failure():
+    from unittest.mock import patch
+    import execution
+    import fcntl
+    restore = _with_targets({'w5-old-alias': {'host': 'same.example'},
+                             'w5-new-alias': {'host': 'same.example'}})
+    try:
+        directory = core.STATE_DIR / 'locks'; directory.mkdir(exist_ok=True)
+        old = os.open(directory / 'w5-old-alias.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(old, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with core.target_lock('w5-new-alias'):
+                    raise AssertionError('新版规范锁不能绕过旧版同机别名锁')
+            except core.TargetBusy:
+                pass
+        finally:
+            os.close(old)
+        with core.target_lock('w5-new-alias'):
+            pass
+    finally:
+        restore()
+    command = 'printf w5-owner-short-write'
+    core.approve(command)
+    with patch.object(core.os, 'write', return_value=0), patch.object(core, '_run_change') as backend:
+        try:
+            core.exec_change(command)
+            raise AssertionError('锁owner写不完整不得启动变更')
+        except core.OpsxError:
+            pass
+        backend.assert_not_called()
+    assert execution.find_latest(command)['status'] == 'aborted'
+    assert core.check_stamp(command), '命令未下发，不消耗授权'
+    with core.target_lock(None):
+        pass
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

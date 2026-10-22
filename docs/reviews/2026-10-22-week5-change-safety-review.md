@@ -1,5 +1,7 @@
 # W5 复审记录：变更执行记录、目标级写锁、审批次数、远程原子恢复
 
+后续审查：同日完成[W5 二次审查与修复](2026-10-22-week5-followup-review.md)，当前自检 **292/292 passed**。下面保留首次交付时的记录。
+
 日期：2026-10-22。范围：W5 全部未提交改动（`execution.py` 新增，`core.py` / `remote.py` /
 `opsx` / `mcp_server.py` / `agent/tools.py` / `agent/loop.py` / `.claude/agents/ops.md` 修改）。
 方式：两轮独立只读复审（各自完整读 diff + 实际执行复现脚本）+ 自查；每条严重问题都写了复现命令。

@@ -13,13 +13,13 @@ unknown 是**唯一需要人类介入的终态**：命令可能执行了一半�
 同一目标同一命令的再次执行会被拒绝——"断线不自动重放"就落在这个门禁上，而不是
 靠"我们记得不要重试"这种口头约定。
 
-已知边界：进程存活判断用 pid（与 agent/schedule.py 的 reconcile 同源）。pid 被复用
-时的方向是**少拦**（新进程占着旧 pid → 看起来还在跑 → 门禁放行），不是多拦。
-个人单机场景概率低；要更严可拿 /proc/<pid> 启动时间与记录里的 started_ts 比对。
+执行阶段同时核对 pid 和目标锁的持有者。进程仍在但记录收尾写盘失败、锁已释放，
+也属于 unknown，不能把“REPL 进程还活着”当成“那次变更仍在执行”。
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -89,7 +89,8 @@ def _write(rec: dict) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(rec, handle, ensure_ascii=False, indent=2)
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(core.redact_obj(rec), handle, ensure_ascii=False, indent=2)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
@@ -101,11 +102,30 @@ def _read(path: Path) -> dict | None:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(rec, dict) or not isinstance(rec.get("id"), str):
+    if (not isinstance(rec, dict) or rec.get("id") != path.stem
+            or not _ID_RE.fullmatch(path.stem)):
         return None
     if rec.get("status") not in STATUSES or rec.get("kind") not in KINDS:
         return None
-    return rec
+    if (not isinstance(rec.get("cmd"), str)
+            or not isinstance(rec.get("cmd_hash"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", rec["cmd_hash"])
+            or (rec.get("target") is not None and not isinstance(rec["target"], str))
+            or not isinstance(rec.get("env"), dict)
+            or ("command_hash" in rec and (not isinstance(rec["command_hash"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", rec["command_hash"])))
+            or type(rec.get("started_ts")) not in (int, float)):
+        return None
+    try:
+        if not math.isfinite(rec["started_ts"]):
+            return None
+    except OverflowError:
+        return None
+    resolved = rec.get("resolved")
+    if (not isinstance(resolved, dict) or resolved.get("outcome") not in OUTCOMES
+            or not isinstance(resolved.get("at"), str)):
+        rec["resolved"] = None
+    return core.redact_obj(rec)
 
 
 def _pid_alive(pid) -> bool:
@@ -124,6 +144,44 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+def _execution_alive(rec: dict) -> bool:
+    if not _pid_alive(rec.get("pid")):
+        return False
+    if rec.get("phase") in BEFORE_EXEC_PHASES:
+        return True
+    target = rec.get("target")
+    try:
+        canonical = core._lock_path(target, env=rec.get("env"))
+    except core.OpsxError:
+        return False
+    legacy = core.STATE_DIR / "locks" / f"{target if target is not None else core.LOCAL_LOCK_FILE}.lock"
+    for path in dict.fromkeys((canonical, legacy)):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                try:
+                    owner = json.loads(os.read(fd, 4096).decode("utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(owner, dict):
+                    continue
+                if owner.get("execution_id"):
+                    if owner["execution_id"] == rec["id"]:
+                        return True
+                elif owner.get("pid") == rec.get("pid"):
+                    return True
+            except OSError:
+                continue
+        finally:
+            os.close(fd)
+    return False
+
+
 def begin(kind: str, cmd: str, target: str | None = None, env: dict | None = None,
           snapshot_id: str | None = None, phase: str = "exec") -> dict:
     """开一条执行记录。phase 标记卡在哪一步（snapshot/exec/restore），断线时有用。"""
@@ -133,6 +191,7 @@ def begin(kind: str, cmd: str, target: str | None = None, env: dict | None = Non
     rec = {
         "id": new_id(), "kind": kind, "status": "running", "phase": phase,
         "cmd": cmd, "cmd_hash": core.cmd_hash(cmd, target),
+        "command_hash": core.cmd_hash(cmd),
         "target": target, "host": (env or {}).get("host"),
         "env": env or {}, "snapshot_id": snapshot_id,
         "pid": os.getpid(), "started": core_iso(now), "started_ts": now,
@@ -193,7 +252,7 @@ def finish(execution_id: str, status: str, *, exit_code=None, error=None,
         rec.update({
             "status": status, "exit_code": exit_code,
             "error": core.redact(str(error))[:500] if error else None,
-            "output_preview": core.redact((output or "")[:PREVIEW_LIMIT]),
+            "output_preview": core.redact(output or "")[:PREVIEW_LIMIT],
             "finished": core_iso(now), "finished_ts": now,
             "duration_s": round(now - float(rec.get("started_ts") or now), 1),
         })
@@ -206,7 +265,7 @@ def finish(execution_id: str, status: str, *, exit_code=None, error=None,
 
 
 def reconcile() -> list[dict]:
-    """running 但进程已不在 → unknown。
+    """running 但对应进程或目标锁已不在 → unknown。
 
     进程被杀时我们确实不知道命令执行到哪了，所以不能标 failed（会让人以为没事），
     更不能重放。标 unknown 并进入待核实队列，是唯一诚实的结论。
@@ -220,7 +279,7 @@ def reconcile() -> list[dict]:
             rec = _read(path)
             if rec is None or rec.get("status") != "running":
                 continue
-            if _pid_alive(rec.get("pid")):
+            if _execution_alive(rec):
                 continue
             fresh = _read(path)
             if fresh is None or fresh.get("status") != "running":
@@ -236,7 +295,7 @@ def reconcile() -> list[dict]:
                 "finished": core_iso(now), "finished_ts": now,
                 "duration_s": round(now - float(fresh.get("started_ts") or now), 1),
                 "error": ("执行进程在命令下发前退出（命令未执行）" if before_exec else
-                          "执行进程已退出，无法确认命令是否完成（需人工核实）"),
+                          "执行进程已退出或目标锁已释放，无法确认命令是否完成（需人工核实）"),
             })
             _write(fresh)
             moved.append(fresh)
@@ -244,20 +303,23 @@ def reconcile() -> list[dict]:
         core._safe_audit("execution-unknown" if rec["status"] == "unknown"
                          else "execution-aborted",
                          execution_id=rec["id"], target=rec.get("target"),
-                         reason="执行进程消失")
+                         reason="执行进程或目标锁已不再对应记录")
     return moved
 
 
 def _view(rec: dict) -> dict:
-    """读取时的状态视图：进程已死但记录仍是 running，按实际含义呈现。
+    """读取时的状态视图：对应执行已不活动但记录仍是 running，按实际含义呈现。
 
     不在这里写盘——`ops_executions` 这类工具声明为只读，落盘对账交给
     `reconcile()`（CLI / daemon）。但门禁必须看到真实风险，所以视图里：
     - phase 已进入 exec（命令可能已下发）→ unknown（需要人核实）
     - phase 还在 lock/snapshot（命令一定没下发）→ aborted（明确"没执行"）
     """
-    if rec.get("status") != "running" or _pid_alive(rec.get("pid")):
+    if rec.get("status") != "running" or _execution_alive(rec):
         return rec
+    fresh = _read(_path(rec["id"]))
+    if fresh is not None and fresh.get("status") != "running":
+        return fresh  # 读完旧 running 后原调用可能恰好成功收尾，不能显示成 unknown。
     shown = dict(rec)
     if rec.get("phase") in BEFORE_EXEC_PHASES:
         shown["status"] = "aborted"
@@ -265,7 +327,7 @@ def _view(rec: dict) -> dict:
     else:
         shown["status"] = "unknown"
         shown["error"] = rec.get("error") or \
-            "执行进程已退出，无法确认命令是否完成（需人工核实）"
+            "执行进程已退出或目标锁已释放，无法确认命令是否完成（需人工核实）"
     shown["stale"] = True   # 文件里仍是 running，reconcile 才会落盘
     return shown
 
@@ -290,32 +352,57 @@ def list_records(tail: int = 20, target: str | None = None,
     return out[:tail] if tail >= 0 else out
 
 
-def find_latest(cmd: str, target: str | None = None) -> dict | None:
+def find_latest(cmd: str, target: str | None = None, *, since: float | None = None,
+                pid: int | None = None, kind: str | None = None) -> dict | None:
     """按「命令 + 目标」找最近一条执行记录（CLI 展示 execution_id 用）。
 
-    不缓存"最后一次 id"：并发时模块级变量会串台。同目标同命令本来就被目标锁
-    串行化，所以按 cmd_hash 找最近一条是准确的。
+    按调用进程与起点过滤：另一进程拿锁失败也会写更新的 aborted，不能串成它的 id。
     """
     digest = core.cmd_hash(cmd, target)
     for rec in list_records(tail=-1, target=target):
-        if rec.get("cmd_hash") == digest:
+        if (rec.get("target") == target and rec.get("cmd_hash") == digest
+                and (since is None or rec["started_ts"] >= since)
+                and (pid is None or rec.get("pid") == pid)
+                and (kind is None or rec.get("kind") == kind)):
             return rec
     return None
 
 
-def pending_unknown(target: str | None, cmd_hash: str | None = None) -> dict | None:
+def pending_unknown(target: str | None, cmd_hash: str | None = None, *,
+                    env: dict | None = None, command: str | None = None) -> dict | None:
     """同一目标上未核实的 unknown 执行（可按命令哈希收窄）。
 
     这是"不自动重放"的执行点：只要还有一条没核实的记录，就不再放行新执行。
     收窄到命令哈希是为了不因为一次失败的变更把整个目标永久锁死——同一目标上
     另一条命令仍然可以走（拿的是同一把目标锁，串行但不阻塞）。
     """
-    for rec in list_records(tail=-1, target=target, status="unknown"):
+    for path in _dir().glob("*.json"):
+        if _read(path) is None and path.exists():
+            raise core.OpsxError(
+                f"执行记录损坏，无法确认是否有未核实的变更，拒绝执行: {path}；"
+                "请人工核实后修复该记录，不会自动删除或重放")
+    command_hash = core.cmd_hash(command) if command is not None else None
+    for rec in list_records(tail=-1, status="unknown"):
         if rec.get("resolved"):
             continue
-        if cmd_hash is not None and rec.get("cmd_hash") != cmd_hash:
+        recorded_env = rec.get("env") or {}
+        same_host = (target is not None and rec.get("target") is not None and env
+                     and env.get("host") and recorded_env.get("host")
+                     and str(env["host"]).lower().rstrip(".")
+                     == str(recorded_env["host"]).lower().rstrip(".")
+                     and str(env.get("port") or 22) == str(recorded_env.get("port") or 22))
+        same_target = rec.get("target") == target
+        if not same_target and not same_host:
             continue
-        return rec
+        if cmd_hash is None and command is None:
+            return rec
+        if same_target and rec.get("cmd_hash") == cmd_hash:
+            return rec
+        if same_host and command is not None:
+            # 旧记录没有独立命令哈希，用本次原文按旧别名算；不能反算已脱敏的 rec.cmd。
+            if (rec.get("command_hash") == command_hash
+                    or rec.get("cmd_hash") == core.cmd_hash(command, rec.get("target"))):
+                return rec
     return None
 
 
@@ -334,7 +421,7 @@ def resolve(execution_id: str, outcome: str, note: str = "") -> dict:
         if rec is None:
             raise core.OpsxError(f"没有这条执行记录: {execution_id}")
         if rec.get("status") == "running":
-            # 进程已死但还没对账：人可以直接核实，不必先跑一次 list 触发 reconcile
+            # 对应执行已不活动但还没对账，人可以直接核实，不必先跑 list。
             shown = _view(rec)
             shown.pop("stale", None)
             if shown.get("status") == "unknown":
@@ -343,7 +430,7 @@ def resolve(execution_id: str, outcome: str, note: str = "") -> dict:
                 shown["finished_ts"] = shown.get("finished_ts") or now
                 _write(shown)
                 core._safe_audit("execution-unknown", execution_id=execution_id,
-                                 target=shown.get("target"), reason="核实时发现进程已退出")
+                                 target=shown.get("target"), reason="核实时发现执行进程或目标锁已不再对应记录")
             rec = shown
         if rec.get("status") != "unknown":
             raise core.OpsxError(
@@ -357,20 +444,10 @@ def resolve(execution_id: str, outcome: str, note: str = "") -> dict:
 
 
 def prune(keep: int = KEEP) -> None:
-    """清理旧记录，但永不清理未核实的 unknown（那等于把待办删了）。"""
+    """清理已知安全的旧终态；损坏记录和未核实 unknown 不得自动删除。"""
     d = _dir()
     if not d.is_dir():
         return
-    cutoff = time.time() - 7 * 86400
-    for path in d.glob("*.json"):
-        # 损坏/半写的记录读不出来，也就永远排不进 keep 的统计：按 mtime 超期清理
-        if _read(path) is not None:
-            continue
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-        except OSError:
-            pass
     records = list_records(tail=-1)
     if len(records) <= keep:
         return
@@ -408,7 +485,7 @@ def format_record(rec: dict) -> str:
         lines.append("  待核实：opsx executions resolve "
                      f"{rec.get('id')} --observed-ok|--observed-failed")
     if rec.get("stale"):
-        lines.append("  （记录文件里仍是 running：执行进程已不在，对账会落盘为上面这个状态）")
+        lines.append("  （记录文件里仍是 running：对应执行或目标锁已不再活动，对账会落盘为上面这个状态）")
     return "\n".join(lines)
 
 

@@ -19,6 +19,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
-        run: python -m compileall -q core.py remote.py opsx mcp_server.py agent selftest.py
+        run: python -m compileall -q core.py execution.py remote.py opsx opsagent mcp_server.py agent selftest.py
       - name: Selftest
         run: ./opsx selftest

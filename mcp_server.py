@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -166,13 +168,15 @@ def call_tool(name, args):
         return _result({"revoked": revoked})
     if name == "ops_exec":
         snap_cmds = [(c["command"], c.get("name", "")) for c in args.get("snapshot_cmds", [])]
+        started = time.time()
         code, sid, output = core.exec_change(
             _require(args, "command"),
             args.get("snapshot_files", []),
             snap_cmds,
         )
         import execution
-        record = execution.find_latest(_require(args, "command"))
+        record = execution.find_latest(_require(args, "command"), since=started,
+                                       pid=os.getpid(), kind="exec")
         payload = {"exit_code": code, "snapshot_id": sid, "output": output[:4000]}
         if record is not None:
             payload["execution_id"] = record["id"]
@@ -186,6 +190,8 @@ def call_tool(name, args):
             if record is None:
                 raise core.OpsxError(f"没有这条执行记录: {args.get('execution_id')}")
             return _result(record)
+        if args.get("tail", 20) <= 0:
+            raise core.OpsxError("tail 须为正整数")
         summary = execution.summary()
         return _result({"summary": summary,
                         "records": execution.list_records(
@@ -198,7 +204,22 @@ def call_tool(name, args):
             return _result({"needs_confirm": True,
                             "plan": core.format_rollback_plan(plan),
                             "hint": "回滚会覆盖文件：核对目标与差异后带 confirm=true 重试"})
-        return _result({"report": remote.rollback(sid, confirm=True)})
+        import execution
+        started, error = time.time(), None
+        try:
+            report = remote.rollback(sid, confirm=True)
+        except (core.OpsxError, remote.RemoteError) as e:
+            error = e
+        record = execution.find_latest(f"rollback {sid}", plan.get("target"),
+                                       since=started, pid=os.getpid(), kind="rollback")
+        if error is not None:
+            reference = (f"\nexecution_id={record['id']}（状态 {record['status']}；"
+                         f"查看：opsx executions show {record['id']}）") if record else ""
+            return _tool_error(str(error) + reference)
+        payload = {"report": report}
+        if record is not None:
+            payload.update(execution_id=record["id"], execution_status=record["status"])
+        return _result(payload)
     if name == "ops_list":
         return _result(core.collect_state())
     if name == "ops_audit":

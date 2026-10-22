@@ -270,11 +270,7 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     where = f"目标 {target} " if target else "本机"
     import execution
-    record = execution.find_latest(cmd, target)
-    # 只认本次调用产生的记录：被门禁挡下时不会新建记录，find_latest 会返回上一条，
-    # 那样会把"这次没执行"配上一次的状态（"失败 + 状态 succeeded"）
-    if record is not None and float(record.get("started_ts") or 0) < started:
-        record = None
+    record = execution.find_latest(cmd, target, since=started, pid=os.getpid(), kind="exec")
     exec_text = ""
     if record is not None:
         exec_text = f"；execution_id={record['id']}（状态 {record['status']}）"
@@ -290,7 +286,10 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     executed = record is not None and record.get("status") in ("succeeded", "failed",
                                                                "unknown")
     if not executed and code != 0:
-        return f"[opsx 拒绝] {where}本次未执行（exit={code}）。\n{out_text}"
+        snapshot = f"，{sid_text}" if sid else ""
+        return f"[opsx 拒绝] {where}本次未执行（exit={code}）{snapshot}{exec_text}。\n{out_text}"
+    if record is not None and record["status"] == "unknown":
+        return f"[结果未知] {where}执行结果需核实（exit={code}），{sid_text}{exec_text}。\n{out_text}"
     if code == 0:
         return f"[完成] {where}执行成功（exit=0），{sid_text}{exec_text}。\n{out_text}"
     return f"[失败] {where}执行未完成（exit={code}），{sid_text}{exec_text}。\n{out_text}"
@@ -298,8 +297,10 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
 
 def _ops_rollback(args: dict, ctx: ToolContext) -> str:
     sid = args["snapshot_id"]
+    started, target = None, None
     try:
         plan = remote.rollback_plan(sid)
+        target = plan.get("target")
         if plan["files"]:
             preview = core.format_rollback_plan(plan)
             if ctx.ask_user is None:
@@ -310,9 +311,18 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
                     "确认回滚", "确认", "yes", "y"}:
                 core.audit("rollback-deny", snapshot_id=sid)
                 return "[opsx 拒绝] 用户未批准回滚，文件未改动。"
-        return remote.rollback(sid, confirm=True)  # 远程快照推回，本机走 core
+        started = time.time()
+        result = remote.rollback(sid, confirm=True)  # 远程快照推回，本机走 core
     except (core.OpsxError, remote.RemoteError) as e:
-        return f"[opsx 错误] {e}"
+        result = f"[opsx 错误] {e}"
+    if started is not None:
+        import execution
+        record = execution.find_latest(f"rollback {sid}", target, since=started,
+                                       pid=os.getpid(), kind="rollback")
+        if record is not None:
+            result += (f"\nexecution_id={record['id']}（状态 {record['status']}；"
+                       f"查看：opsx executions show {record['id']}）")
+    return result
 
 
 def _ops_executions(args: dict, ctx: ToolContext) -> str:
@@ -326,8 +336,8 @@ def _ops_executions(args: dict, ctx: ToolContext) -> str:
             return f"[错误] 没有这条执行记录: {args.get('execution_id')!r}"
         return execution.format_record(record)
     tail = args.get("tail", 20)
-    if type(tail) is not int or tail < 0:
-        return "[错误] tail 须为非负整数"
+    if type(tail) is not int or tail <= 0:
+        return "[错误] tail 须为正整数"
     summary = execution.summary()
     text = execution.format_list(execution.list_records(
         tail=tail, status=args.get("status") or None))
