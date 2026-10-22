@@ -113,7 +113,7 @@ def tail(n: int = TAIL_DEFAULT, kind: str | None = None) -> list[dict]:
     if type(n) is not int or n < 0:
         raise ValueError("n 须为非负整数")
     path = _path()
-    if not path.is_file() or n == 0:
+    if n == 0:
         return []
     lines = []
     for candidate in (path.with_name(path.name + ".1"), path):

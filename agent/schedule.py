@@ -47,7 +47,7 @@ MIN_EVERY = 60
 SCHEDULE_MAX_TURNS = 12
 DAILY_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
-# 整任务时间预算（在轮次边界停止：单轮含一次 LLM 调用，自有超时）
+# 整任务时间预算（轮次与工具调用前检查，已启动调用自有超时）
 DEFAULT_TASK_TIMEOUT = 900
 MIN_TASK_TIMEOUT, MAX_TASK_TIMEOUT = 60, 86400
 # 只读巡检的瞬时失败（SSH/网络）有限重试：不会放大成风暴，也不会重放写操作
@@ -153,10 +153,13 @@ def _save(items: list[dict], meta: dict | None = None) -> None:
         except ScheduleError:
             meta = {}
     p = _file()
-    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    core._ensure_state_dir()
     tmp = p.with_name(f".schedules-{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"items": items, "meta": meta or {}}, ensure_ascii=False,
-                              indent=2), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(core.redact_obj({"items": items, "meta": meta or {}}), handle,
+                  ensure_ascii=False, indent=2)
     os.replace(tmp, p)
 
 
@@ -315,7 +318,7 @@ def _describe_checks(entry: dict) -> str:
 
 def add(prompt: str, every_seconds=None, daily=None, timeout_seconds=None,
         checks_target=None, checks_groups=None) -> dict:
-    prompt = (prompt or "").strip()
+    prompt = core.redact((prompt or "").strip())
     if not prompt:
         raise ScheduleError("prompt 不能为空")
     if (every_seconds is not None) == (daily is not None):
@@ -568,6 +571,8 @@ def _update_entry_state(task_id: str, run_id: str, status: str,
                     it["last_run_id"] = run_id
                     it["last_status"] = status
                     it["last_verdict"] = verdict
+                    if status == "succeeded":
+                        it["last_success"] = now
                     if reanchor and it.get("enabled", True):
                         try:
                             it["next_run"] = _next_run(it, now)
@@ -633,8 +638,12 @@ def format_runs(task_id: str | None = None, tail: int = 20,
             line += f"\n    {str(rec['error'])[:160]}"
         if rec.get("session_id"):
             line += f"\n    会话: {rec['session_id']}"
-        if rec.get("report_path"):
-            line += f"\n    报告: {rec['report_path']}"
+        paths = [rec["report_path"]] if isinstance(rec.get("report_path"), str) else []
+        extra_paths = rec.get("rules_report_paths")
+        if isinstance(extra_paths, list):
+            paths += [path for path in extra_paths if isinstance(path, str)]
+        for path in dict.fromkeys(paths):
+            line += f"\n    报告: {path}"
         if rec.get("notify_status"):
             line += f"\n    通知: {rec.get('notification_id') or '-'} {rec['notify_status']}"
             if rec.get("notify_error"):
@@ -675,22 +684,19 @@ def _strip_quoted(text: str) -> str:
 
 
 def _run_preset_checks(entry: dict, session_id: str,
-                       budget_deadline: float) -> tuple[str, str | None]:
-    """返回 (注入给模型的说明, 摘要路径)。
+                       budget_deadline: float) -> tuple[str, str | None, str | None]:
+    """返回 (注入给模型的说明, 摘要路径, 检查错误)。
 
     取任务预算的一半（最多 300s）作为规则检查的总时间上限：预设检查不能把
     模型解读的时间吃光，更不能让任务因为探针慢而整体 timeout。
-    """
-    """任务声明了 checks 时，在调用模型之前先跑规则检查。
 
-    这是"LLM 完全不可用仍能上报规则异常"的关键：检查不经过模型，结果直接落
-    signal 与报告；模型只负责解读。预算用任务级时间预算（不含模型时间）。
+    任务声明了 checks 时，在模型之前跑检查并落摘要，模型失败也保留规则证据。
     """
     spec = entry.get("checks")
     if not spec:
-        return "", None
+        return "", None, None
     try:
-        remaining = max(10.0, budget_deadline - time.monotonic())
+        remaining = max(0.0, budget_deadline - time.monotonic())
         report = checks.run_checks(targets=spec.get("targets") or "all",
                                    groups=spec.get("groups") or None,
                                    deadline=time.monotonic() + min(remaining * 0.5, 300))
@@ -699,16 +705,17 @@ def _run_preset_checks(entry: dict, session_id: str,
         _safe_audit("schedule-checks-error", id=entry.get("id"), error=str(e))
         events.append("schedule-checks-error", task=entry.get("id"), error=str(e),
                       reason="规则检查无法执行")
-        return (f"（本次规则检查未能执行：{e}；没有规则结论，不得据此宣称正常）\n", None)
+        error = core.redact(f"规则检查未能执行：{e}")
+        return f"（{error}；没有规则结论，不得据此宣称正常）\n", None, error
     except Exception as e:  # noqa: BLE001 —— 规则检查自身出错不能把整个任务打挂
         _safe_audit("schedule-checks-error", id=entry.get("id"),
                     error=core.redact(f"{type(e).__name__}: {e}"))
         events.append("schedule-checks-error", task=entry.get("id"),
                       error=core.redact(str(e)), reason="规则检查内部错误")
-        return (f"（本次规则检查出现内部错误：{type(e).__name__}；"
-                "没有规则结论，不得据此宣称正常）\n", None)
+        error = core.redact(f"规则检查内部错误：{type(e).__name__}: {e}")
+        return f"（{error}；没有规则结论，不得据此宣称正常）\n", None, error
     path = checks.save_report(f"schedule-{entry['id']}", text)
-    checks.save_signal(session_id, report, path)
+    signal_path = checks.save_signal(session_id, report, path)
     summary = report["summary"]
     note = (f"本次已在调用模型之前跑完确定性规则检查（程序判定，不经模型）："
             f"结论 {report['verdict']}，异常 {summary['critical']} / 警告 {summary['warn']} / "
@@ -716,7 +723,8 @@ def _run_preset_checks(entry: dict, session_id: str,
             + (f"完整报告: {path}（用 read 查看，不要重复跑同样的探针）。" if path else "")
             + "\n你的任务是解读这份结果、指出需要人工确认的点，不得与之冲突，也不得把"
               "未采集项说成正常。\n")
-    return note, str(checks.signal_path(session_id)) if checks.signal_path(session_id) else None
+    error = "规则结果摘要写入失败，无法保存检查证据" if signal_path is None else None
+    return note, str(signal_path) if signal_path else None, error
 
 
 def _run_entry(entry: dict, model: str | None, session=None,
@@ -759,6 +767,7 @@ def _attach_signal(rec: dict, signal: dict | None) -> None:
     rec["rules_verdict"] = signal.get("verdict")
     rec["rules_complete"] = signal.get("complete")
     rec["rules_targets"] = list(signal.get("targets") or [])
+    rec["rules_report_paths"] = list(signal.get("report_paths") or [])
     path = checks.signal_path(signal.get("session_id") or rec.get("session_id") or "")
     rec["signal_path"] = str(path) if path else None
     if signal.get("report_path"):
@@ -769,7 +778,7 @@ def _begin_run(entry: dict, session_id: str | None) -> dict:
     rec = {
         "run_id": _new_run_id(entry["id"]),
         "task_id": entry["id"],
-        "prompt": entry["prompt"][:200],
+        "prompt": core.redact(entry["prompt"])[:200],
         "session_id": session_id,
         "pid": os.getpid(),
         "status": "running",
@@ -820,6 +829,14 @@ def _finish_run(rec: dict, entry: dict, status: str, verdict=None, error=None,
         except (OSError, RuntimeError):
             pass
     _attach_signal(rec, signal)
+    if status == "succeeded" and signal:
+        # 模型只能补充风险，不能把程序发现的异常或未采集项改成正常。
+        candidates = [verdict or "未判定", signal.get("verdict") or "不完整"]
+        if signal.get("complete") is not True:
+            candidates.append("不完整")
+        rank = {"正常": 0, "未判定": 1, "不完整": 1, "警告": 2, "异常": 3}
+        verdict = max(candidates, key=lambda value: rank.get(value, 1))
+        rec["verdict"] = verdict
     try:
         _write_run(rec)
     except OSError:
@@ -876,12 +893,17 @@ def _missed_count(entry: dict, anchor: float, since: float, now: float) -> int:
 
 
 def _load_run_signal(sessions: list[str]) -> tuple[dict | None, str | None]:
-    """按尝试顺序倒序找规则检查摘要：最后一次尝试可能连检查都没跑到。"""
-    for session_id in reversed(sessions):
+    """合并每次尝试的规则证据：重试只查部分目标时保留此前其他目标的异常。"""
+    combined, latest, count = None, None, 0
+    for session_id in sessions:
         signal = checks.load_signal(session_id)
-        if signal is not None:
-            return signal, session_id
-    return None, None
+        if signal is None:
+            continue
+        combined = checks._merge_signal(combined, signal) if combined else signal
+        latest, count = session_id, count + 1
+    if count > 1 and checks._save_signal_payload(latest, combined) is None:
+        raise ScheduleError("重试后的规则结果摘要写入失败，无法保存完整检查证据")
+    return combined, latest
 
 
 def _execute_run(entry: dict, model: str | None) -> dict:
@@ -903,9 +925,10 @@ def _execute_run(entry: dict, model: str | None) -> dict:
         _write_run(rec)
     except OSError:
         rec["unrecorded"] = True
-    extra, signal_path = _run_preset_checks(entry, first_session.id, deadline)
-    if signal_path:
+    extra, signal_path, checks_error = _run_preset_checks(entry, first_session.id, deadline)
+    if signal_path or checks_error:
         rec["signal_path"] = signal_path
+        rec["checks_error"] = checks_error
         try:
             _write_run(rec)
         except OSError:
@@ -929,16 +952,24 @@ def _execute_run(entry: dict, model: str | None) -> dict:
             attempt_errors.append(f"{type(e).__name__}: {e}")
             if attempt <= RUN_RETRIES:
                 time.sleep(RUN_RETRY_DELAY)
-    signal, signal_session = _load_run_signal(sessions)
+    try:
+        signal, signal_session = _load_run_signal(sessions)
+    except ScheduleError as e:
+        return _finish_run(rec, entry, "failed", error=str(e), attempts=attempts,
+                           attempt_errors=attempt_errors, result_text=text or "")
     if signal_session:
         rec["session_id"] = signal_session  # 摘要所在的会话才是可信证据链
+    if checks_error:
+        return _finish_run(rec, entry, "failed", error=checks_error,
+                           attempts=attempts, attempt_errors=attempt_errors,
+                           result_text=text or "", signal=signal)
     if text is None:
         return _finish_run(rec, entry, "failed",
                            error=attempt_errors[-1] if attempt_errors else "未知错误",
                            attempts=attempts, attempt_errors=attempt_errors,
                            signal=signal)
     if loop.DEADLINE_MARK in text:
-        return _finish_run(rec, entry, "timeout", error="整任务时间预算耗尽（轮次边界停止）",
+        return _finish_run(rec, entry, "timeout", error="整任务时间预算耗尽（停止后续调用）",
                            attempts=attempts, attempt_errors=attempt_errors,
                            result_text=text, signal=signal)
     verdict = _detect_verdict(text)
@@ -989,8 +1020,8 @@ def _claim_due(task_id: str, now: float) -> dict | None:
             meta["last_scan"] = now
             _save(items, meta)
             return dict(target)
-    except (ScheduleError, TypeError, ValueError, OSError):
-        return None
+    except (TypeError, ValueError) as e:
+        raise ScheduleError(f"任务 {task_id} 的排期损坏") from e
 
 
 def _touch_heartbeat() -> None:
@@ -1010,6 +1041,8 @@ def _notify_run(rec: dict) -> None:
     已经完成的巡检变成失败——否则"通知坏了"会连带"巡检也没了"。
     回写 notification_id/status 让"这次告警到底发出去没有"能在 runs 里直接看到。
     """
+    rec["notify_attempted_ts"] = time.time()
+    rec.pop("notify_error", None)
     try:
         result = notify.process_run(rec)
     except Exception as e:  # noqa: BLE001 —— 旁路失败不改变巡检结论
@@ -1074,12 +1107,16 @@ def _pending_notify_runs(limit: int = 20, window: int = 86400) -> list[dict]:
     中断/失败可能在 daemon 停机期间产生；`schedule runs` 先对账后，run_due 也
     不会再看到它们。没有这层扫描，这些"没人在看"的时刻就永远不会推到人。
     """
-    cutoff = time.time() - window
+    now = time.time()
+    cutoff = now - window
     out = []
-    for rec in list_runs(tail=60):
-        if rec.get("notify_status"):
+    for rec in reversed(list_runs(tail=RUNS_KEEP)):
+        if rec.get("notify_status") == "error":
+            if now - _meta_ts(rec, "notify_attempted_ts") < 60:
+                continue
+        elif rec.get("notify_status"):
             continue
-        if rec.get("status") not in ("failed", "timeout", "interrupted", "missed"):
+        if rec.get("status") == "running":
             continue
         finished = rec.get("finished_ts") or rec.get("started_ts") or 0
         if not isinstance(finished, (int, float)) or finished < cutoff:
@@ -1125,18 +1162,28 @@ def run_due(model: str | None = None) -> list[dict]:
                 missed = _missed_count(it, anchor, since, now)
             except (ScheduleError, TypeError, ValueError):
                 it["enabled"] = False
-                disabled.append(it["id"])
+                disabled.append((dict(it), ScheduleError("任务时间配置损坏，已暂停")))
                 continue
             planned.append((it["id"], missed))
         meta["last_scan"] = now
         if not _safe_save(items, meta):
             _safe_audit("schedule-degraded", reason="排期/心跳写盘失败，本轮可能重复执行")
-    for task_id in disabled:
-        _safe_audit("schedule-disable", id=task_id, reason="时间/预算配置损坏")
-
     records = []
+    for entry, error in disabled:
+        _safe_audit("schedule-disable", id=entry["id"], reason=str(error))
+        rec = _record_synthetic_failed(entry, error)
+        _notify_run(rec)
+        records.append(rec)
+
     for task_id, missed in planned:
-        entry = _claim_due(task_id, time.time())
+        try:
+            entry = _claim_due(task_id, time.time())
+        except (OSError, ScheduleError) as e:
+            entry = next(it for it in items if it["id"] == task_id)
+            rec = _record_synthetic_failed(entry, e)
+            _notify_run(rec)
+            records.append(rec)
+            continue
         if entry is None:  # 扫描后被暂停、删除或改期
             _safe_audit("schedule-skip", id=task_id, reason="扫描后不再到期或已暂停")
             continue
@@ -1243,12 +1290,13 @@ def daemon(model: str | None = None, once: bool = False) -> int:
               f"运行记录: {_runs_dir()}，通知: {notify.describe_config(_notify_config())}")
         try:
             while True:
+                _notify_pending_runs()
                 for notif in _safe_retry_notifications():
                     print(f"[schedule] 通知重试 {notif['id']}：{notif['status']}")
                 try:
                     records = run_due(model)
                 except (ScheduleError, OSError) as e:
-                    print(f"[schedule] {e}", file=sys.stderr)
+                    print(f"[schedule] {core.redact(str(e))}", file=sys.stderr)
                     time.sleep(60)
                     continue
                 for rec in records:

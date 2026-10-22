@@ -84,7 +84,9 @@ _SENSITIVE_DIR_PATTERNS = [
 # k8s Secret 值：默认表格/describe 不输出值，-o yaml/json/jsonpath 等会输出明文（base64）。
 _KUBECTL_GET_SECRET = re.compile(r"\bkubectl\b.*?\bget\b.*?\bsecrets?\b", re.I)
 _KUBECTL_VALUE_OUTPUT = re.compile(
-    r"(?:\s-o|\s--output)(?:=|\s+)(?!name\b)\S+|\s--template(?:=|\s+)\S+"
+    r"\s-o(?:=(?!name\b)\S+|\s+(?!name\b)\S+|(?![=\s]|name\b)\S+)"
+    r"|\s--output(?:=|\s+)(?!name\b)\S+"
+    r"|\s--template(?:=|\s+)\S+"
     r"|\s--go-template(?:-file)?(?:=|\s+)\S+", re.I)
 _CONTENT_READERS = frozenset({
     "cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "strings", "xxd",
@@ -119,11 +121,21 @@ def redact_obj(value):
 
 
 def sensitive_path(path: str) -> bool:
-    return isinstance(path, str) and any(re.search(p, path) for p in _SENSITIVE_FILE_PATTERNS)
+    if not isinstance(path, str):
+        return False
+    real = os.path.realpath(os.path.expanduser(path))
+    return (real == os.path.realpath(STATE_DIR / "notify.json") or
+            any(re.search(p, path) for p in _SENSITIVE_FILE_PATTERNS))
 
 
 def sensitive_dir(path: str) -> bool:
-    return isinstance(path, str) and any(re.search(p, path) for p in _SENSITIVE_DIR_PATTERNS)
+    if not isinstance(path, str):
+        return False
+    real = os.path.realpath(os.path.expanduser(path))
+    snapshots = os.path.realpath(STATE_DIR / "snapshots")
+    return (real == os.path.realpath(STATE_DIR) or real == snapshots or
+            real.startswith(snapshots + os.sep) or
+            any(re.search(p, path) for p in _SENSITIVE_DIR_PATTERNS))
 
 
 def _path_probes(cand: str) -> list[str]:
@@ -160,8 +172,13 @@ def sensitive_command(cmd: str, strict: bool = False) -> str | None:
     for seg in _segments(cmd):
         if _KUBECTL_GET_SECRET.search(seg) and _KUBECTL_VALUE_OUTPUT.search(seg):
             return "kubectl get secret -o yaml/json（禁止输出 Secret 值）"
+        if re.search(r"\bkubectl\b.*\bconfig\s+view\b.*\s--raw(?:=true)?(?:\s|$)", seg):
+            return "kubectl config view --raw（禁止输出集群凭据）"
         try:
-            words = shlex.split(seg)
+            lexer = shlex.shlex(seg, posix=True, punctuation_chars="<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            words = list(lexer)
         except ValueError:
             words = seg.split()
         if not words:
@@ -399,7 +416,7 @@ _KUBECTL_FLAGS_WITH_VALUE = frozenset({
     "--certificate-authority", "--client-certificate", "--client-key", "--cache-dir",
 })
 _KUBECTL_READ_VERBS = frozenset({"get", "describe", "logs", "top", "api-resources",
-                                 "explain", "version", "cluster-info", "auth"})
+                                 "explain", "version", "cluster-info"})
 
 
 def _kubectl_read_only(seg: str) -> bool:
@@ -420,16 +437,20 @@ def _kubectl_read_only(seg: str) -> bool:
             if w.startswith("-"):
                 j += 1
                 continue
+            if w == "auth":
+                return j + 1 < len(words) and words[j + 1] in ("can-i", "whoami")
             return w in _KUBECTL_READ_VERBS
     return False
 
 
 def k8s_scope(cmd: str) -> dict:
-    for seg in _kubectl_segments(cmd):
-        ctx = _KUBECTL_CONTEXT.search(seg)
-        ns = _KUBECTL_NAMESPACE.search(seg)
-        return {"context": ctx.group(1).strip("\"'") if ctx else "",
-                "namespace": ns.group(1).strip("\"'") if ns else ""}
+    segments = _kubectl_segments(cmd)
+    changes = [seg for seg in segments if not _kubectl_read_only(seg)]
+    for seg in changes or segments:
+        ctx = list(_KUBECTL_CONTEXT.finditer(seg))
+        ns = list(_KUBECTL_NAMESPACE.finditer(seg))
+        return {"context": ctx[-1].group(1).strip("\"'") if ctx else "",
+                "namespace": ns[-1].group(1).strip("\"'") if ns else ""}
     return {"context": "", "namespace": ""}
 
 
@@ -470,6 +491,21 @@ def cmd_hash(cmd: str, target: str | None = None) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+def _validate_k8s_change_scope(cmd: str) -> None:
+    kubectl = [seg for seg in _kubectl_segments(cmd) if not _kubectl_read_only(seg)]
+    contexts = [[m.group(1).strip("\"'") for m in _KUBECTL_CONTEXT.finditer(seg)]
+                for seg in kubectl]
+    if any(not values or any(not value or any(ch in value for ch in "$`\\")
+                             for value in values) for values in contexts):
+        raise OpsxError("kubectl 变更须在命令中显式指定非空、无变量展开的 --context："
+                        "审批绑定实际 context，不能用当前默认 context 执行")
+    if len({value for values in contexts for value in values}) > 1:
+        raise OpsxError("同一命令里的 kubectl 段使用了不同 --context：请拆开分别审批执行")
+    if any(not m.group(1).strip("\"'") or any(ch in m.group(1) for ch in "$`\\")
+           for seg in kubectl for m in _KUBECTL_NAMESPACE.finditer(seg)):
+        raise OpsxError("kubectl 变更的 namespace 须为非空、无变量展开的固定值")
+
+
 def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
             target: str | None = None, env: dict | None = None) -> Path:
     if type(ttl_seconds) is not int or ttl_seconds <= 0:
@@ -482,13 +518,7 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
     if level == "R3" and not force:
         raise OpsxError("R3 命令需 --force 显式确认（不可逆操作）")
     env = env or resolve_env(cmd, target)
-    kubectl = [seg for seg in _kubectl_segments(cmd) if not _kubectl_read_only(seg)]
-    ctx_matches = [_KUBECTL_CONTEXT.search(seg) for seg in kubectl]
-    if any(m is None for m in ctx_matches):
-        raise OpsxError("kubectl 变更须在命令中显式指定 --context："
-                        "审批绑定实际 context，不能用当前默认 context 执行")
-    if len({m.group(1).strip("\"'") for m in ctx_matches}) > 1:
-        raise OpsxError("同一命令里的 kubectl 段使用了不同 --context：请拆开分别审批执行")
+    _validate_k8s_change_scope(cmd)
     stamp = {
         "cmd_hash": cmd_hash(cmd, target),
         "cmd": cmd,
@@ -516,6 +546,7 @@ def check_stamp(cmd: str, target: str | None = None, env: dict | None = None) ->
         return False
     try:
         s = json.loads(p.read_text(encoding="utf-8"))
+        _validate_k8s_change_scope(cmd)
         if env is None:
             env = resolve_env(cmd, target)
         return (_stamp_live(s) and s["cmd_hash"] == cmd_hash(cmd, target) and
@@ -792,8 +823,8 @@ def _local_read_state(src: str) -> tuple[bool, bytes]:
 
 def _diff_text(current: bytes, archived: bytes, src: str, snapshot_id: str) -> str:
     try:
-        cur = current.decode("utf-8")
-        old = archived.decode("utf-8")
+        cur = redact(current.decode("utf-8"))
+        old = redact(archived.decode("utf-8"))
     except UnicodeDecodeError:
         return "（二进制文件，差异从略）"
     if "\x00" in cur or "\x00" in old:
@@ -802,7 +833,7 @@ def _diff_text(current: bytes, archived: bytes, src: str, snapshot_id: str) -> s
         cur.splitlines(), old.splitlines(), fromfile=f"当前 {src}",
         tofile=f"快照 {snapshot_id}", lineterm="", n=2))
     if not diff:
-        return "（内容与快照一致）"
+        return "（内容与快照一致）" if current == archived else "（内容有变化，脱敏后的文本预览无差异）"
     return diff if len(diff) <= DIFF_LIMIT else diff[:DIFF_LIMIT] + "\n...[差异已截断]"
 
 
@@ -832,7 +863,7 @@ def rollback_plan(snapshot_id: str, read_state=None) -> dict:
         else:
             out = (d / item["output"]).read_text(encoding="utf-8", errors="replace")
             plan["commands"].append({"name": item.get("name") or item["cmd"],
-                                     "output": out[:DIFF_LIMIT]})
+                                     "output": redact(out)[:DIFF_LIMIT]})
     return plan
 
 
@@ -1003,6 +1034,11 @@ def exec_change(
             print(output, file=sys.stderr)
             audit("exec-abort", cmd=cmd, reason=str(e))
             return 3, None, output
+    if sid:
+        code, msg = check(cmd)  # 快照可能耗时：执行前重验 TTL、撤销和环境。
+        if code != 0:
+            audit("exec-abort", cmd=cmd, snapshot_id=sid, reason="快照后审批失效")
+            return code, sid, msg
     try:
         r = run_shell(cmd, timeout=timeout)
         output = redact(r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else ""))

@@ -1,8 +1,8 @@
 """agent loop：消息装配 → LLM 调用 → 工具分发 → 结果回填，最大轮次保护。
 
 与前端解耦：前端提供 ToolContext（人机回路）与 on_event 回调（渲染）。
-ctx.deadline（monotonic 秒）是整任务时间预算：在轮次边界停止——一次 LLM 调用
-有自身超时（默认 300s），所以超预算的上界是「预算 + 一轮」，不会永久阻塞。
+ctx.deadline（monotonic 秒）是整任务时间预算：在轮次与工具调用前检查。
+已启动的 LLM/工具调用仍受自身超时约束；到点不再启动后续调用。
 """
 from __future__ import annotations
 
@@ -180,10 +180,11 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
                         "content": "[中断] 工具调用未记录结果，可能已执行；请先核实状态，勿直接重试写操作。"})
     session.append({"role": "user", "content": user_input})
     final_text = ""
+    deadline_warning = (f"{DEADLINE_MARK} 已终止：任务时间预算耗尽"
+                        "（已完成部分仍在会话中，可 /resume 回看）")
     for _ in range(max_turns):
         if ctx.deadline is not None and time.monotonic() > ctx.deadline:
-            warning = (f"{DEADLINE_MARK} 已终止：任务时间预算耗尽"
-                       "（在轮次边界停止；已完成部分仍在会话中，可 /resume 回看）")
+            warning = deadline_warning
             emit("text", warning)
             return (final_text + "\n" if final_text else "") + warning
         messages = compact([{"role": "system", "content": system or _default_system()}]
@@ -203,18 +204,24 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
             return final_text
         for call in msg["tool_calls"]:
             name = call["function"]["name"]
-            try:
-                args = json.loads(call["function"].get("arguments") or "{}")
-                if not isinstance(args, dict):
-                    raise ValueError("参数必须是 JSON 对象")
-            except ValueError as e:
-                result = f"[错误] 工具参数不是有效 JSON 对象: {e}"
+            if ctx.deadline is not None and time.monotonic() > ctx.deadline:
+                result = f"{DEADLINE_MARK} 工具未执行：任务时间预算耗尽"
             else:
-                emit("tool", {"phase": "call", "name": name, "args": args})
-                result = tools.dispatch(name, args, ctx)
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                    if not isinstance(args, dict):
+                        raise ValueError("参数必须是 JSON 对象")
+                except ValueError as e:
+                    result = f"[错误] 工具参数不是有效 JSON 对象: {e}"
+                else:
+                    emit("tool", {"phase": "call", "name": name, "args": args})
+                    result = tools.dispatch(name, args, ctx)
             session.append({"role": "tool", "tool_call_id": call["id"],
                             "name": name, "content": result})
             emit("tool", {"phase": "result", "name": name, "result": result[:500]})
+        if ctx.deadline is not None and time.monotonic() > ctx.deadline:
+            emit("text", deadline_warning)
+            return (final_text + "\n" if final_text else "") + deadline_warning
     warning = f"{MAX_TURNS_MARK}，终止]"
     emit("text", warning)
     return (final_text + "\n" if final_text else "") + warning

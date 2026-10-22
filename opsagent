@@ -34,7 +34,7 @@ def _print_mode(prompt: str, model: str | None) -> int:
     try:
         text = loop.run_turn(prompt, session, ctx, model=model)
     except loop.llm.LLMError as e:
-        print(f"[LLM 错误] {e}", file=sys.stderr)
+        print(f"[LLM 错误] {tools.core.redact(str(e))}", file=sys.stderr)
         return 1
     print(text)
     return 0

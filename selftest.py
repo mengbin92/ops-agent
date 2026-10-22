@@ -1926,7 +1926,9 @@ def test_schedule_corrupt_entry_disabled():
         results = schedule.run_due()
     finally:
         schedule._run_entry = orig
-    assert [r["task_id"] for r in results] == [good["id"]]
+    assert [r["task_id"] for r in results if r["status"] == "succeeded"] == [good["id"]]
+    assert any(r["task_id"] == "sch-bad" and r["status"] == "failed" for r in results)
+    assert schedule.runs_exit_code(results) == 1
     bad = [it for it in schedule.list_entries() if it["id"] == "sch-bad"][0]
     assert bad["enabled"] is False
     (core.STATE_DIR / "schedules.json").unlink(missing_ok=True)
@@ -1953,7 +1955,9 @@ def test_schedule_corrupt_times_and_daily_dst():
     schedule._run_entry = lambda entry, model, **kw: "报告"
     try:
         assert "时间配置损坏" in schedule.format_list()
-        assert [r["task_id"] for r in schedule.run_due()] == [good["id"]]
+        records = schedule.run_due()
+        assert [r["task_id"] for r in records if r["status"] == "succeeded"] == [good["id"]]
+        assert sum(r["status"] == "failed" for r in records) == len(bad_values)
         assert all(not it["enabled"] for it in schedule.list_entries()[1:])
         assert schedule.run_due() == []
     finally:
@@ -5387,6 +5391,802 @@ def test_notify_recurrence_after_recovery_logs_new_event():
         assert len(sent.calls) == 3
     finally:
         notify._post = orig
+        _clean_notify()
+
+
+# Review regressions: notifications and events
+def test_review_events_reads_rotated_file_without_current():
+    from agent import events
+    _clean_notify()
+    try:
+        events.append('anomaly-new', title='旧事件')
+        events._path().replace(events._path().with_name('events.jsonl.1'))
+        assert events.tail(1)[0]['title'] == '旧事件'
+    finally:
+        _clean_notify()
+
+
+def test_review_notify_redacts_endpoint_in_delivery_errors():
+    from agent import notify
+    original = notify._post
+    try:
+        for status, body, error in (
+                (200, 'ok', 'invalid URL https://hooks.example.com/services/T/B/SECRET'),
+                (400, 'invalid hook SECRET and querycredential', None),
+                (200, '{"ok":false,"error":"bad hook SECRET"}', None)):
+            _clean_notify()
+            _notify_setup(url='https://hooks.example.com/services/T/B/SECRET?k=querycredential')
+            notify._post = _FakePost(status=status, body=body, error=error)
+            result = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+            assert result['notification']['status'] == 'failed'
+            for path in [core.STATE_DIR / 'events.jsonl',
+                         *list((core.STATE_DIR / 'notifications').glob('*.json'))]:
+                text = path.read_text()
+                assert 'SECRET' not in text and 'querycredential' not in text
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_failed_alert_does_not_create_false_recovery():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost(error='offline')
+        failed = notify.process_run(_rec_with_signal(_report_with([_anomaly()])))['notification']
+        sent = _FakePost()
+        notify._post = sent
+        normal = _rec_with_signal(_report_with([], complete=True, verdict='正常'))
+        assert notify.process_run(normal)['notification'] is None
+        assert notify.retry_pending(notif_id=failed['id'])[0]['status'] == 'superseded'
+        assert not sent.calls
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_recovery_retry_clears_state_once():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost()
+        notify.process_run(_rec_with_signal(_report_with([_anomaly()])))
+        notify._post = _FakePost(error='offline')
+        normal = _rec_with_signal(_report_with([], complete=True, verdict='正常'))
+        failed = notify.process_run(normal)['notification']
+        sent = _FakePost()
+        notify._post = sent
+        assert notify.retry_pending(notif_id=failed['id'])[0]['status'] == 'sent'
+        assert notify._load_state()['items']['check:web1/resources/磁盘 /data']['severity'] is None
+        assert notify.process_run(normal)['notification'] is None
+        assert len(sent.calls) == 1
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_discards_stale_recovery_after_recurrence():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost()
+        alert = _rec_with_signal(_report_with([_anomaly()]))
+        notify.process_run(alert)
+        notify._post = _FakePost(error='offline')
+        normal = _rec_with_signal(_report_with([], complete=True, verdict='正常'))
+        recovery = notify.process_run(normal)['notification']
+        sent = _FakePost()
+        notify._post = sent
+        # 同一告警复发仍可能处于去重窗口；也必须取消待发的恢复。
+        alert = _rec_with_signal(_report_with([_anomaly()]))
+        notify.process_run(alert)
+        assert notify.retry_pending(notif_id=recovery['id'])[0]['status'] == 'superseded'
+        assert not sent.calls
+        assert not notify._load_state()['items']['check:web1/resources/磁盘 /data'].get('pending_recovery')
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_refreshes_partial_batch_and_mute_rearms():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost(error='offline')
+        a, b = _anomaly(), _anomaly(id='web1/resources/内存', name='内存',
+                                    line='内存已用 96%', command='free -m', output='96%')
+        failed = notify.process_run(_rec_with_signal(_report_with([a, b])))['notification']
+        only_b = _rec_with_signal(_report_with([b]))
+        notify.process_run(only_b)
+        cfg = notify.load_config()
+        cfg['mute_until'] = time.time() + 3600
+        notify.save_config(cfg)
+        assert notify.retry_pending(notif_id=failed['id'])[0]['status'] == 'muted'
+        cfg['mute_until'] = 0
+        notify.save_config(cfg)
+        sent = _FakePost()
+        notify._post = sent
+        out = notify.process_run(only_b)
+        assert out['notification']['status'] == 'sent'
+        assert len(out['notification']['items']) == 1
+        assert out['notification']['items'][0]['title'].endswith('内存')
+        assert '磁盘 /data' not in sent.calls[0]['text']
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_retry_filters_recovered_items_and_retains_transient():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost(error='offline')
+        a, b = _anomaly(), _anomaly(id='web1/resources/内存', name='内存',
+                                    line='内存已用 96%', command='free -m', output='96%')
+        failed = notify.process_run(_rec_with_signal(_report_with([a, b])))['notification']
+        notify.process_run(_rec_with_signal(_report_with([b])))
+        sent = _FakePost()
+        notify._post = sent
+        retried = notify.retry_pending(notif_id=failed['id'])[0]
+        assert retried['status'] == 'sent'
+        assert len(retried['items']) == 1 and '磁盘 /data' not in sent.calls[0]['text']
+        # missed 是一次性事件，状态不会保持 open，但失败后仍必须可重试。
+        notify._post = _FakePost(error='offline')
+        missed = notify.process_run({'task_id': 'missed-task', 'run_id': 'missed-run',
+                                     'status': 'missed', 'error': 'missed one'})['notification']
+        notify._post = sent
+        assert notify.retry_pending(notif_id=missed['id'])[0]['status'] == 'sent'
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_review_notify_updates_last_seen_and_skips_corrupt_outbox():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        notify._post = _FakePost(error='offline')
+        rec = _rec_with_signal(_report_with([_anomaly()]))
+        failed = notify.process_run(rec)['notification']
+        state = notify._load_state()
+        state['items']['check:web1/resources/磁盘 /data']['last_seen'] = 1
+        notify._save_state(state)
+        notify.process_run(rec)
+        assert notify._load_state()['items']['check:web1/resources/磁盘 /data']['last_seen'] > 1
+        for over in ({'attempts': 'oops'}, {'items': [{'fingerprint': []}]},
+                     {'items': [{'fingerprint': 'x', 'severity': []}]},
+                     {'report_paths': [{}]}):
+            notify._write_notification(dict(failed, id='broken', **over))
+            assert 'broken' not in [n['id'] for n in notify.list_notifications()]
+        assert notify.retry_pending() == []
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+# Review regressions: security
+# Review regressions: security
+
+def test_review_custom_state_sensitive_paths():
+    from agent import tools as agent_tools
+    ctx = agent_tools.ToolContext()
+    state = core.STATE_DIR
+    for path in (state / "notify.json", state / "snapshots" / "s1" / "files" / "config"):
+        assert core.sensitive_command(f"cat {path}"), path
+        out = agent_tools.dispatch("read", {"path": str(path)}, ctx)
+        assert "拒绝" in out, (path, out)
+    for suffix in ("", "/.", "/*", "/n*"):
+        assert core.sensitive_command(f"grep -r hook {state}{suffix}"), suffix
+    assert core.sensitive_command(f"ls -l {state}") is None
+    assert core.sensitive_command(f"cat {state}/reports/health.md") is None
+
+
+def test_review_read_symlink_sensitive_directory():
+    from agent import tools as agent_tools
+    with tempfile.TemporaryDirectory() as td:
+        secret_dir = Path(td) / ".config" / "gcloud"
+        secret_dir.mkdir(parents=True)
+        secret = secret_dir / "application_default_credentials.json"
+        secret.write_text('{"refresh_token":"directory-alias-sentinel"}')
+        link = Path(td) / "ordinary.json"
+        link.symlink_to(secret)
+        out = agent_tools.dispatch("read", {"path": str(link)}, agent_tools.ToolContext())
+        assert "拒绝" in out and "directory-alias-sentinel" not in out, out
+
+
+def test_review_kubectl_credential_dump_flags():
+    for flag in ("-oyaml", "-ojson", "-o=json", "-ojsonpath={.data}",
+                 "--output=yaml"):
+        cmd = f"kubectl get secret database {flag}"
+        assert core.sensitive_command(cmd), cmd
+        assert core.check(cmd)[0] == 2, cmd
+    for flag in ("-o name", "-oname", "-o=name"):
+        assert core.sensitive_command(f"kubectl get secret database {flag}") is None, flag
+    for flag in ("--raw", "--raw=true"):
+        assert core.sensitive_command(f"kubectl config view {flag}"), flag
+    assert core.sensitive_command("kubectl config view") is None
+
+
+def test_review_kubectl_literal_scope_and_display():
+    for flags in ("--context=''", '--context=""', '--context="$OPS_TEST_CONTEXT"',
+                  '--context=prod --context=stage', '--context=prod -n "$OPS_TEST_NS"'):
+        cmd = f"kubectl apply -f deployment.yaml {flags}"
+        try:
+            core.approve(cmd, ttl_seconds=60)
+        except core.OpsxError:
+            pass
+        else:
+            raise AssertionError(f"empty/dynamic/ambiguous scope was approved: {cmd}")
+    cmd = ("kubectl get pods --context=dev && "
+           "kubectl apply -f deployment.yaml --context=prod -n production")
+    p = core.approve(cmd, ttl_seconds=60)
+    stamp = json.loads(p.read_text())
+    assert stamp["env"]["k8s"] == {"context": "prod", "namespace": "production"}, stamp
+    assert core.check_stamp(cmd)
+    # A previously issued stamp must also fail after scope validation tightens.
+    old = 'kubectl apply -f deployment.yaml --context="$OPS_TEST_CONTEXT"'
+    stamp.update(cmd=old, cmd_hash=core.cmd_hash(old), env=core.resolve_env(old))
+    (p.parent / (core.cmd_hash(old) + ".json")).write_text(json.dumps(stamp))
+    assert not core.check_stamp(old)
+
+
+def test_review_rollback_redacts_before_diff_and_clip():
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "config.txt"
+        body = [f"private-key-body-sentinel-{i}" for i in range(12)]
+        original = ("-----BEGIN PRIVATE KEY-----\n" + "\n".join(body)
+                    + "\n-----END PRIVATE KEY-----\n")
+        f.write_text(original)
+        sid = core.snapshot_file(str(f))
+        f.write_text(original.replace(body[6], "changed-private-key-line"))
+        plan = core.rollback_plan(sid)
+        assert "private-key-body-sentinel" not in json.dumps(plan), plan
+        archived, meta = core.load_snapshot(sid)
+        assert (archived / meta["items"][0]["dest"]).read_text() == original
+        # A long PEM would lose its end marker if clipping happened before redaction.
+        f.write_text("-----BEGIN PRIVATE KEY-----\n" + "long-pem-sentinel\n" * 500
+                     + "-----END PRIVATE KEY-----\n")
+        cmd_sid = core.snapshot_cmd(f"cat {f}")
+        output = core.rollback_plan(cmd_sid)["commands"][0]["output"]
+        assert "long-pem-sentinel" not in output and core.REDACTED in output, output
+
+
+def test_review_exec_rechecks_approval_after_snapshot():
+    import remote
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "config.txt"
+        f.write_text("before")
+        cmd = f"printf changed > {f}"
+        core.approve(cmd, ttl_seconds=60)
+        original = core._snapshot_file_into
+
+        def copy_then_revoke(d, src, items):
+            original(d, src, items)
+            core.revoke(cmd)
+
+        with mock.patch.object(core, "_snapshot_file_into", copy_then_revoke):
+            code, sid, _ = core.exec_change(cmd, snapshot_files=[str(f)])
+        assert code == 2 and sid and f.read_text() == "before"
+        _write_targets()
+        remote_cmd = "systemctl restart snapshot-bound"
+        core.approve(remote_cmd, ttl_seconds=60, target="web1")
+
+        def pull_then_revoke(name, src, d, items):
+            dest = d / "file.txt"
+            dest.write_text("before")
+            items.append({"type": "file", "src": src, "dest": "file.txt"})
+            core.revoke(remote_cmd, target=name)
+
+        with mock.patch.object(remote, "_pull_file", pull_then_revoke), \
+                mock.patch.object(remote, "_ssh") as ssh:
+            code, sid, _ = remote.exec_change("web1", remote_cmd,
+                                               snapshot_files=["/etc/app.conf"])
+        assert code == 2 and sid and not ssh.called
+
+
+def test_review_sensitive_input_redirection():
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            os.chdir(td)
+            Path('.env').write_text('arbitrary-config-sentinel')
+            for cmd in ('cat <.env', 'cat<.env', 'head -c 10 <.env'):
+                assert core.sensitive_command(cmd), cmd
+                assert core.check(cmd)[0] == 2, cmd
+        finally:
+            os.chdir(cwd)
+
+
+# Review regressions: checks
+def test_review_signal_keeps_other_targets_and_unsampled_groups():
+    """分批检查保留其他目标与未采样分组；同项新采样才替换旧状态。"""
+    from agent import checks
+    restore = _with_targets({
+        "web1": {"host": "h1", "services": [{"type": "docker", "name": "api"}]},
+        "db1": {"host": "h2", "services": [{"type": "docker", "name": "db"}]}})
+    original = checks._exec
+    sid = "review-checks-merge"
+    path = checks.signal_path(sid)
+    path.unlink(missing_ok=True)
+    unhealthy = _linux_fake({"cat /proc/meminfo": (0, "MemTotal: 1000 kB\nMemAvailable: 1 kB\n")})
+    checks._exec = unhealthy
+    try:
+        web = checks.run_checks(targets="web1")
+        checks.save_signal(sid, web, "/tmp/web-evidence.md")
+        checks._exec = _linux_fake()
+        db = checks.run_checks(targets="db1")
+        checks.save_signal(sid, db, "/tmp/db-evidence.md")
+        signal = checks.load_signal(sid)
+        assert signal["verdict"] == "异常"
+        assert signal["targets"] == ["web1", "db1"]
+        assert signal["anomalies"][0]["id"] == "web1/resources/内存"
+        assert signal["report_paths"] == ["/tmp/web-evidence.md", "/tmp/db-evidence.md"]
+        assert signal["target_complete"] == {"web1": True, "db1": True}
+        # 只重查服务，不能把此前内存告警丢掉。
+        checks.save_signal(sid, checks.run_checks(targets="web1", groups=["services"]))
+        assert checks.load_signal(sid)["anomalies"][0]["id"] == "web1/resources/内存"
+        checks.save_signal(sid, checks.run_checks(targets="web1", groups=["resources"]))
+        recovered = checks.load_signal(sid)
+        assert recovered["verdict"] == "正常" and not recovered["anomalies"]
+        assert recovered["summary"]["checks"] == 10
+    finally:
+        checks._exec = original
+        path.unlink(missing_ok=True)
+        restore()
+
+
+def test_review_signal_target_completeness_does_not_follow_verdict():
+    """同一目标既有 critical 又有 unknown 时，结论异常不代表采集完整。"""
+    from agent import checks
+    restore = _with_targets({"web1": {"host": "h", "services": [{"type": "docker", "name": "api"}]}})
+    original = checks._exec
+    checks._exec = _linux_fake({"cat /proc/meminfo": (0, "unparseable"),
+                               "docker inspect --format '{{.State.Status}},{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}},{{.RestartCount}}' api":
+                               (0, "exited,none,0\n")})
+    try:
+        report = checks.run_checks(targets="web1")
+        payload = checks._signal_payload(report, None)
+        assert payload["verdict"] == "异常"
+        assert payload["target_verdicts"]["web1"] == "异常"
+        assert payload["target_complete"]["web1"] is False
+    finally:
+        checks._exec = original
+        restore()
+
+
+def test_review_inspect_workflow_share_deadline():
+    """工具里的确定性检查必须收到调度传下来的整任务截止时间。"""
+    from agent import checks, tools as agent_tools
+    original = checks.run_checks
+    called = []
+    def fake(**kwargs):
+        called.append(kwargs.get("deadline"))
+        raise checks.CheckError("test stop")
+    checks.run_checks = fake
+    ctx = agent_tools.ToolContext(deadline=time.monotonic() - 1)
+    try:
+        agent_tools.dispatch("inspect", {}, ctx)
+        agent_tools.dispatch("workflow", {"name": "daily-inspection"}, ctx)
+        assert called == [ctx.deadline, ctx.deadline]
+    finally:
+        checks.run_checks = original
+
+
+def test_review_inspect_preview_preserves_entire_anomaly_list():
+    """输出截断不能静默丢掉第 30K 字符之后的异常，落盘失败时也如此。"""
+    from agent import checks, tools as agent_tools
+    original = checks.run_checks, checks.save_report
+    report = _report_with([_anomaly(id=f"web1/resources/item-{i}", name=f"item-{i}")
+                           for i in range(180)])
+    for item in report["anomalies"]:
+        item["line"] += "X" * 200
+    checks.run_checks = lambda **kwargs: report
+    checks.save_report = lambda *args: None
+    try:
+        result = agent_tools.dispatch("inspect", {}, agent_tools.ToolContext())
+        assert len(result) > agent_tools.OUTPUT_LIMIT
+        assert all(item["line"] in result for item in report["anomalies"])
+        assert "已截断" in result
+    finally:
+        checks.run_checks, checks.save_report = original
+
+
+def test_review_disk_path_rejects_del_control_character():
+    from agent import checks
+    try:
+        checks._norm_checks("web1", {"disk_paths": ["/data\x7f"]})
+        raise AssertionError("DEL 控制字符不应进入探针路径")
+    except checks.CheckError:
+        pass
+
+def test_review_signal_merge_uses_each_targets_sampled_groups():
+    """跨重试会话聚合时，不把别的目标采过的分组当成本目标已采样。"""
+    from agent import checks
+    restore = _with_targets({
+        "web1": {"host": "h1", "services": [{"type": "docker", "name": "api"}]},
+        "db1": {"host": "h2", "services": [{"type": "docker", "name": "db"}]}})
+    original = checks._exec
+    try:
+        checks._exec = _linux_fake({"cat /proc/meminfo": (0, "MemTotal: 1000 kB\nMemAvailable: 1 kB\n")})
+        first = checks._signal_payload(checks.run_checks(targets="web1"), None)
+        checks._exec = _linux_fake()
+        second = checks._merge_signal(
+            checks._signal_payload(checks.run_checks(targets="web1", groups=["connectivity"]), None),
+            checks._signal_payload(checks.run_checks(targets="db1", groups=["resources"]), None))
+        merged = checks._merge_signal(first, second)
+        assert [a["id"] for a in merged["anomalies"]] == ["web1/resources/内存"]
+        assert merged["target_complete"]["db1"] is False
+        assert merged["verdict"] == "异常"
+    finally:
+        checks._exec = original
+        restore()
+
+
+def test_review_signal_rejects_corrupt_merge_metadata():
+    from agent import checks
+    sid = "review-corrupt-metadata"
+    path = checks.signal_path(sid)
+    original = checks._signal_payload(_report_with([_anomaly()]), None)
+    original["session_id"] = sid
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for over in ({"targets": {}}, {"target_groups": {"web1": 1}},
+                     {"target_complete": {"web1": "true"}},
+                     {"check_statuses": {"web1/resources/x": []}},
+                     {"anomalies": ["not an item"]}):
+            path.write_text(json.dumps(dict(original, **over)), encoding="utf-8")
+            assert checks.load_signal(sid) is None, over
+    finally:
+        path.unlink(missing_ok=True)
+
+
+
+def test_review_notify_severity_changes_compare_last_notification():
+    from agent import notify
+    cfg = {'renotify_after': 21600}
+    critical = {'severity': 'critical', 'task_id': 'task1', 'title': 'disk', 'kind': 'check'}
+    warning = dict(critical, severity='warning')
+    fp = 'check:web1/resources/disk'
+    # 首次发送失败，没有人见过告警时，降级不能因冷却而把全部通知丢掉。
+    state = {'items': {}}
+    notify._plan(state, {fp: dict(critical)}, None, {}, 1000, cfg)
+    notify._mark_notified(state, [fp], 1000, 'failed1', delivered=False)
+    items, _, _ = notify._plan(state, {fp: dict(warning)}, None, {}, 1060, cfg)
+    assert len(items) == 1
+    # 已送达 critical 后的稳定 warning 应在抖动窗口结束后通知。
+    state = {'items': {}}
+    notify._plan(state, {fp: dict(critical)}, None, {}, 1000, cfg)
+    notify._mark_notified(state, [fp], 1000, 'sent1', delivered=True)
+    items, _, _ = notify._plan(state, {fp: dict(warning)}, None, {}, 1060, cfg)
+    assert not items
+    items, _, _ = notify._plan(state, {fp: dict(warning)}, None, {}, 1400, cfg)
+    assert len(items) == 1 and items[0]['severity'] == 'warning'
+
+
+def test_review_notify_structured_data_is_redacted_at_exits():
+    from agent import notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        sent = _FakePost()
+        notify._post = sent
+        secret = 'STRUCTURED-SECRET-SENTINEL'
+        notify.process_run({'task_id': 'task1', 'run_id': 'run1', 'status': 'failed',
+                            'error': 'password=' + secret})
+        texts = [json.dumps(sent.calls), (core.STATE_DIR / 'notify-state.json').read_text()]
+        texts.extend(p.read_text() for p in (core.STATE_DIR / 'notifications').glob('*.json'))
+        assert all(secret not in text for text in texts)
+    finally:
+        notify._post = original
+        _clean_notify()
+
+
+def test_schedule_rules_override_model_normal():
+    """结构化异常/未知不能被模型的“正常”覆盖，退出码与记录保持规则结论。"""
+    from unittest.mock import patch
+    from agent import checks, schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60, checks_target="all")
+        for expected, report in (
+                ("异常", _report_with([_anomaly()])),
+                ("警告", _report_with([_anomaly(status="warn")], verdict="警告")),
+                ("不完整", _report_with([], complete=False, verdict="不完整"))):
+            with patch.object(checks, "run_checks", return_value=report), \
+                    patch.object(schedule, "_run_entry", return_value="结论：正常"):
+                rec = schedule._execute_run(entry, None)
+            assert rec["status"] == "succeeded" and rec["verdict"] == expected, rec
+            assert schedule.list_entries()[0]["last_verdict"] == expected
+            assert schedule.runs_exit_code([rec]) == (3 if expected == "不完整" else 2)
+            assert schedule.list_runs()[0]["verdict"] == expected
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_schedule_preset_check_errors_fail_even_if_model_normal():
+    """规则无法执行或摘要写失败是运行失败，提示词不能代替失败状态。"""
+    from unittest.mock import patch
+    from agent import checks, schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60, checks_target="all")
+        with patch.object(checks, "run_checks", side_effect=checks.CheckError("bad target")), \
+                patch.object(schedule, "_run_entry", return_value="结论：正常"):
+            rec = schedule._execute_run(entry, None)
+        assert rec["status"] == "failed" and "规则检查未能执行" in rec["error"]
+        assert schedule.runs_exit_code([rec]) == 1
+        with patch.object(checks, "run_checks", return_value=_report_with([])), \
+                patch.object(checks, "save_signal", return_value=None), \
+                patch.object(schedule, "_run_entry", return_value="结论：正常"):
+            rec = schedule._execute_run(entry, None)
+        assert rec["status"] == "failed" and "摘要写入失败" in rec["error"]
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_schedule_claim_failure_is_a_visible_failed_run():
+    """推进 next_run 写失败时不能冒充“无到期任务”并 exit 0。"""
+    from unittest.mock import patch
+    from agent import schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60)
+        entries = schedule.list_entries()
+        entries[0]["next_run"] = time.time() - 1
+        schedule._save(entries)
+        save, calls = schedule._save, []
+
+        def fail_claim(*args, **kwargs):
+            calls.append(None)
+            if len(calls) == 2:
+                raise OSError("claim write failed")
+            return save(*args, **kwargs)
+
+        with patch.object(schedule, "_save", side_effect=fail_claim), \
+                patch.object(schedule, "_run_entry") as runner:
+            records = schedule.run_due()
+        runner.assert_not_called()
+        assert len(records) == 1 and records[0]["status"] == "failed", records
+        assert "claim write failed" in records[0]["error"]
+        assert schedule.runs_exit_code(records) == 1
+        assert schedule.list_runs(task_id=entry["id"])[0]["status"] == "failed"
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_schedule_successful_runs_have_chronological_pending_notifications():
+    """成功巡检写完结果、发送前崩溃，也必须按发生顺序补发。"""
+    from unittest.mock import patch
+    from agent import schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60)
+        first = schedule._finish_run(schedule._begin_run(entry, None), entry,
+                                     "succeeded", verdict="异常")
+        second = schedule._finish_run(schedule._begin_run(entry, None), entry,
+                                      "succeeded", verdict="正常")
+        pending = schedule._pending_notify_runs()
+        assert [rec["run_id"] for rec in pending] == [first["run_id"], second["run_id"]]
+        seen = []
+        with patch.object(schedule, "_notify_run", side_effect=lambda rec: seen.append(rec["run_id"])):
+            schedule._notify_pending_runs()
+        assert seen == [first["run_id"], second["run_id"]]
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_schedule_retry_keeps_rules_from_other_attempts():
+    """重试会话只查另一目标，不能丢首轮规则异常或其报告路径。"""
+    from unittest.mock import patch
+    from agent import checks, notify, schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60, checks_target="all")
+        seen = []
+
+        def retry(entry, model, session=None, **kwargs):
+            seen.append(session.id)
+            if len(seen) == 1:
+                raise ConnectionError("temporary failure")
+            report = _report_with([_anomaly(id="db1/resources/磁盘 /db", target="db1")])
+            checks.save_signal(session.id, report, "/tmp/retry-db-report.md")
+            return "结论：正常"
+
+        with patch.object(checks, "run_checks", return_value=_report_with([_anomaly()])), \
+                patch.object(schedule, "_run_entry", side_effect=retry), \
+                patch.object(schedule.time, "sleep"):
+            rec = schedule._execute_run(entry, None)
+        assert rec["attempts"] == 2 and rec["verdict"] == "异常", rec
+        assert {a["target"] for a in rec["anomalies"]} == {"web1", "db1"}
+        assert len(rec["rules_report_paths"]) == 2
+        saved = notify._signal_from_record(rec)
+        assert {a["target"] for a in saved["anomalies"]} == {"web1", "db1"}
+        assert rec["session_id"] == seen[-1]
+        _clean_schedules()
+        _clean_notify()
+        entry = schedule.add("巡检", every_seconds=60, checks_target="all")
+        seen.clear()
+        original_save = checks._save_signal_payload
+        written = []
+
+        def fail_aggregate(session_id, payload):
+            written.append(None)
+            return None if len(written) == 3 else original_save(session_id, payload)
+
+        with patch.object(checks, "run_checks", return_value=_report_with([_anomaly()])), \
+                patch.object(checks, "_save_signal_payload", side_effect=fail_aggregate), \
+                patch.object(schedule, "_run_entry", side_effect=retry), \
+                patch.object(schedule.time, "sleep"):
+            rec = schedule._execute_run(entry, None)
+        assert rec["status"] == "failed" and "摘要写入失败" in rec["error"]
+        assert all(saved["status"] != "running" for saved in schedule.list_runs())
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_schedule_prompt_secret_redacted_before_truncation_and_storage():
+    """任务提示也是常规记录，长私钥必须先脱敏再进入审计/运行摘要。"""
+    from agent import schedule
+    _clean_schedules()
+    private = "SCHEDULE-PRIVATE-SENTINEL" * 40
+    prompt = f"排查\n-----BEGIN PRIVATE KEY-----\n{private}\n-----END PRIVATE KEY-----"
+    try:
+        entry = schedule.add(prompt, every_seconds=60)
+        run = schedule._begin_run(entry, None)
+        text = schedule._file().read_text() + (schedule._runs_dir() / f"{run['run_id']}.json").read_text()
+        text += (core.STATE_DIR / "audit.jsonl").read_text()
+        assert "SCHEDULE-PRIVATE-SENTINEL" not in text
+        assert core.REDACTED in text
+        assert schedule._file().stat().st_mode & 0o777 == 0o600
+        success = schedule._finish_run(run, entry, "succeeded", verdict="正常")
+        previous = schedule.list_entries()[0]["last_success"]
+        schedule._finish_run(schedule._begin_run(entry, None), entry, "failed", error="failed")
+        assert schedule.list_entries()[0]["last_success"] == previous
+    finally:
+        _clean_schedules()
+
+
+def test_run_turn_deadline_stops_remaining_calls_in_same_reply():
+    """同一次模型回复里的工具也受预算约束，未执行调用要有明确协议记录。"""
+    from unittest.mock import patch
+    from agent import loop, session as sessions, tools as agent_tools
+    session = sessions.Session()
+    ctx = agent_tools.ToolContext(deadline=time.monotonic() + 100)
+    calls = [{"id": f"call-{i}", "type": "function",
+              "function": {"name": "bash", "arguments": '{"command":"uname"}'}}
+             for i in range(3)]
+    msg = {"role": "assistant", "content": "检查中", "tool_calls": calls}
+    seen = []
+
+    def dispatch(name, args, context):
+        seen.append(name)
+        context.deadline = time.monotonic() - 1
+        return "[exit=0] Linux"
+
+    with patch.object(loop.llm, "chat", return_value=msg), \
+            patch.object(agent_tools, "dispatch", side_effect=dispatch):
+        text = loop.run_turn("检查", session, ctx, max_turns=1)
+    assert seen == ["bash"] and loop.DEADLINE_MARK in text
+    results = [m for m in session.messages if m["role"] == "tool"]
+    assert len(results) == 3 and all("工具未执行" in m["content"] for m in results[1:])
+
+
+def test_rpc_and_print_mode_errors_redact_credentials():
+    """LLM 异常体可能回显凭据，RPC 与单发错误出口同样脱敏。"""
+    import runpy
+    from unittest.mock import patch
+    from agent import loop, rpc
+    secret = "sk-ERRORSENTINEL0123456789abcdef"
+    request = {"jsonrpc": "2.0", "id": 1, "method": "prompt", "params": {"text": "检查"}}
+    stdout = io.StringIO()
+    with patch.object(sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+            patch.object(sys, "stdout", stdout), \
+            patch.object(loop, "run_turn", side_effect=loop.llm.LLMError(f"api_key={secret}")):
+        rpc.serve()
+    assert secret not in stdout.getvalue() and core.REDACTED in stdout.getvalue()
+    script = runpy.run_path(str(Path(__file__).resolve().parent / "opsagent"))
+    stderr = io.StringIO()
+    with patch.object(sys, "stderr", stderr), \
+            patch.object(loop, "run_turn", side_effect=loop.llm.LLMError(f"api_key={secret}")):
+        assert script["_print_mode"]("检查", None) == 1
+    assert secret not in stderr.getvalue() and core.REDACTED in stderr.getvalue()
+
+
+def test_schedule_processing_error_is_retried_after_config_is_fixed():
+    """通知配置/状态处理失败尚无发件箱，修复后仍要补处理原运行。"""
+    from unittest.mock import patch
+    from agent import notify, schedule
+    _clean_schedules()
+    _clean_notify()
+    try:
+        entry = schedule.add("巡检", every_seconds=60)
+        rec = schedule._finish_run(schedule._begin_run(entry, None), entry,
+                                   "succeeded", verdict="异常")
+        with patch.object(notify, "process_run", return_value={"error": "bad config"}):
+            schedule._notify_run(rec)
+        assert rec["status"] == "succeeded" and rec["notify_status"] == "error"
+        assert schedule._pending_notify_runs() == []  # 失败旁路有退避，不能每秒处理。
+        future = time.time() + 61
+        with patch.object(schedule.time, "time", return_value=future), \
+                patch.object(notify, "process_run", return_value={"configured": False}) as process:
+            schedule._notify_pending_runs()
+        assert process.call_count == 1
+        saved = schedule.list_runs()[0]
+        assert saved["status"] == "succeeded" and saved["notify_status"] == "none"
+        assert not saved.get("notify_error") and schedule._pending_notify_runs() == []
+    finally:
+        _clean_schedules()
+        _clean_notify()
+
+
+def test_review_kubectl_auth_reconcile_requires_context():
+    assert core._kubectl_read_only('kubectl auth can-i get pods')
+    assert core._kubectl_read_only('kubectl auth whoami')
+    assert not core._kubectl_read_only('kubectl auth reconcile -f roles.yaml')
+    try:
+        core.approve('kubectl auth reconcile -f roles.yaml')
+        raise AssertionError('RBAC 写操作必须显式绑定 context')
+    except core.OpsxError:
+        pass
+
+
+def test_review_notify_old_runs_cannot_overwrite_new_observations():
+    from agent import checks, notify
+    original = notify._post
+    try:
+        _clean_notify()
+        _notify_setup()
+        sent = _FakePost()
+        notify._post = sent
+        now = time.time()
+        healthy = checks._signal_payload(_report_with([], verdict='正常'), None)
+        unhealthy = checks._signal_payload(_report_with([_anomaly()]), None)
+        new = {'task_id': 'task-new', 'run_id': 'new', 'finished_ts': now,
+               'status': 'succeeded', 'verdict': '正常'}
+        old = {'task_id': 'task-old', 'run_id': 'old', 'finished_ts': now - 60,
+               'status': 'succeeded', 'verdict': '异常'}
+        # 健康时没有告警指纹，仍要记住已采样，挡住其他任务迟到的旧告警。
+        assert notify.process_run(new, signal=healthy)['notification'] is None
+        assert notify.process_run(old, signal=unhealthy)['notification'] is None
+        assert not sent.calls
+        # 新异常不能被旧健康报告恢复；新恢复后也不能由旧异常重新打开。
+        new.update(finished_ts=now + 1, verdict='异常')
+        notify.process_run(new, signal=unhealthy)
+        assert len(sent.calls) == 1
+        old['verdict'] = '正常'
+        assert notify.process_run(old, signal=healthy)['notification'] is None
+        new.update(finished_ts=now + 2, verdict='正常')
+        notify.process_run(new, signal=healthy)
+        assert len(sent.calls) == 2
+        old['verdict'] = '异常'
+        assert notify.process_run(old, signal=unhealthy)['notification'] is None
+        assert len(sent.calls) == 2
+    finally:
+        notify._post = original
         _clean_notify()
 
 

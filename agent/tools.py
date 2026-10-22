@@ -44,7 +44,7 @@ class ToolContext:
     model：父代理使用的模型，子代理沿用（--model 覆盖时保持一致）。
     session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
     goal_continuation：只有 REPL 会跨轮续跑，-p/RPC/定时任务为 False。
-    deadline：整任务时间预算（time.monotonic 秒），None = 不设限；轮次边界停止。
+    deadline：整任务时间预算（time.monotonic 秒），None = 不设限；到点不再启动后续调用。
     """
 
     def __init__(self, ask_user=None, allowed: set[str] | None = None,
@@ -153,7 +153,7 @@ def _read(args: dict, ctx: ToolContext) -> str:
     except OSError:
         real = path
     if (core.sensitive_path(str(path)) or core.sensitive_dir(str(path))
-            or core.sensitive_path(str(real))):
+            or core.sensitive_path(str(real)) or core.sensitive_dir(str(real))):
         return ("[opsx 拒绝] 该文件是私钥/凭据/敏感配置，不读取到模型上下文。"
                 "确认存在与权限请用 bash 的 ls -l。")
     try:
@@ -413,7 +413,8 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
     """确定性检查工具：规则结论不依赖模型，报告全文落盘。"""
     try:
         report = checks.run_checks(targets=args.get("targets") or "all",
-                                   groups=args.get("groups") or None)
+                                   groups=args.get("groups") or None,
+                                   deadline=ctx.deadline)
     except checks.CheckError as e:
         return f"[检查错误] {e}"
     text = checks.format_report(report)
@@ -424,7 +425,10 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
         tail = (f"\n...[报告共 {len(text)} 字符，已截断；完整内容: {path}"
                 "（用 read 的 offset/limit 分段读取）]" if path else
                 f"\n...[报告共 {len(text)} 字符，已截断；报告未能落盘]")
-        return text[:OUTPUT_LIMIT] + tail
+        # 异常清单是判断依据，不能被正常项表格或固定字符数挤掉。
+        summary_end = text.find("\n\n## ", text.find("## 全部异常与未采集项"))
+        keep = max(OUTPUT_LIMIT, summary_end) if summary_end != -1 else OUTPUT_LIMIT
+        return text[:keep] + tail
     return f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
 
 
@@ -460,7 +464,8 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
         # 固定检查先跑：不调用模型，API 完全不可用时报告仍然成立。
         try:
             report = checks.run_checks(targets=wf["checks"]["targets"],
-                                       groups=wf["checks"]["groups"])
+                                       groups=wf["checks"]["groups"],
+                                       deadline=ctx.deadline)
             checks_text = checks.format_report(report)
         except checks.CheckError as e:
             checks_note = str(e)

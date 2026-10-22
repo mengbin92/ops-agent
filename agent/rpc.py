@@ -166,4 +166,4 @@ def serve(model: str | None = None) -> None:
             peer.send({"jsonrpc": "2.0", "id": msg_id, "result": result})
         except Exception as e:  # noqa: BLE001 —— 单条消息异常不崩循环
             peer.send({"jsonrpc": "2.0", "id": msg_id,
-                       "error": {"code": -32603, "message": str(e)}})
+                       "error": {"code": -32603, "message": tools.core.redact(str(e))}})

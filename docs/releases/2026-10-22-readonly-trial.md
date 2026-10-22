@@ -17,7 +17,9 @@
 | 事件时间线 | `opsagent events` | 异常/恢复/通知/运行状态变化，只记状态变化；跨轮转可查 |
 | 只读安全边界 | `core.check` + `read` | R0 白名单、写操作需审批、敏感文件（含 `notify.json`、整个 `~/.ops-agent`）不读进模型 |
 
-验收自检：`./opsx selftest` → **206/206 passed**。
+交付自检：`./opsx selftest` → **206/206 passed**；同日[路线图对照复审](../reviews/2026-10-22-roadmap-implementation-review.md)
+修复后为 **241/241 passed**。本次涉及巡检摘要、调度结论与通知状态机，属于重大修复；
+真实环境试运行仍未开始，接入后须从修复版本连续观察 7 天。
 
 ## 2. 试用版怎么装
 

@@ -323,7 +323,15 @@ def _load_state_checked() -> tuple[dict, bool]:
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, dict):
         return {"version": 1, "items": {}}, False
-    return {"version": 1, "items": items}, True
+    if any(not isinstance(entry, dict)
+           or entry.get("severity") not in (None, *SEVERITY_RANK)
+           or entry.get("notified_severity") not in (None, *SEVERITY_RANK)
+           for entry in items.values()):
+        return {"version": 1, "items": {}}, False
+    observations = data.get("observations", {})
+    if not isinstance(observations, dict) or any(_finite(ts) is None for ts in observations.values()):
+        return {"version": 1, "items": {}}, False
+    return {"version": 1, "items": items, "observations": observations}, True
 
 
 def _load_state() -> dict:
@@ -344,7 +352,7 @@ def _write_private(path: Path, text: str) -> None:
 
 def _save_state(state: dict) -> None:
     core._ensure_state_dir()
-    _write_private(_state_path(), json.dumps(state, ensure_ascii=False, indent=2))
+    _write_private(_state_path(), json.dumps(core.redact_obj(state), ensure_ascii=False, indent=2))
 
 
 def _prune_state(state: dict, now: float) -> None:
@@ -357,6 +365,10 @@ def _prune_state(state: dict, now: float) -> None:
         last = _finite(entry.get("last_seen"), 0) or 0
         if entry.get("severity") is None and now - last > STATE_KEEP_SECONDS:
             items.pop(fp, None)
+    observations = state.get("observations") or {}
+    for scope, ts in list(observations.items()):
+        if now - ts > STATE_KEEP_SECONDS:
+            observations.pop(scope, None)
 
 
 def _new_notification_id() -> str:
@@ -368,7 +380,7 @@ def _write_notification(notif: dict) -> None:
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(directory, 0o700)
     _write_private(directory / f"{notif['id']}.json",
-                   json.dumps(notif, ensure_ascii=False, indent=2))
+                   json.dumps(core.redact_obj(notif), ensure_ascii=False, indent=2))
 
 
 def _prune_notifications(keep: int = NOTIF_KEEP) -> None:
@@ -388,9 +400,29 @@ def _read_notification(path: Path) -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+    if not isinstance(data, dict) or data.get("id") != path.stem:
         return None
     if data.get("status") not in NOTIF_STATUSES:
+        return None
+    if type(data.get("attempts")) is not int or data["attempts"] < 0:
+        return None
+    if any(not isinstance(data.get(key, []), list)
+           or any(not isinstance(item, dict) for item in data.get(key, []))
+           for key in ("items", "recoveries")):
+        return None
+    if not isinstance(data.get("fingerprints", []), list) or any(
+            not isinstance(fp, str) for fp in data.get("fingerprints", [])):
+        return None
+    if any(not isinstance(item.get("fingerprint"), str)
+           for key in ("items", "recoveries") for item in data.get(key, [])):
+        return None
+    if any(not isinstance(item.get("severity"), str)
+           or item["severity"] not in SEVERITY_RANK for item in data.get("items", [])):
+        return None
+    if any(not isinstance(item.get("title"), str) for item in data.get("recoveries", [])):
+        return None
+    if "report_paths" in data and (not isinstance(data["report_paths"], list)
+                                  or any(not isinstance(p, str) for p in data["report_paths"])):
         return None
     return data
 
@@ -461,6 +493,7 @@ def build_payload(cfg: dict, notif: dict) -> dict:
         "task_id": notif.get("task_id"),
         "session_id": notif.get("session_id"),
         "report_path": notif.get("report_path"),
+        "report_paths": notif.get("report_paths") or [],
         "items": notif.get("items") or [],
         "recoveries": notif.get("recoveries") or [],
         "timestamp": notif.get("created"),
@@ -485,15 +518,15 @@ def _response_error(fmt: str, body: str) -> str | None:
     if not isinstance(data, dict):
         return None
     if fmt == "dingtalk" and data.get("errcode") not in (None, 0, "0"):
-        return f"钉钉返回 errcode={data.get('errcode')}: {data.get('errmsg') or ''}"[:200]
+        return f"钉钉返回 errcode={data.get('errcode')}: {data.get('errmsg') or ''}"
     if fmt == "feishu":
         code = data.get("code", data.get("StatusCode"))
         if code not in (None, 0, "0"):
-            return f"飞书返回 code={code}: {data.get('msg') or ''}"[:200]
+            return f"飞书返回 code={code}: {data.get('msg') or ''}"
     if data.get("ok") is False or data.get("success") is False:
-        return f"渠道返回失败: {data.get('error') or data.get('message') or body[:120]}"[:200]
+        return f"渠道返回失败: {data.get('error') or data.get('message') or body}"
     if fmt == "generic" and isinstance(data.get("error"), str) and data["error"]:
-        return f"渠道返回 error: {data['error']}"[:200]
+        return f"渠道返回 error: {data['error']}"
     return None
 
 
@@ -524,20 +557,34 @@ def _backoff(attempts: int) -> int:
     return min(RETRY_MAX, RETRY_BASE * (2 ** max(0, attempts - 1)))
 
 
+def _safe_error(cfg: dict, message: str) -> str:
+    # 渠道可能在错误中回显 URL、path 或 token；这些已知凭据不能只依赖通用正则。
+    url = cfg["url"]
+    parts = urllib.parse.urlsplit(url)
+    secrets = [url, parts.path, parts.query]
+    secrets += parts.path.split("/")
+    secrets += [v for _, v in urllib.parse.parse_qsl(parts.query)]
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret and secret != "/":
+            message = message.replace(secret, core.REDACTED)
+            message = message.replace(urllib.parse.unquote(secret), core.REDACTED)
+    return core.redact(message)[:300]
+
+
 def _deliver(cfg: dict, notif: dict) -> dict:
     """发送并回写结果（调用方持有 notify.mutex）。"""
     notif["attempts"] = int(notif.get("attempts") or 0) + 1
     notif["last_attempt_iso"] = _now_iso()
     try:
-        status, body = _post(cfg["url"], build_payload(cfg, notif),
+        status, body = _post(cfg["url"], core.redact_obj(build_payload(cfg, notif)),
                              cfg.get("timeout_seconds", DEFAULT_TIMEOUT))
     except NotifyError as e:
-        notif.update({"status": "failed", "last_error": core.redact(str(e))[:300],
+        notif.update({"status": "failed", "last_error": _safe_error(cfg, str(e)),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
         return notif
     except Exception as e:  # noqa: BLE001 —— 发送路径不能把异常抛给巡检
         notif.update({"status": "failed",
-                      "last_error": core.redact(f"{type(e).__name__}: {e}")[:300],
+                      "last_error": _safe_error(cfg, f"{type(e).__name__}: {e}"),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
         return notif
     channel_error = _response_error(cfg.get("format", DEFAULT_FORMAT), body) \
@@ -547,13 +594,47 @@ def _deliver(cfg: dict, notif: dict) -> dict:
                       "sent_iso": _now_iso(), "last_error": None, "next_attempt_ts": 0})
     elif channel_error is not None:
         notif.update({"status": "failed", "http_status": status,
-                      "last_error": core.redact(channel_error)[:300],
+                      "last_error": _safe_error(cfg, channel_error),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
     else:
         notif.update({"status": "failed", "http_status": status,
-                      "last_error": f"HTTP {status}: {core.redact(body)[:200]}",
+                      "last_error": _safe_error(cfg, f"HTTP {status}: {body}"),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
     return notif
+
+
+def _refresh_notification(notif: dict, state: dict, now: float) -> bool:
+    """重试前重建仍有效的项目，避免聚合消息里夹带已恢复/已被替代的旧状态。"""
+    entries = state.get("items") or {}
+    items, recoveries = [], []
+    for recovery, source, dest in ((False, notif.get("items") or [], items),
+                                   (True, notif.get("recoveries") or [], recoveries)):
+        for item in source:
+            entry = entries.get(item.get("fingerprint"))
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("notification_id", notif["id"]) != notif["id"]:
+                continue
+            if recovery:
+                valid = bool(entry.get("pending_recovery"))
+            else:
+                valid = (item.get("transient") or
+                         (entry.get("severity") == item.get("severity")
+                          and entry.get("severity") is not None
+                          and not entry.get("pending_recovery")))
+            if valid:
+                dest.append(item)
+    if not items and not recoveries:
+        # 兼容旧发件箱中仅有 fingerprints、没有结构化项目的记录。
+        if not notif.get("items") and not notif.get("recoveries"):
+            fps = notif.get("fingerprints") or []
+            return not fps or any(isinstance(entries.get(fp), dict)
+                                  and entries[fp].get("severity") is not None for fp in fps)
+        return False
+    notif.update(_compose(items, recoveries, notif, now))
+    notif["fingerprints"] = [i["fingerprint"] for i in items + recoveries]
+    notif["kind"] = "mixed" if items and recoveries else "anomaly" if items else "recovery"
+    return True
 
 
 def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
@@ -565,8 +646,6 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
     done = []
     with _locked("notify.mutex"):
         state, trusted = _load_state_checked()
-        open_fps = {fp for fp, entry in (state.get("items") or {}).items()
-                    if isinstance(entry, dict) and entry.get("severity") is not None}
         candidates = [n for n in _all_notifications() if n.get("status") == "failed"]
         if notif_id:
             candidates = [n for n in candidates if n["id"] == notif_id]
@@ -579,8 +658,7 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
             candidates.sort(key=lambda n: _finite(n.get("created"), 0) or 0)
             candidates = candidates[:limit]
         for notif in candidates:
-            fps = [f for f in (notif.get("fingerprints") or []) if isinstance(f, str)]
-            if trusted and fps and not any(fp in open_fps for fp in fps):
+            if trusted and not _refresh_notification(notif, state, now):
                 # 告警都已经恢复了再补发旧告警，会变成"先恢复、后又报异常"的乱序
                 notif.update({"status": "superseded", "superseded_at": now,
                               "last_error": None})
@@ -589,11 +667,14 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
                               title=notif.get("title"), reason="已恢复或被更新的通知取代")
                 done.append(notif)
                 continue
+            fps = [f for f in (notif.get("fingerprints") or []) if isinstance(f, str)]
             reason = _suppression_reason(cfg, notif.get("severity") or "warning", now)
             if reason:
                 # 用户明确静默/停用期间不补发：否则"静默"形同虚设
                 notif.update({"status": "muted", "muted_reason": reason})
                 _write_notification(notif)
+                _mark_muted(state, fps, now)
+                _save_state(state)
                 events.append("notify-muted", reason=reason, title=notif.get("title"),
                               notification=notif["id"])
                 done.append(notif)
@@ -601,6 +682,15 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
             _deliver(cfg, notif)
             _write_notification(notif)
             ok = notif["status"] == "sent"
+            if ok:
+                _mark_notified(state, fps, now, notif["id"], delivered=True)
+                recovered = [r["fingerprint"] for r in notif.get("recoveries") or []]
+                _mark_recovered(state, recovered, now)
+                _save_state(state)
+                for item in notif.get("recoveries") or []:
+                    events.append("anomaly-recovered", fingerprint=item["fingerprint"],
+                                  title=item.get("title"), task=notif.get("task_id"),
+                                  run=notif.get("run_id"))
             events.append("notify-retry-sent" if ok else "notify-retry-failed",
                           notification=notif["id"], title=notif.get("title"),
                           attempts=notif.get("attempts"), error=notif.get("last_error"))
@@ -715,13 +805,16 @@ def _recoverable(fp: str, signal: dict | None, rec: dict) -> bool:
         group = parts[1] if len(parts) > 1 else ""
         if target not in (signal.get("targets") or []):
             return False  # 本次根本没查这个目标（inspect --target web1 证明不了 db1）
+        target_complete = (signal.get("target_complete") or {}).get(target)
+        if target_complete is not None:
+            return target_complete is True
         groups = signal.get("groups") or []
         if group and groups and group not in groups:
             return False  # 只跑了部分分组：没跑的组不能判恢复
         # 按目标判定：别的目标不可达不该拖住本目标的恢复
         verdict = (signal.get("target_verdicts") or {}).get(target)
         if verdict is not None:
-            return verdict != "不完整"
+            return verdict == "正常"
         return signal.get("complete") is True
     if fp.startswith("run:"):
         return rec.get("status") == "succeeded"
@@ -729,6 +822,22 @@ def _recoverable(fp: str, signal: dict | None, rec: dict) -> bool:
         return False
     return (rec.get("status") == "succeeded" and rec.get("verdict") == "正常"
             and (signal is None or signal.get("complete") is True))
+
+
+def _observation_ts(rec: dict, now: float) -> float:
+    return _finite(rec.get("finished_ts"), _finite(rec.get("started_ts"), now))
+
+
+def _observation_scope(fp: str) -> str:
+    if fp.startswith("check:"):
+        return "/".join(fp.split("/", 2)[:2])
+    return "task:" + fp.split(":", 1)[-1]
+
+
+def _older_observation(state: dict, fp: str, rec: dict, now: float) -> bool:
+    return (not fp.startswith("missed:") and
+            (state.get("observations") or {}).get(_observation_scope(fp), 0)
+            > _observation_ts(rec, now))
 
 
 def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
@@ -740,16 +849,20 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
     counts = {"suppressed": 0, "new": 0, "escalated": 0, "changed": 0,
               "reminder": 0, "recovered": 0, "cleared": 0}
     for fp, item in current.items():
+        if _older_observation(state, fp, rec, now):
+            counts["suppressed"] += 1
+            continue
         prev = items.get(fp) if isinstance(items.get(fp), dict) else None
         prev_sev = prev.get("severity") if prev else None
         last_notified = _finite(prev.get("notified_at"), None) if prev else None
         if prev is None or prev_sev is None:
             action = "new"
-        elif prev_sev != item["severity"]:
+        elif (prev.get("notified_severity") or prev_sev) != item["severity"]:
             # 级别变化（含 critical → unknown 这种"测不到了"）要告诉人；
             # 但"往回变"太频繁就是抖动：5 分钟内不高于上次已通知级别就不发。
             notified_sev = prev.get("notified_severity") or prev_sev
             flapping = (last_notified is not None
+                        and _finite(prev.get("delivered_at", last_notified), None) is not None
                         and now - last_notified < MIN_CHANGE_GAP
                         and SEVERITY_RANK.get(item["severity"], 1)
                         <= SEVERITY_RANK.get(notified_sev, 1))
@@ -767,10 +880,6 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
             action = "reminder"
         else:
             action = "suppressed"
-        if action == "suppressed":
-            counts["suppressed"] += 1
-            continue
-        counts[action] += 1
         entry = dict(prev or {})
         reopened = prev is None or prev_sev is None
         entry.update({"severity": item["severity"], "last_seen": now,
@@ -778,8 +887,17 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
                       (_finite(entry.get("first_seen"), now) or now),
                       "task_id": item["task_id"], "title": item["title"],
                       "kind": item.get("kind")})
+        if reopened:
+            entry["delivered_at"] = None
+            entry.pop("notified_at", None)
+            entry.pop("muted_at", None)
         entry.pop("recovered_at", None)
         entry.pop("pending_recovery", None)
+        items[fp] = entry
+        if action == "suppressed":
+            counts["suppressed"] += 1
+            continue
+        counts[action] += 1
         item["action"] = action
         item["fingerprint"] = fp
         to_send.append(item)
@@ -795,10 +913,12 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
         scope = fp.split(":", 1)[1] if fp.startswith(("run:", "task:")) else None
         if scope is not None and scope != rec.get("task_id"):
             continue
+        if _older_observation(state, fp, rec, now):
+            continue
         if not _recoverable(fp, signal, rec):
             continue
         counts["recovered"] += 1
-        if _finite(entry.get("notified_at"), None) is None:
+        if _finite(entry.get("delivered_at", entry.get("notified_at")), None) is None:
             # 从没真正告诉过用户（未配置/停用/静默期间发现的）：静默清状态，
             # 不发"恢复"——否则会推一条"X 已恢复"，而对方根本不知道 X 曾经坏过。
             entry["severity"] = None
@@ -842,8 +962,14 @@ def _compose(items: list, recoveries: list, rec: dict, now: float) -> dict:
         "",
     ]
     tail = []
-    if rec.get("report_path"):
-        tail.append(f"报告: {rec['report_path']}（含命令与完整输出）")
+    report_paths = list(dict.fromkeys((rec.get("report_paths") or [])
+                                     + ([rec["report_path"]] if rec.get("report_path") else [])))
+    for path in report_paths:
+        line = f"报告: {path}（含命令与完整输出）"
+        if sum(len(part) + 1 for part in tail) + len(line) > TEXT_LIMIT // 2:
+            tail.append(f"（共 {len(report_paths)} 份报告，全部路径见运行记录）")
+            break
+        tail.append(line)
     tail.append(f"追溯: opsagent schedule runs --id {rec.get('task_id') or ''}".rstrip()
                 + "｜opsagent events --tail 20")
     head_text, tail_text = "\n".join(head), "\n".join(tail)
@@ -900,9 +1026,11 @@ def _compose(items: list, recoveries: list, rec: dict, now: float) -> dict:
     return {"severity": severity, "title": title, "text": text,
             "items": [{"fingerprint": i.get("fingerprint"), "severity": i["severity"],
                        "title": i.get("title"), "line": i.get("line"),
-                       "command": i.get("command")} for i in items[:ANOMALY_LIMIT]],
-            "recoveries": [{"fingerprint": r["fingerprint"], "title": r["title"]}
-                           for r in recoveries[:ANOMALY_LIMIT]]}
+                       "command": i.get("command"), "output": i.get("output"),
+                       "transient": bool(i.get("transient"))} for i in items],
+            "recoveries": [{"fingerprint": r["fingerprint"], "title": r["title"],
+                            "first_seen": r.get("first_seen")}
+                           for r in recoveries]}
 
 
 def _suppression_reason(cfg: dict, severity: str, now: float) -> str | None:
@@ -942,6 +1070,8 @@ def forget_task(task_id: str) -> int:
                     and fp.split(":", 1)[1] == task_id:
                 items.pop(fp, None)
                 removed += 1
+        if state.get("observations", {}).pop(f"task:{task_id}", None) is not None:
+            removed += 1
         if removed:
             try:
                 _save_state(state)
@@ -982,12 +1112,17 @@ def _mark_muted(state: dict, fingerprints: list, now: float, touch: bool = True)
     return changed
 
 
-def _mark_notified(state: dict, fingerprints: list, now: float) -> None:
+def _mark_notified(state: dict, fingerprints: list, now: float,
+                   notification_id: str, delivered: bool) -> None:
     items = state.get("items") or {}
     for fp in fingerprints:
         entry = items.get(fp)
         if isinstance(entry, dict):
             entry["notified_at"] = now
+            entry["notification_id"] = notification_id
+            entry.setdefault("delivered_at", None)
+            if delivered:
+                entry["delivered_at"] = now
             entry["notified_severity"] = entry.get("severity")
             entry["needs_notify"] = False
             entry["event_severity"] = entry.get("severity")
@@ -1039,6 +1174,8 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
         result["error"] = str(e)
         _config_error(str(e), now)
     signal = signal if signal is not None else _signal_from_record(rec)
+    rec = dict(rec, report_paths=(signal or {}).get("report_paths")
+               or rec.get("rules_report_paths") or [])
     current = _current_items(rec, signal)
     with _locked("notify.mutex"):
         state = _load_state()
@@ -1046,7 +1183,19 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
         result["actions"] = counts
         items_state = state.get("items") or {}
         # 静默清掉的"从没通知过"的条目也要落盘，否则下一轮会重复清
-        dirty = counts.get("cleared", 0) > 0
+        dirty = bool(current) or counts.get("cleared", 0) > 0
+        # 补发积压或配置修复后的旧记录，不能覆盖后来观测到的异常/恢复。
+        observed = _observation_ts(rec, now)
+        scopes = [] if rec.get("status") == "missed" else [f"task:{rec.get('task_id') or '?'}"]
+        for target in (signal or {}).get("targets") or []:
+            groups = ((signal or {}).get("target_groups") or {}).get(target,
+                      (signal or {}).get("groups") or [])
+            scopes += [f"check:{target}/{group}" for group in groups]
+        observations = state.setdefault("observations", {})
+        for scope in scopes:
+            if observed > observations.get(scope, 0):
+                observations[scope] = observed
+                dirty = True
         for item in to_send:
             entry = items_state.get(item["fingerprint"]) or {}
             previous_event = entry.get("event_severity")
@@ -1082,13 +1231,14 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
                 "recoveries": composed["recoveries"],
                 "task_id": rec.get("task_id"), "run_id": rec.get("run_id"),
                 "session_id": rec.get("session_id"), "report_path": rec.get("report_path"),
+                "report_paths": rec.get("report_paths") or [],
                 "fingerprints": fingerprints,
                 "endpoint": redact_endpoint(cfg.get("url", "")) if cfg else None,
                 "status": "failed", "attempts": 0, "last_error": None,
                 "next_attempt_ts": 0, "http_status": None,
             }
             if reason in (None, "unconfigured", "disabled"):
-                delivered = reason != "unconfigured" and reason != "disabled"
+                delivered = reason in ("unconfigured", "disabled")
                 if reason is None:
                     _deliver(cfg, notif)
                     _store_notification(notif, result)
@@ -1098,7 +1248,8 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
                                   title=composed["title"], attempts=notif["attempts"],
                                   error=notif.get("last_error"), endpoint=notif["endpoint"],
                                   task=rec.get("task_id"), run=rec.get("run_id"))
-                    _mark_notified(state, fingerprints, now)
+                    _mark_notified(state, fingerprints, now, notif["id"],
+                                   delivered=notif["status"] == "sent")
                     dirty = True
                     delivered = notif["status"] == "sent"
                 else:

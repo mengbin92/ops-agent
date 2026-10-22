@@ -276,10 +276,16 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
             _write_meta(d, sid, name, items)
         except (RemoteError, OSError, subprocess.SubprocessError) as e:
             shutil.rmtree(d, ignore_errors=True)
-            output = f"[opsx] 远程快照失败，已中止执行: {e}"
+            output = core.redact(f"[opsx] 远程快照失败，已中止执行: {e}")
             print(output, file=sys.stderr)
             core.audit("exec-abort", cmd=cmd, target=name, reason=str(e))
             return 3, None, output
+    if sid:
+        code, msg = core.check(cmd, target=name)
+        if code != 0:
+            core.audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
+                       reason="快照后审批失效")
+            return code, sid, msg
     try:
         r = _ssh(name, cmd, timeout=timeout)
         output = core.redact(_text(r))

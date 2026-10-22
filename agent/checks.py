@@ -88,7 +88,7 @@ TARGET_FIELDS = ("host", "user", "port", "identity", "options", "connect_timeout
 
 # 绝对路径：允许空格与非 ASCII（"/Volumes/My Disk" 是真实挂载点），
 # 拒绝控制字符；命令侧仍用 shlex.quote，且写标记检查对原始段生效。
-_PATH_RE = re.compile(r"^/[^\x00-\x1f]*$")
+_PATH_RE = re.compile(r"^/[^\x00-\x1f\x7f]*$")
 MAX_PATH_LEN = 500
 # 服务名/容器名会拼进 shell 命令：只允许保守字符集，且不能以 '-' 开头（避免被当选项）。
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]*$")
@@ -1110,6 +1110,19 @@ def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
     all_anomalies = report.get("anomalies") or []
     target_verdicts = {tr.get("name"): tr.get("verdict")
                        for tr in report.get("targets") or [] if isinstance(tr, dict)}
+    groups = report.get("groups") or []
+    target_groups = {name: list(groups) for name in report.get("target_names") or []}
+    check_statuses = {key: check.get("status") for key, check in evidence.items()}
+    target_complete = {
+        tr.get("name"): (set(groups) == set(GROUPS)
+                         and tr.get("verdict") not in ("不完整", "未完整检查")
+                         and not any(c.get("status") in (UNKNOWN, ERROR)
+                                     for c in tr.get("checks") or []))
+        for tr in report.get("targets") or [] if isinstance(tr, dict)
+    }
+    for name in report.get("target_names") or []:
+        target_complete.setdefault(name, report.get("complete") is True
+                                   and set(groups) == set(GROUPS))
     return {
         "version": 1,
         "created_ts": time.time(),
@@ -1120,12 +1133,72 @@ def _signal_payload(report: dict, report_path: Path | str | None) -> dict:
         "groups": report.get("groups") or [],
         "targets": report.get("target_names") or [],
         "target_verdicts": target_verdicts,
+        "target_groups": target_groups,
+        "target_complete": target_complete,
+        "check_statuses": check_statuses,
         "summary": report.get("summary") or {},
         "report_path": str(report_path) if report_path else None,
+        "report_paths": [str(report_path)] if report_path else [],
         "anomalies": anomalies,
         # 摘要自身也可能被 100 条上限截断：此时"没看到"不等于"不存在"，禁止判恢复
         "truncated": len(all_anomalies) > len(anomalies),
     }
+
+
+def _merge_signal(previous: dict, current: dict) -> dict:
+    """同一会话可以分批巡检；只替换这次实际采样的目标与分组。"""
+    targets, groups = set(current["targets"]), set(current["groups"])
+
+    def sampled(key):
+        parts = key.split("/", 2)
+        picked = current["target_groups"].get(parts[0], groups)
+        return len(parts) > 1 and parts[0] in targets and parts[1] in picked
+
+    old_statuses = previous.get("check_statuses") or {
+        a["id"]: a.get("status") for a in previous.get("anomalies") or []
+        if isinstance(a, dict) and isinstance(a.get("id"), str)}
+    statuses = {key: status for key, status in old_statuses.items()
+                if isinstance(key, str) and status in (OK, WARN, CRITICAL, UNKNOWN, ERROR)
+                and not sampled(key)}
+    statuses.update(current["check_statuses"])
+    anomalies = {a["id"]: a for a in previous.get("anomalies") or []
+                 if isinstance(a, dict) and isinstance(a.get("id"), str)
+                 and not sampled(a["id"])}
+    anomalies.update({a["id"]: a for a in current["anomalies"]})
+    target_groups = dict(previous.get("target_groups") or {})
+    for target in previous.get("targets") or []:
+        target_groups.setdefault(target, previous.get("groups") or [])
+    for target, picked in current["target_groups"].items():
+        target_groups[target] = list(dict.fromkeys(target_groups.get(target, []) + picked))
+    current["targets"] = list(dict.fromkeys((previous.get("targets") or []) + current["targets"]))
+    current["groups"] = list(dict.fromkeys((previous.get("groups") or []) + current["groups"]))
+    current["target_groups"] = target_groups
+    incoming_complete = current["target_complete"]
+    incoming_statuses = current["check_statuses"]
+    current["check_statuses"] = statuses
+    current["target_complete"], current["target_verdicts"] = {}, {}
+    for target in current["targets"]:
+        checks = [{"status": status} for key, status in statuses.items()
+                  if key.split("/", 1)[0] == target]
+        full = set(target_groups.get(target, [])) == set(GROUPS)
+        current["target_complete"][target] = full and not any(
+            check["status"] in (UNKNOWN, ERROR) for check in checks)
+        if (target in targets and not incoming_complete.get(target)
+                and not any(key.split("/", 1)[0] == target for key in incoming_statuses)):
+            current["target_complete"][target] = False
+        current["target_verdicts"][target] = _target_verdict(checks, full)
+    counts = {status: sum(value == status for value in statuses.values())
+              for status in (OK, WARN, CRITICAL, UNKNOWN, ERROR)}
+    current["summary"] = {"targets": len(current["targets"]), "checks": len(statuses), **counts}
+    current["complete"] = all(current["target_complete"].values())
+    current["verdict"] = _verdict(counts, current["complete"])
+    current["anomalies"] = list(anomalies.values())[:SIGNAL_ANOMALY_LIMIT]
+    current["truncated"] = (bool(previous.get("truncated")) or current["truncated"]
+                            or len(anomalies) > SIGNAL_ANOMALY_LIMIT)
+    old_paths = previous.get("report_paths") or [previous.get("report_path")]
+    current["report_paths"] = list(dict.fromkeys(
+        path for path in old_paths + current["report_paths"] if path))
+    return current
 
 
 def save_signal(session_id: str | None, report: dict,
@@ -1137,12 +1210,25 @@ def save_signal(session_id: str | None, report: dict,
     """
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return None
+    try:
+        payload = _signal_payload(report, report_path)
+        previous = load_signal(session_id)
+        if previous is not None:
+            payload = _merge_signal(previous, payload)
+    except (TypeError, ValueError):
+        return None
+    return _save_signal_payload(session_id, payload)
+
+
+def _save_signal_payload(session_id: str, payload: dict) -> Path | None:
+    """保存已聚合的摘要，供同会话采样与调度重试共用。"""
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
     directory = _signal_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
-        payload = _signal_payload(report, report_path)
-        payload["session_id"] = session_id
+        payload = dict(payload, session_id=session_id)
         path = directory / f"{session_id}.json"
         tmp = directory / f".{session_id}-{uuid.uuid4().hex[:6]}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1176,6 +1262,29 @@ def load_signal(session_id: str | None) -> dict | None:
     if data.get("session_id") != session_id:
         return None
     if not isinstance(data.get("anomalies"), list):
+        return None
+    if any(not isinstance(data.get(key), list)
+           or any(not isinstance(value, str) for value in data[key])
+           for key in ("targets", "groups")):
+        return None
+    for key in ("target_verdicts", "target_groups", "target_complete", "check_statuses"):
+        if key in data and not isinstance(data[key], dict):
+            return None
+    if any(not isinstance(value, list) or any(group not in GROUPS for group in value)
+           for value in (data.get("target_groups") or {}).values()):
+        return None
+    if any(type(value) is not bool for value in (data.get("target_complete") or {}).values()):
+        return None
+    if any(status not in (OK, WARN, CRITICAL, UNKNOWN, ERROR)
+           for status in (data.get("check_statuses") or {}).values()):
+        return None
+    if any(not isinstance(item, dict) or not isinstance(item.get("id"), str)
+           or item.get("status") not in (WARN, CRITICAL, UNKNOWN, ERROR)
+           for item in data["anomalies"]):
+        return None
+    if "report_paths" in data and (not isinstance(data["report_paths"], list)
+                                   or any(not isinstance(path, str)
+                                          for path in data["report_paths"])):
         return None
     return data
 
