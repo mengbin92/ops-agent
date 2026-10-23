@@ -118,9 +118,11 @@ class W8AcceptanceTests(unittest.TestCase):
         pid_path = self.root / "crash-http-pid"
         fixture = self.root / "crashing-worker.py"
         server_source = (
-            "from http.server import HTTPServer,BaseHTTPRequestHandler\n"
+            "import sys\nfrom http.server import BaseHTTPRequestHandler\n"
+            f"sys.path.insert(0,{str(SCRIPT.parent)!r})\n"
+            "from w8_acceptance import _LoopbackHTTPServer\n"
             "from pathlib import Path\n"
-            "server=HTTPServer(('127.0.0.1',0),BaseHTTPRequestHandler)\n"
+            "server=_LoopbackHTTPServer(('127.0.0.1',0),BaseHTTPRequestHandler)\n"
             f"Path({str(port_path)!r}).write_text(str(server.server_port))\n"
             "server.serve_forever()\n")
         fixture.write_text(

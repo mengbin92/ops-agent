@@ -16,7 +16,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,8 +264,8 @@ class W8ReviewDrillTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(b'{"healthy":true}')
 
-        target = HTTPServer(("127.0.0.1", 0), Destination)
-        source = HTTPServer(("127.0.0.1", 0), Redirect)
+        target = w8._LoopbackHTTPServer(("127.0.0.1", 0), Destination)
+        source = w8._LoopbackHTTPServer(("127.0.0.1", 0), Redirect)
         threads = [threading.Thread(target=server.serve_forever, daemon=True)
                    for server in (source, target)]
         for thread in threads:

@@ -22,6 +22,7 @@ import re
 import secrets
 import shlex
 import signal
+from socketserver import TCPServer
 import stat
 import subprocess
 import sys
@@ -262,6 +263,33 @@ def _control(sandbox: Path, **fields) -> None:
     staged.replace(path)
 
 
+class _LoopbackHTTPServer(HTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves even a numeric bind address with getfqdn(). This
+        # local drill must not wait for the runner's reverse DNS resolver.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+def _llm_failure_probe(llm) -> str:
+    # Allow a cold HTTP request time to finish, while keeping the retry delay
+    # outside that budget so exactly one failed attempt is charged. Only this
+    # isolated worker's synthetic failure uses this backoff configuration.
+    retry_base = llm.TRANSIENT_BASE
+    try:
+        llm.TRANSIENT_BASE = 10.0
+        llm.chat([{"role": "user", "content": "W8 local synthetic probe"}],
+                 deadline=time.monotonic() + 10.0)
+    except llm.LLMError as error:
+        failure = str(error)
+    else:
+        raise AssertionError("LLM 503 was reported successful")
+    finally:
+        llm.TRANSIENT_BASE = retry_base
+    _require("HTTP 503" in failure, "LLM failure did not receive the synthetic HTTP 503")
+    return failure
+
+
 def _serve(sandbox: Path) -> int:
     """A real HTTP service whose application health follows the sandbox config."""
     _validate_session(sandbox)
@@ -301,9 +329,9 @@ def _serve(sandbox: Path) -> int:
             else:
                 self.respond(404, {"error": "unknown route"})
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    (sandbox / "http-port").write_text(str(server.server_port))
-    server.serve_forever(poll_interval=0.05)
+    with _LoopbackHTTPServer(("127.0.0.1", 0), Handler) as server:
+        (sandbox / "http-port").write_text(str(server.server_port))
+        server.serve_forever(poll_interval=0.05)
     return 0
 
 
@@ -503,13 +531,7 @@ def _worker(sandbox: Path) -> dict:
         def llm_failure_recovery():
             usage.save_budget({"enabled": True, "daily_calls": 10, "daily_tokens": None})
             _control(sandbox, llm_status=503)
-            try:
-                llm.chat([{"role": "user", "content": "W8 local synthetic probe"}],
-                         deadline=time.monotonic() + 0.8)
-            except llm.LLMError as error:
-                failure = str(error)
-            else:
-                raise AssertionError("LLM 503 was reported successful")
+            failure = _llm_failure_probe(llm)
             failed_usage = usage.today()["calls"]
             _require(failed_usage == 1, "failed request was not budgeted exactly once")
             _control(sandbox, llm_status=200)
