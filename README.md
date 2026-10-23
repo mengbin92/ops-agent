@@ -1,9 +1,9 @@
 # ops-agent
 
 默认只读、高风险操作需会话内授权并附风险说明与快照回滚的运维智能体。
-既可**独立运行**（自带 agent loop 与 LLM 接入），也可作为 Claude Code 子代理/MCP server 嵌入。
+自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端。
 
-## 独立 agent 形态（opsagent）
+## Agent 形态（opsagent）
 
 自带 agent 内核（`agent/`：loop + provider（OpenAI 兼容 / Anthropic 原生）+ 工具注册表 + 会话持久化），
 守门核心 core.py 作为内置安全层复用。架构见
@@ -48,28 +48,26 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 `ask_user` 用 `{"method":"ask_user","id":"srv-..."}` 反向请求，客户端把回答作为响应回传。
 
 四种形态共享同一内核与状态目录：REPL、单发、RPC、MCP（见下）。
-独立形态下守门在内核之内：bash 工具直接调 `core.check()`，写命令须
+守门在内核之内：bash 工具直接调 `core.check()`，写命令须
 变更单 → ops_approve 向用户确认完整命令与目标、明确批准后建戳 → ops_exec 快照执行。
 `ask_user` 仍可用于澄清；它的回答不代替 `ops_approve` 对具体命令的确认。
 非 TTY 环境 ask_user 不可用：`ops_approve` 直接拒绝（没有确认通道，不能自己给自己发戳），
 写操作只能靠人工预先 `./opsx approve` 授权。
 
-## 组成（Claude Code 插件形态）
+## 组成
 
-- `.claude/agents/ops.md` — Agent 定义（R0-R3 风险分级与流程纪律）
-- `.claude/settings.json` — PreToolUse hook，对所有 Bash 命令执行 `opsx hook`
+- `opsagent` / `agent/` — agent 内核（loop、provider、工具注册表、会话持久化）
 - `opsx` / `core.py` — 纯标准库 CLI/核心库（分类、审批戳、快照、回滚、审计）
+- `mcp_server.py` — MCP server（stdio，与 CLI 共享 core.py 与状态目录）
 - `config.yaml` — 只读白名单与风险规则；`~/.ops-agent/config.override.yaml` 追加覆盖
 
 ## 使用
-
-必须在 `ops-agent/` 目录内启动（hook 为项目级配置，目录外只有 prompt 约束一层防线）。
 
 ```bash
 # 自检
 ./opsx selftest
 
-# 手动预授权（AskUserQuestion 不可用时的降级路径）
+# 手动预授权（无确认通道时的降级路径，如非交互环境）
 ./opsx approve 'systemctl restart nginx' --ttl 900  # （`!` 前缀 = 你本人直接执行，即授权动作本身）
 
 # 用户取消变更时立即撤销审批戳（不必等 TTL 过期）
@@ -538,8 +536,9 @@ API 完全不可用时 workflow 的规则结果照常产出。
 
 ## 防线说明
 
-两层防线：① Agent 流程纪律（变更单 → AskUserQuestion → opsx exec）；
-② PreToolUse hook 只放行 R0 只读命令或本仓库受守门的 CLI；裸写命令即使有审批戳也拒绝。
+两层防线：① Agent 流程纪律（变更单 → `ops_approve` 向用户确认 → `ops_exec` 执行）；
+② 守门核心 `core.check()`——agent 的 bash 工具与 CLI 各入口只放行 R0 只读命令或
+本仓库受守门的 CLI；绕过入口的裸写命令即使有审批戳也拒绝。
 
 `opsx exec --snapshot-cmd`、独立的 `opsx snapshot --cmd` 与 MCP `ops_snapshot_cmd`
 仅允许 R0 只读抓取，已批准的非 R0 命令也不能通过采集入口执行。
@@ -549,7 +548,7 @@ API 完全不可用时 workflow 的规则结果照常产出。
 本机文件回滚先写临时文件再原子替换，恢复内容与权限但会改变 inode；
 远程文件回滚也原子替换，会改变 inode，并保留已有文件的属主/属组。
 
-hook 允许直接调用本仓库的 `opsx`（或 Python + 本仓库脚本），由入口内部校验审批与快照；
+命令入口（bash 工具、`opsx check`/`hook`/`exec`）由入口内部校验审批与快照；
 入口外拼接 shell 命令仍逐条守门。审批戳保留引号、转义和换行里的空白，避免不同命令复用授权；
 升级前为这类命令创建的旧戳可能需要重新授权。
 
@@ -585,19 +584,7 @@ W4 已支持单向 webhook、事件去重与恢复通知；双向 IM 对话尚�
 }
 ```
 
-只读工具（`ops_check` / `ops_list` / `ops_audit`）建议 allowlist 免弹窗；写工具（`ops_approve` / `ops_revoke` / `ops_exec` / `ops_rollback` / `ops_snapshot_*`）保持每次弹窗（双保险），审批戳仍是硬闸门。Claude Code 的权限配置片段：
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "mcp__ops-guard__ops_check",
-      "mcp__ops-guard__ops_list",
-      "mcp__ops-guard__ops_audit"
-    ]
-  }
-}
-```
+只读工具（`ops_check` / `ops_list` / `ops_audit`）建议在宿主侧 allowlist 免弹窗；写工具（`ops_approve` / `ops_revoke` / `ops_exec` / `ops_rollback` / `ops_snapshot_*`）保持每次弹窗（双保险），审批戳仍是硬闸门。
 
 确认流与 CLI 形态一致：变更单 → `ops_approve`（弹窗=授权，建戳）→ `ops_exec`（再弹窗=双保险，校验戳）→ 报告 snapshot_id 与回滚。R3 仍需 `force=true` + 会话内显式确认。
 `ops_rollback` 先返回目标/文件/差异预览，核对后带 `confirm=true` 重试才真正回滚（执行前自动保存回滚前副本）。
