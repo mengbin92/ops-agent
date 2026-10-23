@@ -330,7 +330,15 @@ def _serve(sandbox: Path) -> int:
                 self.respond(404, {"error": "unknown route"})
 
     with _LoopbackHTTPServer(("127.0.0.1", 0), Handler) as server:
-        (sandbox / "http-port").write_text(str(server.server_port))
+        fd, temporary = tempfile.mkstemp(prefix=".w8-port-", dir=sandbox)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write(str(server.server_port))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, sandbox / "http-port")
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         server.serve_forever(poll_interval=0.05)
     return 0
 
