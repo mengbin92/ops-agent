@@ -20,6 +20,27 @@ FORMAT_VERSION = 1
 SESSION_KEEP = 300  # 会话文件保留上限，超出按修改时间删最旧
 
 
+def _validate_record(rec: dict, line_number: int) -> None:
+    """导入/恢复的消息也会重发给模型，不能只检查 role 后信任调用结构。"""
+    from .llm import LLMError, _validate_message
+
+    role = rec.get("role")
+    if not isinstance(role, str) or role not in {"user", "assistant", "tool", "system"}:
+        raise ValueError(f"会话消息缺少有效 role（第 {line_number} 行）")
+    if role == "assistant":
+        try:
+            _validate_message(rec)
+        except LLMError as e:
+            raise ValueError(f"会话 assistant 消息格式异常（第 {line_number} 行）") from e
+    elif not isinstance(rec.get("content"), str):
+        raise ValueError(f"会话消息 content 须为字符串（第 {line_number} 行）")
+    if role == "tool":
+        # 旧会话可能没有 id/name；保留展示能力，但已存在的关联字段必须合法。
+        for key in ("tool_call_id", "name"):
+            if key in rec and (not isinstance(rec[key], str) or not rec[key]):
+                raise ValueError(f"会话工具消息格式异常（第 {line_number} 行）")
+
+
 def _prune_sessions() -> None:
     d = core.STATE_DIR / "sessions"
     if not d.exists():
@@ -57,7 +78,7 @@ class Session:
             for i, line in enumerate(lines):
                 try:
                     rec = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                except (ValueError, RecursionError) as e:
                     if i > 0 and i == len(lines) - 1 and not line.endswith(b"\n"):
                         f.truncate(offset)  # 崩溃留下的未完整写入尾行，保留之前的完整记录。
                         break
@@ -68,11 +89,13 @@ class Session:
                     if type(rec.get("format")) is not int or rec["format"] != FORMAT_VERSION \
                             or rec.get("id") != self.id:
                         raise ValueError("不支持的会话格式或会话 id 不匹配")
-                elif rec.get("role") not in {"user", "assistant", "tool", "system"}:
-                    raise ValueError(f"会话消息缺少有效 role（第 {i + 1} 行）")
                 else:
+                    _validate_record(rec, i + 1)
                     # 旧版本/手工导入的记录也会再次发给模型，读取时同样要脱敏。
-                    self.messages.append(core.redact_obj(rec))
+                    try:
+                        self.messages.append(core.redact_obj(rec))
+                    except RecursionError as e:
+                        raise ValueError(f"会话消息嵌套过深（第 {i + 1} 行）") from e
                 offset += len(line)
             else:
                 if lines and not lines[-1].endswith(b"\n"):
@@ -82,7 +105,10 @@ class Session:
                 raise ValueError("会话文件为空")
 
     def append(self, message: dict) -> None:
-        message = core.redact_obj(message)  # 会话落盘与后续模型请求都不带明文密钥
+        try:
+            message = core.redact_obj(message)  # 会话落盘与后续模型请求都不带明文密钥
+        except RecursionError as e:
+            raise ValueError("会话消息嵌套过深") from e
         record = json.dumps(message, ensure_ascii=False) + "\n"
         core.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(core.STATE_DIR, 0o700)

@@ -60,6 +60,9 @@ def recall(limit: int = MEMORY_LIMIT) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    # 旧文件、离线恢复或手工编辑未经过 add 的拒绝逻辑；读取出口同样脱敏。
+    # 必须先处理全文再截取尾部，否则 PEM 包围标记可能被截掉而泄露中间内容。
+    text = core.redact(text)
     body = text[len(HEADER):] if text.startswith(HEADER) else text
     body = body.strip()
     if not body:

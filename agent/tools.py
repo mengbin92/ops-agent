@@ -45,6 +45,7 @@ class ToolContext:
     session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
     goal_continuation：只有 REPL 会跨轮续跑，-p/RPC/定时任务为 False。
     deadline：整任务时间预算（time.monotonic 秒），None = 不设限；到点不再启动后续调用。
+    evidence_errors：规则采集/摘要保存错误，由调度程序读取，不能由模型的正常结论覆盖。
     """
 
     def __init__(self, ask_user=None, allowed: set[str] | None = None,
@@ -56,6 +57,7 @@ class ToolContext:
         self.session_id = session_id
         self.goal_continuation = goal_continuation
         self.deadline = deadline
+        self.evidence_errors: list[str] = []
 
 
 def _schema(name, description, properties, required):
@@ -228,7 +230,8 @@ def _read(args: dict, ctx: ToolContext) -> str:
 def _ask_user(args: dict, ctx: ToolContext) -> str:
     if ctx.ask_user is None:
         return "[ask_user 不可用] 当前形态无交互终端。写操作安全方向降级：视为用户拒绝。"
-    return ctx.ask_user(args["question"])
+    answer = ctx.ask_user(args["question"])
+    return answer if isinstance(answer, str) else "[ask_user 不可用] 用户未回答，视为用户拒绝。"
 
 
 def _ops_approve(args: dict, ctx: ToolContext) -> str:
@@ -559,6 +562,13 @@ def _workflow_footer(report: dict | None, index: list, failed: int,
     return "\n".join(lines)
 
 
+def _evidence_error(ctx: ToolContext, message: str) -> str:
+    note = core.redact(message)[:300]
+    if note not in ctx.evidence_errors:
+        ctx.evidence_errors.append(note)
+    return f"\n[规则证据错误] {note}；解读不完整，需人工核对。"
+
+
 def _inspect(args: dict, ctx: ToolContext) -> str:
     """确定性检查工具：规则结论不依赖模型，报告全文落盘。"""
     try:
@@ -566,11 +576,15 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
                                    groups=args.get("groups") or None,
                                    deadline=ctx.deadline)
     except checks.CheckError as e:
-        return f"[检查错误] {e}"
+        return f"[检查错误] {e}" + _evidence_error(ctx, "inspect 规则检查未能执行")
     text = checks.format_report(report)
     path = checks.save_report("inspect", text)
+    note = ""
+    if path is None:
+        note = _evidence_error(ctx, "inspect 规则完整报告写入失败，无法保存完整检查证据")
     # 规则结果按会话落盘：通知与运行记录据此上报"模型不可用也成立"的异常
-    checks.save_signal(ctx.session_id, report, path)
+    if checks.save_signal(ctx.session_id, report, path) is None:
+        note += _evidence_error(ctx, "inspect 规则结果摘要写入失败，无法保存检查证据")
     if len(text) > OUTPUT_LIMIT:
         tail = (f"\n...[报告共 {len(text)} 字符，已截断；完整内容: {path}"
                 "（用 read 的 offset/limit 分段读取）]" if path else
@@ -578,8 +592,9 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
         # 异常清单是判断依据，不能被正常项表格或固定字符数挤掉。
         summary_end = text.find("\n\n## ", text.find("## 全部异常与未采集项"))
         keep = max(OUTPUT_LIMIT, summary_end) if summary_end != -1 else OUTPUT_LIMIT
-        return text[:keep] + tail
-    return f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
+        return text[:keep] + tail + note
+    return (f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
+            + note)
 
 
 def _events(args: dict, ctx: ToolContext) -> str:
@@ -620,6 +635,7 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
         except checks.CheckError as e:
             checks_note = str(e)
             checks_text = ""
+            _evidence_error(ctx, "workflow 规则检查未能执行")
         sections.append("## 规则检查（确定性探针，模型未参与）\n"
                         + (checks_text or f"[规则检查未执行] {checks_note}"))
 
@@ -664,9 +680,14 @@ def _workflow(args: dict, ctx: ToolContext) -> str:
     body = "\n\n".join(sections)
     full = f"{body}\n\n{footer}"
     path = checks.save_report(f"workflow-{name}", full)
+    note = ""
+    if path is None:
+        note = _evidence_error(ctx, "workflow 完整报告写入失败，无法保存完整检查证据")
     if report is not None:  # 只有真跑过规则检查才有信号可写
-        checks.save_signal(ctx.session_id, report, path)
+        if checks.save_signal(ctx.session_id, report, path) is None:
+            note += _evidence_error(ctx, "workflow 规则结果摘要写入失败，无法保存检查证据")
     pointer = f"[全量报告] {path}" if path else "[报告未能落盘，以上为可见内容]"
+    pointer += note
     if len(full) <= OUTPUT_LIMIT:
         return f"{full}\n\n{pointer}"
     # 截断时必须保住尾部汇总：它是"不得谎报正常"的最后一道程序约束，

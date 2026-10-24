@@ -182,7 +182,7 @@ def _check_ssh_targets() -> list[dict]:
         targets = remote.load_targets()
     except remote.RemoteError as e:
         return [_item("ssh-targets", FAIL, f"targets.json 损坏: {e}")]
-    names = sorted(n for n in targets if not n.startswith("_"))
+    names = sorted(n for n in targets if n != "_local")
     if not names:
         return [_item("ssh-targets", OK, "未注册远程目标")]
     out = []

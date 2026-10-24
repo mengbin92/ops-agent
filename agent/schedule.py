@@ -64,7 +64,7 @@ RUN_STATUSES = ("running", "succeeded", "failed", "timeout", "interrupted", "mis
 #   2) workflow/inspect 报告头 `结论: **异常**｜完整性: ...`
 _VERDICT_LINE = re.compile(
     r"^[ \t]*\*{0,2}结论[:：][ \t]*\*{0,2}(正常|警告|异常|不完整)\*{0,2}"
-    r"(?![\u4e00-\u9fff])", re.M)
+    r"[ \t]*$", re.M)
 _VERDICT_REPORT = re.compile(
     r"^[ \t]*-?[ \t]*结论[:：][ \t]*\*\*(正常|警告|异常|不完整)\*\*｜完整性", re.M)
 _TRUNCATED_HINTS = ("解读不完整", "[失败]")
@@ -662,22 +662,27 @@ def _detect_verdict(text: str) -> str:
     这样日志/引用里的 `结论：正常` 不能翻转最终判定。
     """
     text = _strip_quoted(text or "")
-    # 单独成行的结论优先（模型最后写的）；否则退回本轮报告头里的加粗结论。
-    for pattern in (_VERDICT_LINE, _VERDICT_REPORT):
-        hits = [(m.start(), m.group(1)) for m in pattern.finditer(text)]
-        if hits:
-            return max(hits)[1]
-    return "未判定"
+    hits = [(m.start(), m.group(1)) for pattern in (_VERDICT_LINE, _VERDICT_REPORT)
+            for m in pattern.finditer(text)]
+    return max(hits)[1] if hits else "未判定"
 
 
 def _strip_quoted(text: str) -> str:
     """去掉代码围栏与引用块：里面粘贴的旧报告/日志不是本次结论。"""
-    kept, in_fence = [], False
+    kept, fence = [], None
     for line in text.splitlines():
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
+        if fence is not None:
+            char, length = fence
+            if re.fullmatch(r" {0,3}" + re.escape(char) + "{" + str(length) + r",}[ \t]*", line):
+                fence = None
             continue
-        if in_fence or line.lstrip().startswith(">"):
+        if line.lstrip().startswith(">"):
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if opening and (opening[1][0] != "`" or "`" not in opening[2]):
+            fence = (opening[1][0], len(opening[1]))
+            continue
+        if line.startswith(("    ", "\t")):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -740,10 +745,15 @@ def _run_entry(entry: dict, model: str | None, session=None,
     ctx = tools.ToolContext(ask_user=None, model=model, allowed=tools.SCHEDULED_TOOLS,
                             session_id=session.id, deadline=deadline)
     prompt = f"{extra}{entry['prompt']}" if extra else entry["prompt"]
-    return loop.run_turn(prompt, session, ctx,
+    text = loop.run_turn(prompt, session, ctx,
                          system=loop._default_system(SCHEDULE_PROMPT),
                          max_turns=SCHEDULE_MAX_TURNS,
                          model=model)
+    if ctx.evidence_errors:
+        # 来自实际工具执行的内部状态；即使模型忽略警告并声称正常，也必须降级。
+        text += "\n\n[失败] 规则证据不完整：" + "；".join(ctx.evidence_errors)
+        text += "\n解读不完整，需人工核对。\n结论：不完整"
+    return text
 
 
 def _attach_signal(rec: dict, signal: dict | None) -> None:
@@ -960,6 +970,9 @@ def _execute_started_run(entry: dict, model: str | None, rec: dict,
     # "调度已停"。每次尝试前都刷一次，成本可忽略。
     _touch_heartbeat()
     for attempt in range(1, RUN_RETRIES + 2):
+        if time.monotonic() >= deadline:
+            text = loop.DEADLINE_MARK
+            break
         attempts = attempt
         rec["attempts"] = attempt
         _touch_heartbeat()
@@ -984,8 +997,12 @@ def _execute_started_run(entry: dict, model: str | None, rec: dict,
                 # 预算跨天才恢复：重试只会白花钱白花时间，直接按失败收尾。
                 # 规则检查结果已在本函数前半段落盘，通知不受影响。
                 break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                text = loop.DEADLINE_MARK
+                break
             if attempt <= RUN_RETRIES:
-                time.sleep(RUN_RETRY_DELAY)
+                time.sleep(min(RUN_RETRY_DELAY, remaining))
     try:
         signal, signal_session = _load_run_signal(sessions)
     except ScheduleError as e:

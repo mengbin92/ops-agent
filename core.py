@@ -4,6 +4,8 @@ from __future__ import annotations
 import difflib
 import hashlib
 import fcntl
+import fnmatch
+import glob
 import json
 import math
 import os
@@ -102,6 +104,7 @@ _CONTENT_READERS = frozenset({
     "python3", "perl", "ruby", "node", "bash", "sh", "zsh", "source", "curl", "wget",
     "vi", "vim", "nano",
 })
+MAX_SENSITIVE_GLOB_MATCHES = 1024
 
 
 def redact(text: str) -> str:
@@ -195,10 +198,6 @@ def sensitive_command(cmd: str, strict: bool = False) -> str | None:
     if not isinstance(cmd, str):
         return None
     for seg in _segments(cmd):
-        if _KUBECTL_GET_SECRET.search(seg) and _KUBECTL_VALUE_OUTPUT.search(seg):
-            return "kubectl get secret -o yaml/json（禁止输出 Secret 值）"
-        if re.search(r"\bkubectl\b.*\bconfig\s+view\b.*\s--raw(?:=true)?(?:\s|$)", seg):
-            return "kubectl config view --raw（禁止输出集群凭据）"
         try:
             lexer = shlex.shlex(seg, posix=True, punctuation_chars="<>")
             lexer.whitespace_split = True
@@ -208,6 +207,22 @@ def sensitive_command(cmd: str, strict: bool = False) -> str | None:
             words = seg.split()
         if not words:
             continue
+        # Shell removes quotes and escapes inside words before invoking kubectl.
+        # Checking only the source text misses e.g. se''crets and --r''aw.
+        parsed = " ".join(words)
+        command = words[0]
+        if command.startswith("KUBECONFIG=") and len(words) > 1:
+            command = words[1]
+        glob_hit = _sensitive_content_glob(seg, command, strict)
+        if glob_hit:
+            return glob_hit
+        if command == "kubectl" and _has_option_expansion(seg, words):
+            return "kubectl 动态资源/选项展开（无法确认是否输出 Secret/集群凭据）"
+        if _KUBECTL_GET_SECRET.search(parsed) and _KUBECTL_VALUE_OUTPUT.search(parsed):
+            return "kubectl get secret -o yaml/json（禁止输出 Secret 值）"
+        if (re.search(r"\bkubectl\b.*\b(?:get|config\s+view)\b", parsed)
+                and any(w == "--raw" or w.startswith("--raw=") for w in words)):
+            return "kubectl --raw（禁止绕过 Secret/集群凭据读取保护）"
         if not strict and Path(words[0]).name == "ssh" and len(words) > 1:
             inner = sensitive_command(words[-1], strict=True)  # ssh host "cat id_rsa"
             if inner:
@@ -336,22 +351,163 @@ def _classify_ssh(cmd: str) -> str | None:
     return classify(inner)[0]
 
 
+def _has_shell_expansion(seg: str) -> bool:
+    """Unexpanded shell parameters can manufacture otherwise forbidden options."""
+    quote = None
+    i = 0
+    while i < len(seg):
+        ch = seg[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch == '"':
+            quote = None if quote == '"' else '"'
+        elif ch == "'" and quote is None:
+            quote = "'"
+        elif ch == "$":
+            return True
+        i += 1
+    return False
+
+
+def _shell_tokens(seg: str) -> list[tuple[str, set[str]]]:
+    """Decode words while retaining which wildcard/brace characters are active."""
+    tokens = []
+    token, active, quote = [], set(), None
+    i = 0
+    while i <= len(seg):
+        ch = seg[i] if i < len(seg) else " "
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                token.append(ch)
+        elif ch == "\\" and i + 1 < len(seg):
+            i += 1
+            token.append(seg[i])
+        elif ch == '"':
+            quote = None if quote == '"' else '"'
+        elif ch == "'" and quote is None:
+            quote = "'"
+        elif ch == "#" and quote is None and not token:
+            break
+        elif ch.isspace() and quote is None:
+            if token:
+                tokens.append(("".join(token), active))
+            token, active = [], set()
+        else:
+            token.append(ch)
+            if quote is None and ch in "*?[{},":
+                active.add(ch)
+        i += 1
+    return tokens
+
+
+def _sensitive_content_glob(seg: str, command: str, strict: bool) -> str | None:
+    if Path(command).name not in _CONTENT_READERS:
+        return None
+    matched = 0
+    for token, active in _shell_tokens(seg):
+        if "{" in active and "}" in token and ("," in active or ".." in token):
+            return f"{token}（内容读取不允许未引用的 brace 展开，请先列出文件并指定明确路径）"
+        if not active.intersection("*?["):
+            continue
+        if strict:
+            return f"{token}（远程内容通配无法核实敏感路径，请先列出文件并指定明确路径）"
+        pattern = os.path.expanduser(os.path.expandvars(token))
+        for candidate in glob.iglob(pattern):
+            matched += 1
+            if matched > MAX_SENSITIVE_GLOB_MATCHES:
+                return f"{token}（通配匹配超过 {MAX_SENSITIVE_GLOB_MATCHES} 项，无法完成敏感路径检查）"
+            real = os.path.realpath(candidate)
+            if (sensitive_path(candidate) or sensitive_path(real)
+                    or sensitive_dir(candidate) or sensitive_dir(real)):
+                return candidate
+    return None
+
+
+def _has_option_expansion(seg: str, words: list[str]) -> bool:
+    """Recognize glob/brace syntax manufacturing flags or kubectl resources.
+
+    Only commands with known write/helper options need this check. Quoted
+    patterns and path-prefixed globs remain ordinary read arguments.
+    """
+    command = words[0] if words else ""
+    if command.startswith("KUBECONFIG=") and len(words) > 1:
+        command = words[1]
+    if command not in ("find", "git", "journalctl", "less", "docker", "kubectl"):
+        return False
+    flags = ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0",
+             "-fprintf", "-fls", "--output", "--open-files-in-pager", "--upload-pack",
+             "--exec", "--ext-diff", "--textconv", "--rotate", "--flush", "--sync",
+             "--vacuum-time", "--vacuum-size", "--vacuum-files", "--setup-keys",
+             "--update-catalog", "--relinquish-var", "--smart-relinquish-var",
+             "--log-file", "--LOG-FILE", "-o", "-O")
+    tokens = _shell_tokens(seg)
+    for token, active in tokens:
+        if not active or token.startswith(("/", "./", "../")):
+            continue
+        glob = bool(active.intersection("*?["))
+        brace = "{" in active and "}" in token and ("," in active or ".." in token)
+        if command == "kubectl" and (glob or brace):
+            return True  # se* / se{cret,crets} can reveal Secret values without naming them.
+        if glob and (token.startswith("-") or any(
+                fnmatch.fnmatchcase(flag, token) for flag in flags)):
+            return True
+        if brace:
+            if token.startswith(("-", "{")):
+                return True
+    return False
+
+
 def _has_write_marker(seg: str) -> bool:
     """白名单形状但藏写行为时不按只读放行。
 
     覆盖：重定向（仅 stderr 到 /dev/null 或 fd 复制豁免）、`&>`全量重定向、
     tee、find -exec/-delete、命令替换（`$(...)`/反引号，可在只读命令里藏任意写操作）。
     """
-    if re.search(r"\btee\b|-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", seg):
+    try:
+        words = shlex.split(seg, comments=True)
+    except ValueError:
+        return True  # 不能可靠解析的 shell 片段不作为只读放行。
+    if words and words[0].startswith("KUBECONFIG="):
+        words = words[1:]  # 与 _classify_single 的赋值前缀处理一致。
+    parsed = " ".join(words)
+    if _has_option_expansion(seg, words):
         return True
-    if "$(" in seg or "`" in seg or "<(" in seg or ">(" in seg:
+    if re.search(r"\btee\b|-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", parsed):
+        return True
+    if _has_shell_expansion(seg) or "`" in seg or "<(" in seg or ">(" in seg:
         return True
     if re.search(r"&>{1,2}", seg):
         return True
-    if re.search(r"--(?:output|open-files-in-pager|rotate|vacuum-\S+|flush|sync|relinquish-var|smart-relinquish-var|setup-keys|update-catalog)(?:\s|=|$)", seg):
+    long_options = [w.partition("=")[0] for w in words
+                    if w.startswith("--") and w != "--"]
+    dangerous_options = ("--output", "--open-files-in-pager", "--rotate", "--flush",
+                         "--sync", "--relinquish-var", "--smart-relinquish-var",
+                         "--setup-keys", "--update-catalog", "--vacuum-time",
+                         "--vacuum-size", "--vacuum-files")
+    # getopt/parse-options commonly accept unique abbreviations of long flags.
+    if any(full.startswith(option) for option in long_options for full in dangerous_options):
         return True
-    if re.search(r"^docker\s+compose\s+config\b.*\s-o(?:\s|\S)", seg):
+    if re.search(r"^docker\s+compose\s+config\b.*\s-o(?:\s|\S)", parsed):
         return True
+    if words and words[0] == "git":
+        if any(full.startswith(option) for option in long_options
+               for full in ("--upload-pack", "--exec", "--ext-diff", "--textconv")):
+            return True  # 这些看似读取的命令可显式运行任意 helper。
+        if len(words) > 1 and words[1] == "grep" and any(
+                w.startswith("-") and not w.startswith("--") and "O" in w
+                for w in words[2:]):
+            return True  # git grep -O[<pager>] 可指定任意程序。
+    if words and words[0] == "less" and any(
+            w.startswith("+") or (w.startswith("--") and w != "--" and any(
+                option.startswith(w.partition("=")[0]) for option in ("--log-file", "--LOG-FILE")))
+            or (w.startswith("-") and not w.startswith("--") and any(c in w for c in "oO"))
+            for w in words[1:]):
+        return True  # 初始命令可含 shell escape；-o/-O 会写日志文件。
     for m in re.finditer(r"(\d*)>{1,2}\s*(&[0-9]+|/dev/null(?=\s|$))?", seg):
         if m.group(1) != "2" or m.group(2) is None:
             return True
@@ -1131,6 +1287,8 @@ def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
             raise ValueError("元数据形状非法")
         if meta.get("target") is not None and not isinstance(meta["target"], str):
             raise ValueError("快照目标非法")
+        if meta.get("env") is not None and not isinstance(meta["env"], dict):
+            raise ValueError("快照环境非法")
         for item in meta["items"]:
             if not isinstance(item, dict) or item.get("type") not in ("file", "cmd"):
                 raise ValueError("快照条目非法")
@@ -1160,9 +1318,24 @@ def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
 DIFF_LIMIT = 4000  # 回滚预览里的差异展示上限（按字符）
 
 
-def _local_read_state(src: str) -> tuple[bool, bytes]:
-    p = Path(src)
+def _local_restore_path(src: str) -> Path:
+    # Local snapshots store an absolute, resolved source path. A parent replaced
+    # by a symlink must not redirect preview, backup or restore into another tree.
+    # The final component may be a symlink: atomic replace replaces that link,
+    # preserving the established local rollback behavior without writing through it.
+    path = Path(os.path.abspath(src))
     try:
+        parent = path.parent.resolve()
+    except (OSError, RuntimeError) as e:
+        raise OpsxError(f"无法确认本机文件父目录真实路径: {src}") from e
+    if parent != path.parent:
+        raise OpsxError(f"本机文件父目录真实路径已改变: {src}，拒绝回滚")
+    return path
+
+
+def _local_read_state(src: str) -> tuple[bool, bytes]:
+    try:
+        p = _local_restore_path(src)
         if not p.is_file():
             return False, b""
         return True, p.read_bytes()
@@ -1319,6 +1492,7 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
                     if item["type"] == "file":
                         staged = None
                         try:
+                            _local_restore_path(item["src"])
                             try:
                                 current_stat = Path(item["src"]).stat()
                             except FileNotFoundError:
