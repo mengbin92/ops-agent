@@ -1,6 +1,6 @@
 # ops-agent v0.1.0-rc.1 发布：首个候选版与安全可靠性审查修复
 
-> 2026-10-24 · 上一版：无（首次版本化发布）· [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1)
+> 2026-10-25 · 上一版：无（首次版本化发布）· [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1)
 
 v0.1.0-rc.1 是首个 **候选发布版本（prerelease）**，包含独立 Agent、确定性巡检、调度通知、
 受控变更与离线恢复能力，以及本轮全项目审查修复。运行时使用 Python 3.9+ 标准库，支持 macOS/Linux。
@@ -177,3 +177,4 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 - fix: harden execution safety and agent reliability
 - ci(release): publish verified source archives from version tags
 - docs(release): v0.1.0-rc.1
+- docs(release): align candidate publication date
