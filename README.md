@@ -3,6 +3,14 @@
 默认只读、高风险操作需会话内授权并附风险说明与快照回滚的运维智能体。
 自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端。
 
+> 📣 **最新发布**：[v0.1.0-rc.1 发布公告](docs/releases/release-v0.1.0-rc.1.md)（首个候选版、守门与巡检可靠性修复） · [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1)
+
+## 发布与升级
+
+- [v0.1.0-rc.1](docs/releases/release-v0.1.0-rc.1.md)：首个候选版，含独立 Agent、巡检通知、受控变更、离线恢复与 52 项审查回归；真实环境和连续 7 天验收待完成。
+
+完整历史见 [CHANGELOG](CHANGELOG.md)，安装与升级见对应发布公告；维护者流程见[发版说明](docs/ops/releasing.md)。
+
 ## Agent 形态（opsagent）
 
 自带 agent 内核（`agent/`：loop + provider（OpenAI 兼容 / Anthropic 原生）+ 工具注册表 + 会话持久化），
@@ -259,7 +267,7 @@ python3 scripts/w8_acceptance.py --output /tmp/w8-local-evidence.json
 `--quiesced` 是停写声明，不提供在线全局事务锁；详见[状态恢复操作文档](docs/ops/state-backup-recovery.md)。
 
 本地演练退出 0 仅代表本地通过，JSON 同时列出尚未通过的真实 SSH/LLM/通知和 7 天观察门禁；
-`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-23-w8-local-evidence.json)
+`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-24-w8-local-evidence.json)
 为 10/10 通过，整体仍待外部验收。见[测试环境验收步骤](docs/ops/w8-real-environment.md)和
 [受控变更候选版](docs/releases/2026-10-22-controlled-change-candidate.md)。
 
