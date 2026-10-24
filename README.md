@@ -3,6 +3,14 @@
 默认只读、高风险操作需会话内授权并附风险说明与快照回滚的运维智能体。
 自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端。
 
+> 📣 **最新发布**：[v0.1.0-rc.1 发布公告](docs/releases/release-v0.1.0-rc.1.md)（首个候选版、守门与巡检可靠性修复） · [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1)
+
+## 发布与升级
+
+- [v0.1.0-rc.1](docs/releases/release-v0.1.0-rc.1.md)：首个候选版，含独立 Agent、巡检通知、受控变更、离线恢复与 52 项审查回归；真实环境和连续 7 天验收待完成。
+
+完整历史见 [CHANGELOG](CHANGELOG.md)，安装与升级见对应发布公告；维护者流程见[发版说明](docs/ops/releasing.md)。
+
 ## Agent 形态（opsagent）
 
 自带 agent 内核（`agent/`：loop + provider（OpenAI 兼容 / Anthropic 原生）+ 工具注册表 + 会话持久化），
@@ -208,6 +216,8 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   中途被 kill 时，排队中的任务仍是到期状态，下一轮会补上（不会被静默跳过）。
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
+- 工具触发的规则采集、摘要或完整报告保存失败时，程序将结论降为「不完整」（退出 3）；
+  即使模型最终回答「正常」也不能覆盖这类证据错误。
 
 ### 体检、心跳与预算（W7）
 
@@ -257,7 +267,7 @@ python3 scripts/w8_acceptance.py --output /tmp/w8-local-evidence.json
 `--quiesced` 是停写声明，不提供在线全局事务锁；详见[状态恢复操作文档](docs/ops/state-backup-recovery.md)。
 
 本地演练退出 0 仅代表本地通过，JSON 同时列出尚未通过的真实 SSH/LLM/通知和 7 天观察门禁；
-`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-23-w8-local-evidence.json)
+`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-24-w8-local-evidence.json)
 为 10/10 通过，整体仍待外部验收。见[测试环境验收步骤](docs/ops/w8-real-environment.md)和
 [受控变更候选版](docs/releases/2026-10-22-controlled-change-candidate.md)。
 
@@ -438,7 +448,7 @@ API 完全不可用时 workflow 的规则结果照常产出。
 
 | 分组 | 采集内容 | 判定依据 |
 | --- | --- | --- |
-| `connectivity` | `uname -s`（同时确定探针平台） | 命令失败即 `error`；输出解析不出平台记 `unknown` |
+| `connectivity` | `uname -s`（同时确定探针平台，只认 stdout） | 命令失败或无法确定平台记 `error` |
 | `resources` | `df -P -k`（磁盘）、`/proc/meminfo` 或 `vm_stat`（内存）、`/proc/loadavg` 或 `sysctl -n vm.loadavg`（负载，除以核数） | 与阈值比较：≥ 警告为 `warn`、≥ 异常为 `critical` |
 | `services` | `systemctl show`（systemd）、`docker inspect --format`（容器） | 期望运行的单元 `failed/inactive` 为 `critical`；单元/容器不存在、命令不可用为 `unknown` |
 
@@ -494,6 +504,7 @@ API 完全不可用时 workflow 的规则结果照常产出。
 常见 token 形状）。快照保留原始内容供恢复，不脱敏；目录 `0700`，`read` 工具不允许把快照原件
 读进模型上下文。工具结果（agent / CLI / MCP）、会话落盘、审计、长输出落盘和审批列表展示
 都走同一套脱敏；用户消息与 `remember` 写入同样处理（含密钥的记忆条目直接拒绝）。
+人工编辑或导入的记忆、历史事件在读取时也会再次脱敏；原始文件保留不变。
 `selftest` 用哨兵密钥验证各出口都不出现明文。
 
 **敏感文件读取限制**：`read` 直接拒绝私钥（`id_rsa`/`id_ed25519`/`*.key`/`*.p12` 等）、
@@ -506,8 +517,12 @@ API 完全不可用时 workflow 的规则结果照常产出。
 对引用这些文件或读取敏感目录内容的命令一律拒绝（`cat ~/.ssh/id_rsa`、经符号链接指向的私钥、
 `ssh host "cat id_rsa"` 的内层命令、远程命令里的裸 `id_rsa` 都覆盖）；`kubectl get secret
 -o yaml/json/jsonpath`（会把 Secret 值输出成明文）同样拒绝，`-o name` 与默认表格、`describe`
-不受影响。`ls -l ~/.ssh`、`grep id_rsa app.log`、`find -name id_rsa`、
+不受影响；`kubectl get --raw` 与 `kubectl config view --raw` 也拒绝，避免绕过凭据保护。
+`ls -l ~/.ssh`、`grep id_rsa app.log`、`find -name id_rsa`、
 `KUBECONFIG=~/.kube/config kubectl get pods` 不受影响。
+本机内容读取的未引用文件通配会检查实际匹配项及软链接目标，命中凭据或超过 1024 项即拒绝。
+远程内容读取的未引用通配、内容读取的花括号文件名展开会保守拒绝；先用 `ls` 确认文件清单，
+再用明确路径读取。引号内的 grep 正则和 `ls`/`find` 的普通路径通配仍可用。
 边界：正则识别不保证覆盖所有秘密格式（加密内容、二进制、自定义字段会漏报），
 偏保守地拒绝，可能挡住合法的密钥操作（改密钥请由人直接执行）。
 
@@ -526,7 +541,8 @@ API 完全不可用时 workflow 的规则结果照常产出。
 后拒绝回滚，避免写到另一台机器）。没有旧内容可备份（文件原本不存在）时不创建空副本、也不
 承诺可撤销。用户拒绝时文件不发生任何改动；多文件回滚中途失败会在错误里带上副本 id。
 边界：本机回滚原子替换会改变 inode、符号链接路径会变成普通文件；快照只能恢复文件，
-不能替代数据库/卷/部署回退。
+不能替代数据库/卷/部署回退。本机快照记录的是解析后的绝对路径；父目录后来变成软链接、
+导致路径改向时，预览与回滚都会拒绝。
 
 **CI**：`.github/workflows/selftest.yml` 在 push/PR 上跑 `python -m compileall` 与
 `./opsx selftest`（Ubuntu/macOS × Python 3.9/3.12）。
@@ -543,6 +559,11 @@ API 完全不可用时 workflow 的规则结果照常产出。
 `opsx exec --snapshot-cmd`、独立的 `opsx snapshot --cmd` 与 MCP `ops_snapshot_cmd`
 仅允许 R0 只读抓取，已批准的非 R0 命令也不能通过采集入口执行。
 写命令统一走 `opsx exec`，才能消耗审批次数并使用写锁与执行记录。
+只读选项校验会先解析 shell 引号和转义；`find -delete/-exec`、可选择执行程序的 Git 参数、
+`less` 初始命令与日志写入参数等均需审批，相关长选项缩写同样受限。
+包含 `$HOME`、`${...}` 等动态 shell 参数展开的命令也需审批，避免展开后拼成危险选项；
+可改用已确认的绝对路径。单引号或反斜杠保护的字面量（如 `echo '$HOME'`）仍可只读执行。
+可合成写选项的未引用通配/花括号展开，以及动态生成 Kubernetes 资源名的命令也会被拦截。
 状态目录与快照目录按 `0700` 创建，会话与输出文件为 `0600`——
 远程拉回的配置/密钥只有本人可读。
 本机文件回滚先写临时文件再原子替换，恢复内容与权限但会改变 inode；
@@ -601,6 +622,10 @@ W5 变更执行记录与并发控制 → W6 变更场景 → W7 体检/心跳/�
 `executions/`（变更执行记录）、`locks/`（目标级写锁）、`usage.jsonl`/`usage-state.json`/`budget.json`（调用记账与预算，0600）。这些文件都是本地事实来源，不需要数据库。
 调度、运行、通知与执行记录 JSON 用临时文件替换；JSONL 查询跳过损坏行；配置损坏会报错；
 重要状态仍应备份。
+
+2026-10-24 全项目文档对照复审修复了只读守门、敏感读取、回滚路径、巡检判定、证据保存与
+Agent 协议等问题，新增 **52** 项回归；详细发现、兼容调整与验证见
+[本次审查记录](docs/reviews/2026-10-24-project-review.md)。
 
 2026-10-22 对照路线图复审并修复 W1–W4（`241/241`），随后交付 W5（`261/261`）、
 W6（`300/300`）、W7（`309/309`）：详细问题、修复与验证见

@@ -225,7 +225,7 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
                     args = json.loads(call["function"].get("arguments") or "{}")
                     if not isinstance(args, dict):
                         raise ValueError("参数必须是 JSON 对象")
-                except ValueError as e:
+                except (ValueError, RecursionError) as e:
                     result = f"[错误] 工具参数不是有效 JSON 对象: {e}"
                 else:
                     emit("tool", {"phase": "call", "name": name, "args": args})

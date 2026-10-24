@@ -381,7 +381,11 @@ def main(argv: list[str] | None = None) -> int:
             if not f.exists():
                 print("(无审计日志)")
                 return 0
-            lines = f.read_text(encoding="utf-8").strip().splitlines()
+            try:
+                # 崩溃或中断可能留下半个 UTF-8 字符，仍须能查看此前的审计证据。
+                lines = f.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            except OSError as exc:
+                raise core.OpsxError(f"无法读取审计日志: {exc}") from exc
             for line in lines[-args.tail:] if args.tail else []:
                 print(core.redact(line))
             return 0

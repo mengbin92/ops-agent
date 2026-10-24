@@ -53,7 +53,11 @@ def _tool_use_blocks(tool_calls: list[dict]) -> list[dict]:
         fn = tc.get("function") or {}
         try:
             inp = json.loads(fn.get("arguments") or "{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            inp = {}
+        if not isinstance(inp, dict):
+            # loop 会把非法参数作为工具错误回填；重发历史时仍须满足 input 对象协议，
+            # 否则一次参数错误会让后续 Anthropic 调用全部失败。
             inp = {}
         blocks.append({"type": "tool_use", "id": tc.get("id") or "",
                        "name": fn.get("name") or "", "input": inp})
@@ -228,7 +232,7 @@ def chat_once(messages: list[dict], tools: list[dict] | None = None,
             return msg, used_stream.get("tokens")
         with _request(_endpoint(), body, _headers(), timeout) as resp:
             data = json.loads(resp.read().decode())
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+    except (ValueError, RecursionError) as e:
         raise LLMError(f"LLM 响应解析失败: {e}") from e
     except (OSError, http.client.HTTPException) as e:
         raise LLMError(f"LLM API 读取失败: {e}") from e

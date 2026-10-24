@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import sys
 import threading
@@ -92,16 +93,18 @@ def serve(model: str | None = None) -> None:
                     continue
                 try:
                     msg = json.loads(line, parse_constant=_invalid_json_constant)
-                except ValueError:
+                except (ValueError, RecursionError):
                     peer.send({"jsonrpc": "2.0", "id": None,
                                "error": {"code": -32700, "message": "Parse error"}})
                     continue
+                msg_id = msg.get("id") if isinstance(msg, dict) else None
+                valid_id = (type(msg_id) in (str, int, float, type(None))
+                            and (type(msg_id) is not float or math.isfinite(msg_id)))
                 valid = (isinstance(msg, dict) and msg.get("jsonrpc") == "2.0"
-                         and type(msg.get("id")) in (str, int, float, type(None)))
+                         and valid_id)
                 if not valid or ("method" not in msg and "result" not in msg and "error" not in msg) \
                         or ("method" in msg and not isinstance(msg["method"], str)):
-                    error_id = msg.get("id") if isinstance(msg, dict) \
-                        and type(msg.get("id")) in (str, int, float, type(None)) else None
+                    error_id = msg_id if valid_id else None
                     peer.send({"jsonrpc": "2.0", "id": error_id,
                                "error": {"code": -32600, "message": "Invalid Request"}})
                     continue

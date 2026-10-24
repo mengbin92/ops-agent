@@ -138,6 +138,7 @@ def _validate_message(msg: dict) -> dict:
     if not isinstance(calls, list):
         raise LLMError("LLM 响应格式异常：tool_calls 必须为数组")
     ids = set()
+    normalized_calls = []
     for call in calls:
         fn = call.get("function") if isinstance(call, dict) else None
         if (not isinstance(call, dict) or not isinstance(call.get("id"), str)
@@ -147,9 +148,16 @@ def _validate_message(msg: dict) -> dict:
                 or not isinstance(fn.get("arguments"), str)):
             raise LLMError("LLM 响应格式异常：工具调用缺少 id、名称或参数")
         ids.add(call["id"])
+        normalized_calls.append({"id": call["id"], "type": "function", "function": {
+            "name": fn["name"], "arguments": fn["arguments"]}})
     if not msg.get("content") and not calls:
         raise LLMError("LLM 响应为空")
-    return msg
+    # 仅支持的协议字段进入会话与下次请求。额外 provider metadata 既不参与执行，
+    # 也不应将任意深度对象带进递归脱敏/持久化路径。
+    normalized = {"role": "assistant", "content": msg.get("content")}
+    if normalized_calls:
+        normalized["tool_calls"] = normalized_calls
+    return normalized
 
 
 def _usage_tokens(raw, input_key="prompt_tokens", output_key="completion_tokens"):
@@ -235,7 +243,7 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
             return msg, used_stream.get("tokens")
         with _post(body, timeout) as resp:
             data = json.loads(resp.read().decode())
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+    except (ValueError, RecursionError) as e:
         raise LLMError(f"LLM 响应解析失败: {e}") from e
     except (OSError, http.client.HTTPException) as e:
         raise LLMError(f"LLM API 读取失败: {e}") from e

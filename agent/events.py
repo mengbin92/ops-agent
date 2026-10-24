@@ -135,7 +135,9 @@ def tail(n: int = TAIL_DEFAULT, kind: str | None = None) -> list[dict]:
             continue
         try:
             rec = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            # 旧版/人工导入的记录可能未在写入时脱敏；读侧同样保护 CLI 与模型。
+            rec = core.redact_obj(rec)
+        except (ValueError, RecursionError):
             continue
         if not isinstance(rec, dict) or not isinstance(rec.get("kind"), str):
             continue

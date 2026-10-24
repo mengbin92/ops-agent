@@ -573,7 +573,7 @@ def _headline(text: str, fallback: str) -> str:
 def _connectivity(item: dict, timeout: int, budget: dict) -> tuple:
     code, out = _probe(item["target"], "uname -s", timeout, budget)
     # 复用 _headline：stdout 为空时不会把 "[stderr]" 当成平台名
-    platform = _headline(out, "") if code == 0 else ""
+    platform = _headline(_stdout_only(out), "") if code == 0 else ""
     if platform.startswith("["):
         platform = ""
     if code == 0 and platform:
