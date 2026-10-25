@@ -5,6 +5,15 @@ readonly_patterns:
   - ^journalctl(?=[ \t]|$)
   - ^docker[ \t]+(ps|images|logs|inspect|stats|port|top|version|info)(?=[ \t]|$)
   - ^docker[ \t]+compose[ \t]+(ps|logs|config|top)(?=[ \t]|$)
+  - ^docker[ \t]+container[ \t]+(ls|inspect|logs|stats|port|top|diff)(?=[ \t]|$)
+  - ^docker[ \t]+image[ \t]+(ls|inspect|history)(?=[ \t]|$)
+  - ^docker[ \t]+(network|volume)[ \t]+(ls|inspect)(?=[ \t]|$)
+  - ^docker[ \t]+system[ \t]+(df|info)(?=[ \t]|$)
+  - ^docker[ \t]+compose[ \t]+(images|ls|version)(?=[ \t]|$)
+  # 仅允许追加 inspect 对象参数；不允许 xargs 替换命令、选脚本或改用写子命令。
+  - ^xargs[ \t]+(?:(?:-r|-n(?:[1-9][0-9]*|[ \t]+[1-9][0-9]*))[ \t]+)*docker[ \t]+inspect(?=[ \t]|$)
+  # 仅数字行号的打印脚本与明确文件名；额外脚本、就地编辑和通配参数不放行。
+  - ^sed[ \t]+-n[ \t]+(?:[0-9]+(?:,[0-9]+)?p|'[0-9]+(?:,[0-9]+)?p'|"[0-9]+(?:,[0-9]+)?p")(?:[ \t]+--)?(?:[ \t]+[A-Za-z0-9_./][A-Za-z0-9_./-]*)*[ \t]*$
   - ^(cat|less|head|tail|grep|egrep|ls|find|ps|top|htop|df|du|free|uname|uptime|which|whoami|id|echo|w|who)(?=[ \t]|$)
   - ^env[ \t]*$
   - ^hostname(?:[ \t]+(?:-[afisdI]|--fqdn|--short|--ip-address|--domain|--all-ip-addresses))*[ \t]*$

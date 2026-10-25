@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "started_at_utc": "2026-10-25T07:03:15Z",
+  "finished_at_utc": "2026-10-25T07:03:16Z",
+  "local_status": "passed",
+  "overall_status": "blocked",
+  "environment": {
+    "python": "3.9.6",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "drill_source_sha256": "af933ecf0ff04cb5f508c147e7ca9cc0dcd3b58df3b4b5565fdc4066bd3d6eb0",
+    "source_sha256": {
+      "core.py": "63cfcd87f5ad8998f6b61fde2e493c00698e61443ce7fd816638726d0ec34174",
+      "execution.py": "602ff89b67b2c860a5463ba1d19d5b1ae47ee2ec6dd745bd0be96f9b7205fa6e",
+      "scenario.py": "4b43d83a54cf299f89b3d4fa2035f2091fca2262cec84464f7dedaebabf00b53",
+      "usage.py": "0e71d5eea97fceef88f26a1da1875770e05fceecd3ceca614f95bc3b91dee175",
+      "remote.py": "63c26fe28e227861571cac828849b01dd51afe4a9e38d096376a73e14a4b502e",
+      "config.yaml": "81d125853ab715561d96166f8da88cb6e87451e243810f99026d81d9f6ca2605",
+      "agent/__init__.py": "1f1a53f7665b906911cf2ec53af366c61121a93ee7ba65b5fc4ea5fcc01473bb",
+      "agent/checks.py": "043d9c2d82e3900e5748e748dbf44fe5edae3a3987c7187dda62a78392f3ca1c",
+      "agent/events.py": "4f178abec534edd18c1bccb564011faf2224e1807f2aed1d1e9ff09024dca68d",
+      "agent/goal.py": "3e6e12297b9093ec2c37a0e34b7ed3e2603206cc6a36e8eb41248aa21148ec6d",
+      "agent/llm.py": "df4f6c56e6eeb46da4d92c435b1f330f48245c7f991b44a61bb887447a340d2f",
+      "agent/llm_anthropic.py": "ac4a7c27bfafb20994a9b8185c2e353b8457ee258872ebd868aa67629aa141e4",
+      "agent/loop.py": "7b9399fd4098a954d986399ce84d7b8b73393358fc5286aee4d205797942fb10",
+      "agent/markdown.py": "3f80faada3cc4f56b1f65e235ff3f9458d764b4bb2a401a5308087af79316f24",
+      "agent/memory.py": "113ce0e8087f4a923fc9495644b98198b5f58902865d436b2c599904d2f6c3df",
+      "agent/notify.py": "9ac0e54f14a2a6f0cd73c2e25e55b1d2c53e35e5adeca3ec1cca30829e0a23e9",
+      "agent/repl.py": "39fd708acec8e1b1ed9a8acf243b9ad837072e83f5011d4d5e985e27ee1cee9d",
+      "agent/rpc.py": "e5f6e8fc313fce4aadec692a8d2953e92d5ea541a51fdae627639178c1cd01da",
+      "agent/schedule.py": "8a76f4dffaa0df92eedbe67b6d0ea9738a562b4dbee4202c268945da39815537",
+      "agent/session.py": "239e07c88ea0e8c3f88a037a7731dd313cf1807c328b6fef147aac0bb856e535",
+      "agent/skills.py": "1f0f5661a76fd4df8314b7a44e28094a677912a12a500a7c224b6a66045b67a6",
+      "agent/tools.py": "258bcc3a9c89695971a0ba98ce18a20967d936d9cac636337311fcefa9abb942",
+      "agent/workflow.py": "7391ed263bac4314efb85662a5879e6c724396c8171b40a8e2cbeefcb144841c",
+      "drill": "af933ecf0ff04cb5f508c147e7ca9cc0dcd3b58df3b4b5565fdc4066bd3d6eb0"
+    },
+    "transport": "local subprocesses and HTTP on 127.0.0.1 only",
+    "state_isolation": "TemporaryDirectory / OPSX_STATE_DIR",
+    "sandbox_removed": true,
+    "production_writes": false,
+    "real_ssh_executed": false
+  },
+  "checks": [
+    {
+      "id": "denied_authorization_no_write",
+      "status": "passed",
+      "evidence": {
+        "verdict": "approval_required",
+        "config_sha256": "63745aef95742025c6d7a1b4fc0e7107e6f3c3eb2e0cb290f33c46f176e6740d",
+        "mode": "0o640",
+        "execution_records": 0,
+        "precheck": [
+          {
+            "n": 1,
+            "cmd": "/Library/Developer/CommandLineTools/usr/bin/python3 -I -B /Users/neo/vscode/mengbin/ops-agent/scripts/w8_acceptance.py --_probe http://127.0.0.1:62630/health",
+            "exit": 0,
+            "passed": true,
+            "detail": "符合预期",
+            "output": "{\"healthy\": true}\n"
+          }
+        ]
+      }
+    },
+    {
+      "id": "approved_configuration_change",
+      "status": "passed",
+      "evidence": {
+        "execution_id": "exe-20261025-150315-03f89b",
+        "execution_status": "succeeded",
+        "exit_code": 0,
+        "snapshot_id": "20261025-150315-bbab3a",
+        "config_sha256": "54326d7faad8457f010ef9addf8e419facee59a4799e9e6702f7a7af641a2c60",
+        "approval_reusable": false
+      }
+    },
+    {
+      "id": "exit_zero_unhealthy_application",
+      "status": "passed",
+      "evidence": {
+        "verdict": "verify_failed",
+        "postcheck": [
+          {
+            "n": 1,
+            "cmd": "/Library/Developer/CommandLineTools/usr/bin/python3 -I -B /Users/neo/vscode/mengbin/ops-agent/scripts/w8_acceptance.py --_probe http://127.0.0.1:62630/health",
+            "exit": 1,
+            "passed": false,
+            "detail": "exit=1: {\"healthy\": false}\n",
+            "output": "{\"healthy\": false}\n"
+          }
+        ],
+        "probe_allowlist": "exact command in isolated config.override.yaml"
+      }
+    },
+    {
+      "id": "rollback_requires_confirmation",
+      "status": "passed",
+      "evidence": {
+        "snapshot_id": "20261025-150315-bbab3a",
+        "refusal": "回滚会覆盖当前文件，属于写操作：请先预览并由人确认（CLI: opsx rollback <id>；agent: ops_rollback 会展示差异并确认）",
+        "config_unchanged": true
+      }
+    },
+    {
+      "id": "confirmed_config_permission_and_service_recovery",
+      "status": "passed",
+      "evidence": {
+        "snapshot_id": "20261025-150315-bbab3a",
+        "execution_id": "exe-20261025-150315-c5f28c",
+        "config_sha256": "63745aef95742025c6d7a1b4fc0e7107e6f3c3eb2e0cb290f33c46f176e6740d",
+        "mode_before": "0o600",
+        "mode_after": "0o640",
+        "health_exit_code": 0,
+        "health_body": "{\"healthy\": true}",
+        "rollback_evidence": "已恢复文件: /private/var/folders/0h/8d9x460n1137n8_f2ssgn9y80000gn/T/opsx-w8-ejcwtylw/service.conf\n回滚前副本: 20261025-150315-89a233（如需撤销本次回滚: opsx rollback 20261025-150315-89a233）"
+      }
+    },
+    {
+      "id": "local_timeout_stops_child_writes",
+      "status": "passed",
+      "evidence": {
+        "exit_code": 4,
+        "execution_id": "exe-20261025-150316-173ed5",
+        "execution_status": "failed",
+        "delayed_child_write": false,
+        "output": "[opsx] 超时：命令超过 0.05s 未结束，已终止进程组",
+        "scope": "local timeout; SSH disconnect remains external"
+      }
+    },
+    {
+      "id": "unknown_execution_blocks_replay",
+      "status": "passed",
+      "evidence": {
+        "execution_id": "exe-20261025-150316-d60d7e",
+        "first_exit_code": -15,
+        "execution_status": "unknown",
+        "replay_exit_code": 120,
+        "write_count": 1,
+        "replay_output": "[opsx] 拒绝执行：本机 上有一条未核实的执行 exe-20261025-150316-d60d7e（执行进程被信号终止（exit -15），执行状态未知）。\n命令可能已经生效一部分，自动重放会造成重复生效。请先核实实际状态，再决定：\n  opsx executions show exe-20261025-150316-d60d7e\n  opsx executions resolve exe-20261025-150316-d60d7e --observed-ok|--observed-failed",
+        "fault": "actual local shell SIGTERM; no SSH transport was simulated"
+      }
+    },
+    {
+      "id": "llm_http_failure_and_recovery",
+      "status": "passed",
+      "evidence": {
+        "transport": "real urllib to loopback HTTP stub",
+        "failure": "LLM API HTTP 503: {\"error\": \"synthetic unavailable\"}",
+        "failure_http_status": 503,
+        "recovery_http_status": 200,
+        "failed_calls": 1,
+        "total_calls": 2,
+        "response": {
+          "role": "assistant",
+          "content": "local-stub-ok"
+        },
+        "real_provider_executed": false
+      }
+    },
+    {
+      "id": "notification_failure_retry_and_recovery",
+      "status": "passed",
+      "evidence": {
+        "transport": "real urllib to loopback webhook stub",
+        "failure": {
+          "id": "20261025-150316-ntf-7e56d1",
+          "created": 1792911796.650441,
+          "created_iso": "2026-10-25 15:03:16",
+          "kind": "anomaly",
+          "severity": "critical",
+          "title": "巡检告警 1 项",
+          "text": "[ops-agent] 巡检告警 1 项\n时间: 2026-10-25 15:03:16｜任务 w8-local｜run w8-failed｜会话 （未记录）\n\n1. [异常] 任务 w8-local 结论：异常：结论：异常\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [
+            {
+              "fingerprint": "task:w8-local",
+              "severity": "critical",
+              "title": "任务 w8-local 结论：异常",
+              "line": "结论：异常",
+              "command": "",
+              "output": "",
+              "transient": false
+            }
+          ],
+          "recoveries": [],
+          "task_id": "w8-local",
+          "run_id": "w8-failed",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:62630/…",
+          "status": "failed",
+          "attempts": 1,
+          "last_error": "HTTP 503: {\"ok\": true}",
+          "next_attempt_ts": 1792911856.651432,
+          "http_status": 503,
+          "last_attempt_iso": "2026-10-25 15:03:16"
+        },
+        "retry": {
+          "id": "20261025-150316-ntf-7e56d1",
+          "created": 1792911796.650441,
+          "created_iso": "2026-10-25 15:03:16",
+          "kind": "anomaly",
+          "severity": "critical",
+          "title": "巡检告警 1 项",
+          "text": "[ops-agent] 巡检告警 1 项\n时间: 2026-10-25 15:03:16｜任务 w8-local｜run w8-failed｜会话 （未记录）\n\n1. [异常] 任务 w8-local 结论：异常：结论：异常\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [
+            {
+              "fingerprint": "task:w8-local",
+              "severity": "critical",
+              "title": "任务 w8-local 结论：异常",
+              "line": "结论：异常",
+              "command": "",
+              "output": "",
+              "transient": false
+            }
+          ],
+          "recoveries": [],
+          "task_id": "w8-local",
+          "run_id": "w8-failed",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:62630/…",
+          "status": "sent",
+          "attempts": 2,
+          "last_error": null,
+          "next_attempt_ts": 0,
+          "http_status": 200,
+          "last_attempt_iso": "2026-10-25 15:03:16",
+          "sent_at": 1792911796.653091,
+          "sent_iso": "2026-10-25 15:03:16"
+        },
+        "recovery": {
+          "id": "20261025-150316-ntf-1967f5",
+          "created": 1792911796.653823,
+          "created_iso": "2026-10-25 15:03:16",
+          "kind": "recovery",
+          "severity": "info",
+          "title": "巡检恢复 1 项",
+          "text": "[ops-agent] 巡检恢复 1 项\n时间: 2026-10-25 15:03:16｜任务 w8-local｜run w8-recovered｜会话 （未记录）\n\n恢复:\n1. 任务 w8-local 结论：异常 已恢复正常（此前持续约 0s）\n\n追溯: opsagent schedule runs --id w8-local｜opsagent events --tail 20",
+          "items": [],
+          "recoveries": [
+            {
+              "fingerprint": "task:w8-local",
+              "title": "任务 w8-local 结论：异常",
+              "first_seen": 1792911796.650441
+            }
+          ],
+          "task_id": "w8-local",
+          "run_id": "w8-recovered",
+          "session_id": null,
+          "report_path": null,
+          "report_paths": [],
+          "fingerprints": [
+            "task:w8-local"
+          ],
+          "endpoint": "http://127.0.0.1:62630/…",
+          "status": "sent",
+          "attempts": 1,
+          "last_error": null,
+          "next_attempt_ts": 0,
+          "http_status": 200,
+          "last_attempt_iso": "2026-10-25 15:03:16",
+          "sent_at": 1792911796.6545799,
+          "sent_iso": "2026-10-25 15:03:16"
+        },
+        "duplicate_recovery_sent": false,
+        "external_recipient_contacted": false
+      }
+    },
+    {
+      "id": "loopback_server_request_evidence",
+      "status": "passed",
+      "evidence": {
+        "server_pid_is_separate": true,
+        "bind_address": "127.0.0.1",
+        "requests": [
+          {
+            "at_utc": "2026-10-25T07:03:15Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-25T07:03:15Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-25T07:03:15Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "GET",
+            "path": "/health",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 503
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 200
+          },
+          {
+            "at_utc": "2026-10-25T07:03:16Z",
+            "method": "POST",
+            "path": "/hook",
+            "http_status": 200
+          }
+        ]
+      }
+    }
+  ],
+  "external_gates": [
+    {
+      "id": "real_ssh_recovery",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "未提供真实测试 SSH 主机；本次未执行 SSH 或远程断线恢复。"
+      }
+    },
+    {
+      "id": "real_llm_provider",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "LLM 仅使用回环 HTTP 桩；未连接真实模型服务。"
+      }
+    },
+    {
+      "id": "real_notification_channel",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "通知仅发送到回环 HTTP 桩；未向外部接收人发送。"
+      }
+    },
+    {
+      "id": "seven_day_readonly_trial",
+      "status": "blocked",
+      "evidence": {
+        "executed": false,
+        "reason": "本次短时演练不能替代修复后连续 7 天观察。"
+      }
+    }
+  ],
+  "evidence_retention": "配置、状态、服务进程均已清理；结构化证据保留在本报告。"
+}

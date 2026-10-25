@@ -345,14 +345,56 @@ def _classify_ssh(cmd: str) -> str | None:
     m = re.fullmatch(r'ssh[ \t]+([A-Za-z0-9_@.\[\]:][A-Za-z0-9_@.\[\]:-]*)[ \t]+"([^"\\]+)"[ \t]*', cmd)
     if not m:
         return None
+    if _has_shell_expansion(cmd):
+        return "R2"  # 外层双引号先由本地 shell 展开，内层单引号不能保护它。
     inner = m[2]
     if re.search(r"(?:^|[;&|\n])\s*env\b", inner):
         return "R2"  # 远程环境可能带生产密钥，不进入只读白名单
     return classify(inner)[0]
 
 
+def _shell_syntax(text: str) -> str:
+    """Mask quoted/escaped data and comments, preserving shell operator offsets."""
+    # 非空白占位保留参数边界，避免把引用的重定向目标跳过并借用后续 /dev/null。
+    masked = list(text)
+    quote, in_word = None, False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote == "'":
+            masked[i] = "\0"
+            if ch == "'":
+                quote = None
+        elif ch == "\\":
+            masked[i] = "\0"
+            if i + 1 < len(text) and (quote is None or text[i + 1] in '$`"\\\n'):
+                i += 1
+                masked[i] = "\0"
+                if text[i] != "\n":
+                    in_word = True
+        elif ch == '"' or (ch == "'" and quote is None):
+            masked[i] = "\0"
+            quote = None if quote == ch else ch
+            in_word = True
+        elif quote is not None:
+            masked[i] = "\0"
+        elif ch == "#":
+            if not in_word:
+                end = text.find("\n", i)
+                end = len(text) if end < 0 else end
+                masked[i + 1:end] = " " * (end - i - 1)
+                i = end - 1
+            else:
+                masked[i] = "\0"
+        else:
+            in_word = ch not in " \t\n;|&()<>"
+        i += 1
+    return "".join(masked)
+
+
 def _has_shell_expansion(seg: str) -> bool:
     """Unexpanded shell parameters can manufacture otherwise forbidden options."""
+    seg = _strip_comment(seg)
     quote = None
     i = 0
     while i < len(seg):
@@ -366,7 +408,9 @@ def _has_shell_expansion(seg: str) -> bool:
             quote = None if quote == '"' else '"'
         elif ch == "'" and quote is None:
             quote = "'"
-        elif ch == "$":
+        elif ch == "`" or (ch == "$" and i + 1 < len(seg) and (
+                seg[i + 1].isalnum() or seg[i + 1] in "_{([@*#?-$!"
+                or (quote is None and seg[i + 1] in "'\""))):
             return True
         i += 1
     return False
@@ -477,26 +521,35 @@ def _has_write_marker(seg: str) -> bool:
     parsed = " ".join(words)
     if _has_option_expansion(seg, words):
         return True
-    if re.search(r"\btee\b|-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", parsed):
+    command = words[0] if words else ""
+    syntax = _shell_syntax(seg)
+    if command == "find" and re.search(
+            r"-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", parsed):
         return True
-    if _has_shell_expansion(seg) or "`" in seg or "<(" in seg or ">(" in seg:
+    if _has_shell_expansion(seg) or "<(" in syntax or ">(" in syntax:
         return True
-    if re.search(r"&>{1,2}", seg):
+    if re.search(r"&>{1,2}", syntax):
         return True
     long_options = [w.partition("=")[0] for w in words
                     if w.startswith("--") and w != "--"]
-    dangerous_options = ("--output", "--open-files-in-pager", "--rotate", "--flush",
+    dangerous_options = ("--rotate", "--flush",
                          "--sync", "--relinquish-var", "--smart-relinquish-var",
                          "--setup-keys", "--update-catalog", "--vacuum-time",
                          "--vacuum-size", "--vacuum-files")
     # getopt/parse-options commonly accept unique abbreviations of long flags.
-    if any(full.startswith(option) for option in long_options for full in dangerous_options):
+    if command == "journalctl" and any(
+            full.startswith(option) for option in long_options for full in dangerous_options):
         return True
-    if re.search(r"^docker\s+compose\s+config\b.*\s-o(?:\s|\S)", parsed):
+    if words[:3] == ["docker", "compose", "config"] and any(
+            (w.startswith("-o") and not w.startswith("--"))
+            or (w.startswith("--") and w != "--" and any(
+                flag.startswith(w.partition("=")[0]) for flag in ("--output", "--lock-image-digests")))
+            for w in words[3:]):
         return True
     if words and words[0] == "git":
         if any(full.startswith(option) for option in long_options
-               for full in ("--upload-pack", "--exec", "--ext-diff", "--textconv")):
+               for full in ("--output", "--open-files-in-pager", "--upload-pack",
+                            "--exec", "--ext-diff", "--textconv")):
             return True  # 这些看似读取的命令可显式运行任意 helper。
         if len(words) > 1 and words[1] == "grep" and any(
                 w.startswith("-") and not w.startswith("--") and "O" in w
@@ -508,7 +561,7 @@ def _has_write_marker(seg: str) -> bool:
             or (w.startswith("-") and not w.startswith("--") and any(c in w for c in "oO"))
             for w in words[1:]):
         return True  # 初始命令可含 shell escape；-o/-O 会写日志文件。
-    for m in re.finditer(r"(\d*)>{1,2}\s*(&[0-9]+|/dev/null(?=\s|$))?", seg):
+    for m in re.finditer(r"(\d*)>{1,2}[ \t]*((?:&[0-9]+|/dev/null)(?=[ \t]|$))?", syntax):
         if m.group(1) != "2" or m.group(2) is None:
             return True
     return False
@@ -588,13 +641,19 @@ _KUBECTL_SEG_RE = re.compile(r"(?:^|[\s/\"'])kubectl(?=[\s\"']|$)")
 
 
 def _segments(cmd: str) -> list[str]:
-    """复合命令分段（只按 shell 分隔符切，不解析 AST）。"""
-    return [seg.strip(" \t") for seg in _SEGMENT_RE.split(cmd) if seg.strip(" \t")]
+    """仅按未引用、未转义的 shell 分隔符切段，保留原始参数。"""
+    parts, start = [], 0
+    for match in _SEGMENT_RE.finditer(_shell_syntax(cmd)):
+        parts.append(cmd[start:match.start()])
+        start = match.end()
+    parts.append(cmd[start:])
+    return [seg.strip(" \t") for seg in parts if seg.strip(" \t")]
 
 
 def _strip_comment(seg: str) -> str:
     """去掉 shell 注释：`kubectl apply … # --context=prod` 里的 context 不会被执行。"""
-    return re.sub(r"(?:^|\s)#[^\n]*$", "", seg).strip(" \t")
+    comment = _shell_syntax(seg).find("#")
+    return (seg[:comment] if comment >= 0 else seg).strip(" \t")
 
 
 def _kubectl_segments(cmd: str) -> list[str]:

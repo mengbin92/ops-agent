@@ -99,6 +99,20 @@ RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `rese
 ./opsagent inspect --target web1 --json
 ```
 
+Docker 重启策略等只读排查可直接使用格式串和管道，引用内的 `=>`、`|` 与正则尾部 `$` 不会被当作写操作：
+
+```bash
+docker inspect --format '{{.Name}} => {{.HostConfig.RestartPolicy.Name}}' app worker
+docker inspect app | grep -E 'Name|RestartPolicy|"Name"'
+docker ps -aq | xargs -r -n1 docker inspect --format '{{.Name}} => {{.HostConfig.RestartPolicy.Name}}'
+sed -n '1,40p' /opt/app/compose.yml
+```
+
+只读白名单同时覆盖 `docker container/image/network/volume` 的列表与 inspect 等查询。
+`xargs` 仅支持固定追加参数的 `docker inspect`（可带 `-r`、`-n N`）；`sed` 仅支持数字行号打印和明确文件名。
+`while`、通用 `awk`/`xargs`、命令替换和动态变量仍无法按只读放行；可先列出对象，再用明确名称批量查询。
+真实输出重定向、Compose config 写文件选项和 Docker 写操作仍需审批，敏感文件读取限制照常生效。
+
 ## 远程执行（SSH 目标）
 
 写操作可以下发到远程机，守门仍在本机跑：同一份 `config.yaml`、同一套审批戳、本地审计。
@@ -269,7 +283,7 @@ python3 scripts/w8_acceptance.py --output /tmp/w8-local-evidence.json
 `--quiesced` 是停写声明，不提供在线全局事务锁；详见[状态恢复操作文档](docs/ops/state-backup-recovery.md)。
 
 本地演练退出 0 仅代表本地通过，JSON 同时列出尚未通过的真实 SSH/LLM/通知和 7 天观察门禁；
-`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-24-w8-local-evidence.json)
+`--require-external` 在这些门禁未完成时退出 2。当前[本地证据](docs/validation/2026-10-25-w8-local-evidence.json)
 为 10/10 通过，整体仍待外部验收。见[测试环境验收步骤](docs/ops/w8-real-environment.md)和
 [受控变更候选版](docs/releases/2026-10-22-controlled-change-candidate.md)。
 
