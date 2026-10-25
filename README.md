@@ -11,6 +11,8 @@
 
 完整历史见 [CHANGELOG](CHANGELOG.md)，安装与升级见对应发布公告；维护者流程见[发版说明](docs/ops/releasing.md)。
 
+后续工作见[下一阶段规划](docs/plans/2026-10-25-next-stage.md)：真实环境验收、连续 7 天只读观察、正式发布门禁与 `v0.1.0` 收口。
+
 ## Agent 形态（opsagent）
 
 自带 agent 内核（`agent/`：loop + provider（OpenAI 兼容 / Anthropic 原生）+ 工具注册表 + 会话持久化），
