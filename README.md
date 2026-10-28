@@ -262,6 +262,7 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   （自动去重），恢复时自动发"已恢复"。
 - **常驻部署**：`docs/ops/` 提供 systemd service（+ timer 替代方案）与 launchd plist
   示例，含加固指令与环境变量文件说明。
+  需要 Mac 休眠后仍连续巡检时，将调度器放到 Linux 主机，见[服务器常驻巡检](docs/ops/server-scheduler.md)。
 
 ### 恢复准备与演练（W8）
 
