@@ -27,7 +27,8 @@
 | 日志粗筛（logscan） | journald `docker.service` 实扫 6821 行/149 组/1.1s 无超时；`docker logs mysql` 正常；存量噪声：dockerd 日志已有 warn/error（非观察期引入） |
 | systemd 托管 | root 用户级 `opsagent-schedule.service`，enabled + active，`Linger=yes`，`Restart=always` |
 | 自动拉起 | kill 主进程后 `NRestarts=1` 恢复，任务频率/预算/下次执行时间不变 |
-| 证据索引 | 服务器 `~/.ops-agent-trial/validation/deploy-20261028.json`（0600） |
+| 证据索引 | 服务器 `~/.ops-agent-trial/validation/deploy-20261028.json`（0600），含 56 次预期执行时间点 |
+| 每日对账 | 服务器 `~/.ops-agent-trial/validation/reconcile.py`（私有，不入库）：实际 run 对预期时点 diff，输出当日 应跑/实跑/成功/失败/错过 |
 
 ## 观察期参数
 
