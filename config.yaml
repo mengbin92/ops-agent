@@ -39,6 +39,13 @@ readonly_patterns:
   - ^sysctl[ \t]+(-a|--all)[ \t]*$
   # 场景预检/后验用：nginx -t 只测语法不重载（reload/start 才是写操作）
   - ^nginx[ \t]+-t[ \t]*$
+  # 预演（would-be 变更）：diff 只对比不落盘；--dry-run 只走校验/准入不写存储。
+  # KUBECTL_EXTERNAL_DIFF 可借 diff 执行任意命令：命令行里出现该赋值时锚定 ^kubectl
+  # 失配自然落入 R2；进程环境自带该变量时由 bash 工具剔除后再执行（core.is_kubectl_diff）。
+  # --dry-run 须为最后一个同名 flag（pflag 后值覆盖前值）：防止 --dry-run=server 拿到 R0
+  # 后再用 --dry-run=none 真正落盘。=true 是旧版本 server 语义。
+  - ^kubectl[ \t]+diff(?=[ \t]|$)
+  - ^kubectl[ \t]+(?:apply|create|replace|patch|set|scale|annotate|label)(?=[ \t])[^;&|]*[ \t]--dry-run(?:=(?:server|client|true)|[ \t]+(?:server|client|true))(?=[ \t]|$)(?![^;&|]*--dry-run)
   - ^(brew[ \t]+(list|info|outdated)|launchctl[ \t]+list)(?=[ \t]|$)
   - ^brew[ \t]+services(?:[ \t]+(list|info)(?=[ \t]|$)|[ \t]*$)
 

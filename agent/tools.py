@@ -23,6 +23,7 @@ import remote  # noqa: E402
 from . import checks  # noqa: E402
 from . import events as events_mod  # noqa: E402
 from . import goal as goal_mod  # noqa: E402
+from . import logscan  # noqa: E402
 from . import memory as memory_mod  # noqa: E402
 from . import schedule as schedule_mod  # noqa: E402
 from . import session as session_mod  # noqa: E402
@@ -134,7 +135,13 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         code, out = remote.run(target, cmd, timeout=timeout)
         return f"[target={target} exit={code}]\n" + _cap(out, f"bash-{target}")
     try:
-        r = core.run_shell(cmd, timeout=timeout)
+        child_env = None
+        if core.is_kubectl_diff(cmd):
+            # diff 尊重 KUBECTL_EXTERNAL_DIFF（可借此执行任意命令）：
+            # R0 预演剔除该变量后执行，"只读预演"才名实相符。
+            child_env = {k: v for k, v in os.environ.items()
+                         if k != "KUBECTL_EXTERNAL_DIFF"}
+        r = core.run_shell(cmd, timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         return f"[超时] 命令超过 {timeout:g}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
@@ -245,14 +252,36 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
         level, _ = core.classify(args["command"])
         # 审批绑定实际执行环境（主机/cwd/k8s context），批准后环境变化即失效。
         env = core.resolve_env(args["command"], target)
+        impact = (args.get("impact") or "").strip()
+        if not impact:
+            # 人确认的是 would-be 变更，不是一条孤立的命令字符串：影响面必须来自
+            # 只读预演（kubectl diff / --dry-run=server / 目标内容与现内容对比）。
+            return ("[opsx 拒绝] 变更单缺少影响面（impact）：先用只读预演确认 would-be 变更"
+                    "（k8s: kubectl diff -f ... 或 kubectl apply --dry-run=server "
+                    "--context <c> -f ...；文件: 对比目标内容与当前内容），"
+                    "写清将改什么状态、影响哪些服务，再提交审批。")
+        snap_files = sorted({str(f).strip() for f in (args.get("snapshot_files") or [])
+                             if str(f).strip()})
+        snap_cmds = [(str(c["command"]), str(c.get("name", "")))
+                     for c in (args.get("snapshot_cmds") or []) if str(c["command"]).strip()]
         warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
         uses = args.get("uses", 1)
         # 次数必须出现在确认框里：否则模型用 uses=100 换来的授权，人看起来和 1 次一样
         times = "1 次（执行后即失效，再执行需重新批准）" if uses == 1 \
             else f"{uses} 次（同一授权可重复执行 {uses} 次）"
+        if snap_files or snap_cmds:
+            rollback = (f"回滚点: 快照文件 {len(snap_files)} 个、快照命令 {len(snap_cmds)} 条"
+                        "（ops_exec 必须带同一份快照参数）")
+        elif level == "R3":
+            rollback = "回滚点: 无（R3 不强制快照；执行结果不可逆）"
+        else:
+            rollback = ("⚠ 本次未声明任何快照：执行后无自动回滚点，"
+                        "回滚只能按命令语义人工进行")
         answer = ctx.ask_user(f"批准此变更？\n执行环境：{core.format_env(env)}\n"
                               f"风险级别：{level}{warning}\n"
                               f"可用次数：{times}\n"
+                              f"影响面（would-be 变更）:\n{core.redact(impact)}\n"
+                              f"{rollback}\n"
                               f"完整命令：\n{args['command']}\n"
                               "输入“确认执行”或 yes 批准，其他回答均拒绝。")
         if not isinstance(answer, str) or answer.strip().casefold() not in {"确认执行", "确认", "yes", "y"}:
@@ -261,7 +290,8 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
             return "[opsx 拒绝] 用户未明确批准此命令，不创建审批戳。"
         path = core.approve(args["command"], ttl_seconds=args.get("ttl_seconds", 900),
                             force=args.get("force", False), target=target, env=env,
-                            uses=uses)
+                            uses=uses, impact=impact, snapshot_files=snap_files,
+                            snapshot_cmds=snap_cmds)
     except (core.OpsxError, remote.RemoteError) as e:
         return f"[opsx 错误] {e}"
     stamp = json.loads(path.read_text(encoding="utf-8"))
@@ -438,11 +468,12 @@ def _scenario_run(args: dict, ctx: ToolContext) -> str:
     return scenario.format_result(result, with_suggestion=True)
 
 
-SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events", "ops_executions"})
+SUBAGENT_TOOLS = frozenset({"bash", "read", "skill", "ops_list", "events", "ops_executions",
+                            "logscan"})
 # 无人值守定时巡检只能用只读工具：没有人类可以确认，approve/exec 一律不可见。
-# inspect 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
+# inspect/logscan 是确定性检查（规则先跑，模型只解读），因此允许出现在无人值守上下文。
 SCHEDULED_TOOLS = frozenset({"bash", "read", "skill", "workflow", "subagent",
-                             "inspect", "events", "ops_executions", "ops_list"})
+                             "inspect", "logscan", "events", "ops_executions", "ops_list"})
 SUBAGENT_MAX_TASKS = 4
 SUBAGENT_MAX_TURNS = 8
 WORKFLOW_PREV_LIMIT = 6000
@@ -595,6 +626,47 @@ def _inspect(args: dict, ctx: ToolContext) -> str:
         return text[:keep] + tail + note
     return (f"{text}\n\n" + (f"[全量报告] {path}" if path else "[报告未能落盘，以上为完整内容]")
             + note)
+
+
+def _logscan(args: dict, ctx: ToolContext) -> str:
+    """确定性日志粗筛（只读）：级别/关键词收口 + 聚类 + 时间分布。
+
+    模型读语义前的规则第一道；样本经统一脱敏出口，命中敏感路径直接拒绝。
+    """
+    path = (args.get("path") or "").strip()
+    target = (args.get("target") or "").strip()
+    if path:
+        real = os.path.realpath(os.path.expanduser(path))
+        if (core.sensitive_path(path) or core.sensitive_path(real)
+                or core.sensitive_dir(path) or core.sensitive_dir(real)):
+            core.audit("logscan-deny", path=path, target=target or None)
+            return ("[opsx 拒绝] 该路径命中敏感文件/目录规则（凭据、私钥、快照原件等），"
+                    "日志粗筛同样不读取。确需排查请由人直接操作。")
+    lines = args.get("lines") or logscan.DEFAULT_LINES
+    top = args.get("top") or logscan.DEFAULT_TOP
+    if type(lines) is not int or not 1 <= lines <= 2_000_000:
+        return "[错误] lines 须为 1-2000000 的整数"
+    if type(top) is not int or not 1 <= top <= 50:
+        return "[错误] top 须为 1-50 的整数"
+    try:
+        desc, log_lines = logscan.detect_source(
+            path=path, unit=(args.get("unit") or "").strip(),
+            container=(args.get("container") or "").strip(),
+            since=(args.get("since") or "").strip(),
+            until=(args.get("until") or "").strip(),
+            lines=lines, target=target)
+        report = logscan.scan(log_lines, top=top,
+                              pattern=(args.get("pattern") or "").strip() or None)
+    except logscan.ScanSourceError as e:
+        return f"[logscan 错误] {e}"
+    except re.error as e:
+        return f"[logscan 错误] pattern 正则非法: {e}"
+    except (core.OpsxError, remote.RemoteError) as e:
+        return f"[logscan 错误] {e}"
+    core.audit("logscan", desc=desc, scanned=report["scanned"],
+               groups=report["group_total"], partial=report["partial"],
+               target=target or None)
+    return _cap(logscan.format_report(desc, report), "logscan")
 
 
 def _events(args: dict, ctx: ToolContext) -> str:
@@ -844,6 +916,30 @@ REGISTRY: dict[str, dict] = {
                           []),
         "handler": _inspect, "read_only": True,
     },
+    "logscan": {
+        "schema": _schema("logscan",
+                          "确定性日志粗筛（只读）：按错误级别/关键词收口、模式聚类去重、"
+                          "时间桶分布，只把可疑聚类的少量样本交给你读语义。日志量大时先跑它，"
+                          "不要直接用 grep/tail 逐轮硬翻原始日志。无命中≠没问题：粗筛规则外的"
+                          "语义异常仍需针对性复核。",
+                          {"path": {"type": "string", "description": "本机日志文件路径（三选一）"},
+                           "unit": {"type": "string",
+                                    "description": "journalctl 单元名，如 nginx.service（三选一）"},
+                           "container": {"type": "string", "description": "docker 容器名（三选一）"},
+                           "since": {"type": "string",
+                                     "description": "起始时间 ISO（journalctl/docker 有效）"},
+                           "until": {"type": "string", "description": "结束时间 ISO（journalctl 有效）"},
+                           "lines": {"type": "integer", "default": 200000,
+                                     "description": "最多扫描的最近行数（1-2000000）"},
+                           "top": {"type": "integer", "default": 10,
+                                   "description": "报告的可疑聚类数（1-50）"},
+                           "pattern": {"type": "string",
+                                       "description": "额外聚焦的正则（只分析命中的行）"},
+                           "target": {"type": "string",
+                                      "description": "SSH 目标名；远程仅支持 unit/container"}},
+                          []),
+        "handler": _logscan, "read_only": True,
+    },
     "ask_user": {
         "schema": _schema("ask_user", "向用户提问并等待回答。写操作审批、歧义澄清时使用。",
                           {"question": {"type": "string", "description": "向用户展示的问题（含变更单）"}},
@@ -853,8 +949,8 @@ REGISTRY: dict[str, dict] = {
     "subagent": {
         "schema": _schema("subagent",
                           f"只读排查子代理：并行执行多个独立检查任务（最多 {SUBAGENT_MAX_TASKS} 个），"
-                          "各自返回结论与证据。子代理只能用 bash(R0)/read/skill/ops_list，不能写；"
-                          "需要变更时把建议写进结论，由主代理走变更单流程。",
+                          "各自返回结论与证据。子代理只能用 bash(R0)/read/skill/logscan/ops_list，"
+                          "不能写；需要变更时把建议写进结论，由主代理走变更单流程。",
                           {"tasks": {"type": "array", "items": {"type": "string"},
                                      "description": "子任务描述（写清目标主机、命名空间、日志路径与要回答的问题）"}},
                           ["tasks"]),
@@ -905,10 +1001,22 @@ REGISTRY: dict[str, dict] = {
     },
     "ops_approve": {
         "schema": _schema("ops_approve",
-                          "提交变更单后调用：工具向用户确认此命令，明确批准后才创建审批戳（R3 需 force=true）。"
+                          "提交变更单后调用：工具向用户确认完整变更单（影响面+快照声明+命令），"
+                          "明确批准后才创建审批戳（R3 需 force=true）。"
                           "戳绑定实际主机、工作目录、k8s context（kubectl 变更须在命令中写 --context）；"
                           "带 target 时只对该目标有效。环境变化后旧戳失效。",
                           {"command": {"type": "string"},
+                           "impact": {"type": "string",
+                                      "description": "影响面（必填）：将改什么状态、影响哪些服务。"
+                                                     "先跑只读预演再填写：k8s 用 kubectl diff 或 "
+                                                     "kubectl apply --dry-run=server --context <c> -f ...；"
+                                                     "文件对比目标内容与当前内容"},
+                           "snapshot_files": {"type": "array", "items": {"type": "string"},
+                                              "description": "执行前需快照的文件（声明后 ops_exec 必须带同一份）"},
+                           "snapshot_cmds": {"type": "array", "items": {"type": "object",
+                                             "properties": {"command": {"type": "string"},
+                                                            "name": {"type": "string"}},
+                                             "required": ["command"]}},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
                            "ttl_seconds": {"type": "integer", "default": 900},
                            "force": {"type": "boolean", "default": False},
@@ -927,10 +1035,12 @@ REGISTRY: dict[str, dict] = {
     "ops_exec": {
         "schema": _schema("ops_exec",
                           "原子执行变更：校验审批戳→快照→执行→审计。带 target 时经 SSH 在目标机执行，"
-                          "快照拉回本机存档。",
+                          "快照拉回本机存档。审批戳若声明过快照计划，本工具的快照参数必须与之完全一致，"
+                          "否则拒绝执行。",
                           {"command": {"type": "string"},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
-                           "snapshot_file": {"type": "string", "description": "执行前需快照的文件（可选）"},
+                           "snapshot_file": {"type": "string", "description": "执行前需快照的文件（可选；"
+                                                                              "审批声明过则必须与之一致）"},
                            "snapshot_cmds": {"type": "array", "items": {"type": "object",
                                              "properties": {"command": {"type": "string"},
                                                             "name": {"type": "string"}},

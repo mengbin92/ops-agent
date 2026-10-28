@@ -26,6 +26,39 @@ def test_classify():
     assert core.classify("some-unknown-write")[0] == "R2"
 
 
+def test_dry_run_preview_whitelist():
+    """只读预演（would-be 变更）进 R0：diff 与 --dry-run=server|client 直接放行，
+    常见绕过（值覆盖、外部 diff 命令、重定向、命令替换）仍须审批。"""
+    for cmd in ("kubectl diff -f deploy.yaml",
+                "kubectl diff --context=prod -f x.yaml",
+                "kubectl apply --dry-run=server -f deploy.yaml",
+                "kubectl apply --dry-run=client -f deploy.yaml",
+                "kubectl apply -f deploy.yaml --dry-run=server",
+                "kubectl apply --dry-run server -f deploy.yaml",
+                "kubectl apply --dry-run=true -f deploy.yaml",  # 旧版本 server 语义
+                "kubectl patch --dry-run=server -p '{}' deploy/x --context=prod",
+                "kubectl create --dry-run=server -f x.yaml",
+                "kubectl scale --dry-run=server deploy x --replicas=3 --context=prod"):
+        assert core.classify(cmd)[0] == "R0", cmd
+        assert core.check(cmd)[0] == 0, cmd
+    # 仍会真正落盘的形态不能借白名单：值被后置 flag 覆盖、none/false、无 flag
+    for cmd in ("kubectl apply --dry-run=server -f x.yaml --dry-run=none",
+                "kubectl apply --dry-run=none -f x.yaml",
+                "kubectl apply --dry-run=false -f x.yaml",
+                "kubectl apply --dry-run=server-side -f x.yaml",
+                "kubectl apply -f x.yaml",
+                "kubectl rollout restart deploy/x --dry-run=server",
+                "kubectl diff -f x.yaml > /tmp/diff-out",
+                "kubectl diff -f $(pwd)/x.yaml",
+                "KUBECTL_EXTERNAL_DIFF=touch-pwned kubectl diff -f x.yaml",
+                "KUBECONFIG=~/.kube/prod KUBECTL_EXTERNAL_DIFF=evil kubectl diff -f x.yaml"):
+        assert core.classify(cmd)[0] != "R0", cmd
+    assert core.is_kubectl_diff("kubectl diff -f x.yaml")
+    assert core.is_kubectl_diff("KUBECONFIG=~/.kube/c kubectl diff -f x.yaml")
+    assert not core.is_kubectl_diff("kubectl get pods")
+    assert not core.is_kubectl_diff("kubectl apply --dry-run=server -f x.yaml")
+
+
 def test_audit():
     core.audit("test", foo=1)
     line = Path(core.STATE_DIR, "audit.jsonl").read_text().strip().splitlines()[-1]
@@ -430,7 +463,9 @@ def test_mcp_write_cycle():
             cmd = f"echo v2 > {f}"
             _, payload = c.call_tool("ops_revoke", {"command": "systemctl restart mcp-none"})
             assert payload["revoked"] is False
-            _, payload = c.call_tool("ops_approve", {"command": cmd, "ttl_seconds": 60})
+            _, payload = c.call_tool("ops_approve",
+                                     {"command": cmd, "ttl_seconds": 60, "impact": "改写 mcp-demo.conf",
+                                      "snapshot_files": [str(f)]})
             assert payload["level"] == "R2"
             _, payload = c.call_tool("ops_exec", {"command": cmd, "snapshot_files": [str(f)]})
             assert payload["exit_code"] == 0 and payload["snapshot_id"]
@@ -517,7 +552,9 @@ def test_agent_loop_approval_flow():
         cmd = f"echo v2 > {f}"
         restore = _stub_llm([
             {"role": "assistant", "content": "", "tool_calls": [
-                _tool_call("c2", "ops_approve", {"command": cmd, "ttl_seconds": 60})]},
+                _tool_call("c2", "ops_approve",
+                           {"command": cmd, "ttl_seconds": 60, "impact": "改写 svc.conf",
+                            "snapshot_files": [str(f)]})]},
             {"role": "assistant", "content": "", "tool_calls": [
                 _tool_call("c3", "ops_exec", {"command": cmd, "snapshot_file": str(f)})]},
             {"role": "assistant", "content": "变更完成。"},
@@ -1879,8 +1916,9 @@ def test_subagent_parallel_and_readonly():
     assert "只读上下文" in agent_tools.dispatch(
         "ops_exec", {"command": "systemctl restart x"}, sub_ctx)
     names = {s["function"]["name"] for s in agent_tools.tool_schemas(sub_ctx)}
-    # events 是只读时间线查询（W4），与 bash/read 同级；写工具仍不可见。
-    assert names == {"bash", "read", "skill", "events", "ops_executions", "ops_list"}
+    # events 是只读时间线查询（W4），logscan 是确定性日志粗筛：规则先收口，模型只读结论。
+    assert names == {"bash", "read", "skill", "events", "ops_executions", "ops_list",
+                     "logscan"}
     assert "subagent" not in names  # 不能继续嵌套派生
     # 空任务 / 超量
     assert "[错误]" in agent_tools.dispatch("subagent", {"tasks": []}, agent_tools.ToolContext())
@@ -2128,7 +2166,9 @@ def test_ops_approve_requires_interactive_channel():
                                agent_tools.ToolContext())
     assert "没有可确认的用户通道" in out
     assert core.check_stamp(cmd) is False
-    out = agent_tools.dispatch("ops_approve", {"command": cmd, "ttl_seconds": 60},
+    out = agent_tools.dispatch("ops_approve",
+                               {"command": cmd, "ttl_seconds": 60,
+                                "impact": "重启 approve-gate 服务，中断其在途请求"},
                                agent_tools.ToolContext(ask_user=lambda q: "确认"))
     assert "审批戳已创建" in out and core.check_stamp(cmd) is True
     core.revoke(cmd)
@@ -2139,18 +2179,269 @@ def test_ops_approve_requires_explicit_answer_for_command_and_target():
     cmd = "systemctl restart explicit-approval"
     for answer in (None, "", "no", "拒绝", "还需要检查", "false"):
         core.approve(cmd)
-        out = agent_tools.dispatch("ops_approve", {"command": cmd},
+        out = agent_tools.dispatch("ops_approve",
+                                   {"command": cmd, "impact": "重启 explicit-approval"},
             agent_tools.ToolContext(ask_user=lambda q, answer=answer: answer))
         assert "未明确批准" in out and not core.check_stamp(cmd), out
     questions = []
     def approve(question):
         questions.append(question)
         return "确认执行"
-    out = agent_tools.dispatch("ops_approve", {"command": cmd},
+    out = agent_tools.dispatch("ops_approve",
+                               {"command": cmd, "impact": "重启 explicit-approval 服务"},
                                agent_tools.ToolContext(ask_user=approve))
     assert "审批戳已创建" in out and core.check_stamp(cmd)
     assert cmd in questions[0] and "本机" in questions[0] and "R1" in questions[0]
+    assert "影响面" in questions[0] and "重启 explicit-approval 服务" in questions[0]
     core.revoke(cmd)
+
+
+def test_ops_approve_requires_impact_from_dry_run():
+    """影响面（would-be 变更）是变更单必填项：缺了直接拒绝，并提示先做只读预演。"""
+    from agent import tools as agent_tools
+    cmd = "systemctl restart needs-impact"
+    ctx = agent_tools.ToolContext(ask_user=lambda q: "确认执行")
+    out = agent_tools.dispatch("ops_approve", {"command": cmd}, ctx)
+    assert "缺少影响面" in out and "dry-run" in out, out
+    assert core.check_stamp(cmd) is False
+    out = agent_tools.dispatch("ops_approve", {"command": cmd, "impact": "  "}, ctx)
+    assert "缺少影响面" in out and core.check_stamp(cmd) is False
+    out = agent_tools.dispatch("ops_approve",
+                               {"command": cmd, "impact": "重启 needs-impact，连接短暂中断"},
+                               ctx)
+    assert "审批戳已创建" in out and core.check_stamp(cmd) is True
+    stamp = core.get_stamp(cmd)
+    assert stamp.get("impact") == "重启 needs-impact，连接短暂中断"
+    core.revoke(cmd)
+
+
+def test_ops_approve_dialog_warns_without_snapshots():
+    """确认框必须如实呈现回滚点：无快照声明时给出醒目警告（R1/R2）。"""
+    from agent import tools as agent_tools
+    cmd = "systemctl restart no-snapshot-plan"
+    questions = []
+    ctx = agent_tools.ToolContext(ask_user=lambda q: questions.append(q) or "确认执行")
+    agent_tools.dispatch("ops_approve",
+                         {"command": cmd, "impact": "重启服务"}, ctx)
+    assert "无自动回滚点" in questions[0], questions[0]
+    stamp = core.get_stamp(cmd)
+    assert stamp is not None and stamp.get("snapshot_files") == []
+    core.revoke(cmd)
+    f = "/etc/example.conf"
+    agent_tools.dispatch("ops_approve",
+                         {"command": cmd, "impact": "重启服务",
+                          "snapshot_files": [f],
+                          "snapshot_cmds": [{"command": "systemctl show example"}]}, ctx)
+    assert "回滚点" in questions[1] and "无自动回滚点" not in questions[1]
+    stamp = core.get_stamp(cmd)
+    assert stamp.get("snapshot_files") == [f]
+    assert stamp.get("snapshot_cmds") == [{"command": "systemctl show example", "name": ""}]
+    core.revoke(cmd)
+
+
+def test_exec_enforces_snapshot_declaration():
+    """审批戳声明的快照计划是批准内容的一部分：执行参数不一致必须拒绝。"""
+    import shlex
+    cmd = "systemctl restart declared-snap"
+    core.approve(cmd, impact="重启服务", snapshot_files=["/etc/a.conf"])
+    assert core.check_snapshot_declaration(cmd, None, ["/etc/a.conf"], []) is None
+    msg = core.check_snapshot_declaration(cmd, None, [], [])
+    assert msg and "不一致" in msg
+    msg = core.check_snapshot_declaration(cmd, None, ["/etc/other.conf"], [])
+    assert msg and "不一致" in msg
+    core.revoke(cmd)
+    # 旧戳/CLI 直批（无声明键）不做强校验：向后兼容
+    core.approve(cmd)
+    assert core.check_snapshot_declaration(cmd, None, ["/etc/x"], []) is None
+    core.revoke(cmd)
+    # exec_change 全链路：声明了却少带快照 → 拒绝且不执行
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "declared.conf"
+        f.write_text("v1")
+        write_cmd = f"echo v2 > {shlex.quote(str(f))}"
+        core.approve(write_cmd, impact="改配置", snapshot_files=[str(f)])
+        code, sid, out = core.exec_change(write_cmd)
+        assert code == 2 and "不一致" in out and sid is None, out
+        assert f.read_text() == "v1"   # 命令未执行
+        code, sid, out = core.exec_change(write_cmd, [str(f)])
+        assert code == 0 and sid and f.read_text() == "v2\n"
+        # 显式声明空快照计划（=人确认过"无回滚点"）：与空参数一致，放行
+        bare_cmd = f"echo v3 > {shlex.quote(str(f))}"
+        core.approve(bare_cmd, impact="再改配置", snapshot_files=[], snapshot_cmds=[])
+        code, sid, out = core.exec_change(bare_cmd)
+        assert code == 0 and sid is None
+        core.revoke(bare_cmd)
+        # 旧形态戳（无声明键）：不做一致性校验，但执行后明确警告没有自动回滚点
+        core.approve(bare_cmd)
+        code, sid, out = core.exec_change(bare_cmd)
+        assert code == 0 and sid is None and "无自动回滚点" in out, out
+
+
+def test_ops_exec_snapshot_args_must_match_stamp():
+    """工具层：ops_exec 的快照参数与审批声明不一致时拒绝执行。"""
+    from agent import tools as agent_tools
+    import shlex
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "tool-match.conf"
+        f.write_text("v1")
+        cmd = f"echo v2 > {shlex.quote(str(f))}"
+        ctx = agent_tools.ToolContext(ask_user=lambda q: "确认执行")
+        out = agent_tools.dispatch("ops_approve",
+                                   {"command": cmd, "impact": "改配置",
+                                    "snapshot_files": [str(f)]}, ctx)
+        assert "审批戳已创建" in out
+        out = agent_tools.dispatch("ops_exec", {"command": cmd}, ctx)  # 少带快照
+        assert "[opsx 拒绝]" in out and "不一致" in out, out
+        assert f.read_text() == "v1"
+        out = agent_tools.dispatch("ops_exec", {"command": cmd, "snapshot_file": str(f)}, ctx)
+        assert "[完成]" in out and f.read_text() == "v2\n", out
+
+
+def test_bash_sanitizes_kubectl_external_diff_env():
+    """kubectl diff 进 R0 后，进程环境里的 KUBECTL_EXTERNAL_DIFF 必须被剔除，
+    否则"只读预演"可被环境变量变成任意命令执行。"""
+    from agent import tools as agent_tools
+    from unittest import mock
+    import subprocess
+    os.environ["KUBECTL_EXTERNAL_DIFF"] = "pwned"
+    try:
+        with mock.patch.object(core, "run_shell") as run:
+            run.return_value = subprocess.CompletedProcess("kubectl diff", 0, "diff-out", "")
+            out = agent_tools.dispatch("bash", {"command": "kubectl diff -f deploy.yaml"},
+                                       agent_tools.ToolContext())
+        assert "[exit=0]" in out and run.called
+        _, kwargs = run.call_args
+        assert kwargs.get("env") is not None, "diff 执行应传入剔除后的环境"
+        assert "KUBECTL_EXTERNAL_DIFF" not in kwargs["env"]
+        # 非 diff 命令不受影响：继承环境（env=None）
+        with mock.patch.object(core, "run_shell") as run:
+            run.return_value = subprocess.CompletedProcess("kubectl get pods", 0, "pods", "")
+            agent_tools.dispatch("bash", {"command": "kubectl get pods"},
+                                 agent_tools.ToolContext())
+        _, kwargs = run.call_args
+        assert kwargs.get("env") is None
+    finally:
+        del os.environ["KUBECTL_EXTERNAL_DIFF"]
+
+
+def test_mcp_approve_requires_impact_and_declares_snapshots():
+    c = McpClient()
+    try:
+        cmd = "systemctl restart mcp-impact"
+        result, _ = c.call_tool("ops_approve", {"command": cmd})
+        assert result["isError"] is True and "impact" in result["content"][0]["text"]
+        result, _ = c.call_tool("ops_approve", {"command": cmd, "impact": "重启 mcp-impact"})
+        assert not result.get("isError"), result
+        stamp = core.get_stamp(cmd)
+        assert stamp.get("impact") == "重启 mcp-impact"
+        assert stamp.get("snapshot_files") == []
+        core.revoke(cmd)
+    finally:
+        c.close()
+
+
+def test_logscan_finds_buried_faults_without_false_positives():
+    """复刻埋点实验：3 个故障组埋进 490 行噪音，规则粗筛应全部命中且零误报。"""
+    from agent import logscan
+    noise = [
+        f"2026-10-27T14:{i % 60:02d}:{i % 60:02d} INFO request id=req-{i} "
+        f"path=/api/status status=200 dur_ms={i}"
+        for i in range(490)
+    ]
+    faults = []
+    for i in range(20):   # 故障 1：高频 error，分散在不同秒
+        faults.append(f"2026-10-27T14:2{i % 10}:0{i % 6} ERROR upstream 10.0.0.5:5432 "
+                      f"timed out after 3000ms (req-{1000 + i})")
+    for i in range(5):    # 故障 2：异常堆栈
+        faults.append(f"2026-10-27T14:31:1{i} Traceback (most recent call last): "
+                      "ValueError: bad config section web")
+    for i in range(10):   # 故障 3：nginx 5xx access
+        faults.append(f'10.1.2.3 - - [27/Oct/2026:14:40:{i:02d} +0800] '
+                      '"GET /pay HTTP/1.1" 502 37 "-" "curl/8"')
+    report = logscan.scan(noise + faults, top=10)
+    assert report["group_total"] == 3, report["groups"]
+    g1, g2, g3 = report["groups"]
+    assert g1["level"] == "error" and g1["count"] == 20 and "timed out" in g1["skeleton"]
+    assert g2["count"] == 10 and "<n>" in g2["skeleton"]   # 502 行归一化后同模式
+    assert g3["count"] == 5 and "Traceback" in g3["skeleton"]
+    skels = "\n".join(g["skeleton"] for g in report["groups"])
+    assert "request id=req-" not in skels          # 干净 info 行零误报
+    assert report["level_counts"].get("error") == 20
+    assert report["buckets"], "有 ISO 时间戳就应出时间分布"
+    peak = max(sum(c.values()) for c in report["buckets"].values())
+    assert peak >= 10   # 故障 3 的 10 条 502 同落 14:40 桶：激增在时间分布里可见
+
+
+def test_logscan_report_is_bounded_and_redacts_samples():
+    from agent import logscan
+    lines = [
+        "2026-10-27T15:00:00 ERROR login failed token=sk-abcdefghijklmnop1234",
+        "2026-10-27T15:00:01 ERROR login failed token=sk-abcdefghijklmnop1234",
+    ]
+    text = logscan.format_report("journalctl -u app -n 2", logscan.scan(lines))
+    assert "sk-abcdefghijklmnop1234" not in text and "[已脱敏]" in text
+    assert len(text) < 3000, "聚类报告必须有界，不整份导出日志"
+    assert "journalctl -u app -n 2" in text      # 结论附证据命令
+
+
+def test_logscan_no_hit_and_partial_are_honest():
+    from agent import logscan
+    clean = [f"2026-10-27T15:{i % 60:02d}:00 INFO all good seq={i}" for i in range(50)]
+    text = logscan.format_report("desc", logscan.scan(clean))
+    assert "未发现错误级别/关键词命中" in text and "语义异常" in text
+    report = logscan.scan((f"line {i} ERROR boom" for i in range(100000)),
+                          time_budget=0.0)
+    assert report["partial"] is True and report["scanned"] < 100000
+
+
+def test_logscan_pattern_focus_and_source_validation():
+    from agent import logscan
+    lines = ["ERROR alpha failed", "ERROR beta failed", "INFO gamma ok"]
+    report = logscan.scan(lines, pattern="alpha|gamma")
+    assert report["group_total"] == 1 and "alpha" in report["groups"][0]["skeleton"]
+    for bad_args in ({"path": "x", "unit": "y"}, {"path": "x", "container": "c"}, {}):
+        try:
+            logscan.detect_source(**bad_args)
+            raise AssertionError(f"来源参数应三选一: {bad_args}")
+        except logscan.ScanSourceError:
+            pass
+    try:
+        logscan.detect_source(path="/nonexistent/opsx-app.log")
+        raise AssertionError("不存在文件应报错")
+    except logscan.ScanSourceError as e:
+        assert "不是常规文件" in str(e)
+
+
+def test_logscan_tool_end_to_end():
+    from agent import tools as agent_tools
+    assert "logscan" in agent_tools.SUBAGENT_TOOLS
+    assert "logscan" in agent_tools.SCHEDULED_TOOLS
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "app.log"
+        rows = [f"2026-10-27T15:00:{i:02d} INFO ok seq={i}" for i in range(30)]
+        rows += ["2026-10-27T15:01:00 ERROR db connection refused"] * 3
+        rows += ["2026-10-27T15:01:01 WARN retry 1/3"] * 2
+        f.write_text("\n".join(rows) + "\n")
+        ctx = agent_tools.ToolContext()
+        out = agent_tools.dispatch("logscan", {"path": str(f)}, ctx)
+        assert "可疑聚类" in out and "connection refused" in out
+        assert "L34" in out, "样本要给行号定位，供 read 跟进"
+        assert "WARN retry" in out or "retry" in out
+        bad = agent_tools.dispatch("logscan", {"path": str(f), "pattern": "("}, ctx)
+        assert "pattern 正则非法" in bad
+        empty = Path(td) / "clean.log"
+        empty.write_text("2026-10-27T15:00:00 INFO nothing\n")
+        out = agent_tools.dispatch("logscan", {"path": str(empty)}, ctx)
+        assert "未发现错误级别/关键词命中" in out
+        # 敏感路径同 read/bash 一致拒绝（.env 属凭据类）
+        cred = Path(td) / ".env"
+        cred.write_text("TOKEN=x\n")
+        out = agent_tools.dispatch("logscan", {"path": str(cred)}, ctx)
+        assert "[opsx 拒绝]" in out and "敏感" in out
+        # read_only 上下文（子代理/定时）可用
+        ro = agent_tools.ToolContext(allowed=agent_tools.SUBAGENT_TOOLS)
+        out = agent_tools.dispatch("logscan", {"path": str(f)}, ro)
+        assert "可疑聚类" in out
 
 
 def test_goal_lifecycle():

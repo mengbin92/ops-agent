@@ -77,6 +77,12 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--target", default="", help="SSH 目标名（戳只对该目标有效）；省略=本机")
     a.add_argument("--uses", type=int, default=1,
                    help="该授权允许执行几次（默认 1：一次批准只生效一次）")
+    a.add_argument("--impact", default="",
+                   help="影响面说明（将改什么状态、影响哪些服务）；声明后随戳保存")
+    a.add_argument("--snapshot-file", action="append", default=[],
+                   help="执行前需快照的文件；可多次。声明后 exec 必须带同一份")
+    a.add_argument("--snapshot-cmd", action="append", default=[],
+                   help="'name::command' 形式的状态抓取命令；可多次")
 
     rv = sub.add_parser("revoke", help="撤销审批戳（用户取消变更）")
     rv.add_argument("command", nargs="+")
@@ -207,9 +213,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.sub == "approve":
             if args.target:
                 remote.get_target(args.target)  # 只允许给注册过的目标建戳
+            snap_cmds = []
+            for spec in args.snapshot_cmd:
+                name, _, cmd = spec.partition("::")
+                if not _:
+                    name, cmd = "", spec
+                if not cmd.strip():
+                    raise core.OpsxError("快照命令不能为空")
+                snap_cmds.append((cmd, name))
             path = core.approve(_join(args.command), ttl_seconds=args.ttl,
                                 force=args.force, target=args.target or None,
-                                uses=args.uses)
+                                uses=args.uses,
+                                impact=args.impact or None,
+                                snapshot_files=args.snapshot_file or None,
+                                snapshot_cmds=snap_cmds or None)
             stamp = json.loads(path.read_text(encoding="utf-8"))
             print(f"已授权（级别 {stamp['level']}，TTL {args.ttl}s，可用 {args.uses} 次，"
                   f"{core.format_env(stamp['env'])}）")

@@ -401,6 +401,10 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
             output = core.redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
+    declared = core.check_snapshot_declaration(cmd, name, snapshot_files, snapshot_cmds)
+    if declared:
+        core._safe_audit("exec-abort", cmd=cmd, target=name, reason="快照参数与审批声明不一致")
+        return 2, None, declared
 
     core._validate_lock_args(name, lock_wait)   # 参数错误要在建记录之前就失败
     # env 必须与审批时同源（core.resolve_env = target_env + k8s 作用域）：
@@ -455,6 +459,9 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
             execution.update(rec["id"], phase="exec")
             dispatched = True   # 从这一刻起远端可能已经生效
             exit_code, status, output, err = _run_remote_change(name, cmd, timeout)
+            if sid is None and core.classify(cmd)[0] != "R0":
+                output += ("\n[opsx] 注意：本次变更没有任何快照（未声明 snapshot_files/"
+                           "snapshot_cmds），无自动回滚点；如需回滚只能按命令语义人工恢复。")
             execution.finish(rec["id"], status, exit_code=exit_code, error=err,
                              output=output)
     except core.TargetBusy as e:

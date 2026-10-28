@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- 写操作工具层默认"先预演后执行"：`kubectl diff` 与 `kubectl apply/create/replace/patch/set/scale/annotate/label --dry-run=server|client|true` 进入 R0 白名单，would-be 变更零摩擦预演；`KUBECTL_EXTERNAL_DIFF` 赋值失配锚定白名单、进程环境变量由 bash 工具执行前剔除，堵死借 diff 执行任意命令的绕过。
+- 新只读工具 `logscan`（确定性日志粗筛）：错误级别/关键词收口 + 模式聚类去重 + 时间桶分布，只把可疑聚类的少量样本与行号/时间指针交给模型读语义；支持本机文件、journalctl、docker logs（远程目标仅后两者）。模型独占日志第一道成为过去式：子代理与无人值守定时上下文均可用，敏感路径同 read/bash 一致拒绝，样本统一脱敏，部分扫描如实标注，无命中明确提示"≠没问题"。
+- 变更单结构化进审批戳：ops_approve（agent 工具 / MCP / CLI）新增必填 `impact`（影响面：将改什么状态、影响哪些服务）与 `snapshot_files`/`snapshot_cmds` 快照声明，确认框整段渲染；R1/R2 未声明快照时确认框醒目标注"无自动回滚点"。
+- 快照声明与执行参数强一致：审批戳声明过快照计划后，core/remote `exec_change` 校验执行参数与声明完全一致，不一致拒绝执行；未带任何快照的变更执行后明确警告无自动回滚点。
+
 ### Fixed
 
 - 修复 Docker inspect 格式串中的重定向样式文本、引号内 grep 管道符和正则尾部 `$` 被误判为 R2；共享 shell 分段与写标记检查保留引用和转义语义。

@@ -66,10 +66,27 @@ TOOLS = [
         },
         "required": ["command"],
     }),
-    _tool("ops_approve", "为命令创建审批戳（R3 需 force=true）", {
+    _tool("ops_approve", "为命令创建审批戳（R3 需 force=true）；impact 影响面必填，"
+                         "快照声明后 ops_exec 必须带同一份快照参数", {
         "type": "object",
         "properties": {
             "command": {"type": "string"},
+            "impact": {"type": "string",
+                       "description": "影响面：将改什么状态、影响哪些服务。先跑只读预演"
+                                      "（kubectl diff / kubectl apply --dry-run=server / "
+                                      "目标内容与现内容对比）再填写"},
+            "snapshot_files": {"type": "array", "items": {"type": "string"}},
+            "snapshot_cmds": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "name": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
             "ttl_seconds": {"type": "integer", "default": 900},
             "force": {"type": "boolean", "default": False},
             "uses": {"type": "integer", "default": 1,
@@ -153,11 +170,24 @@ def call_tool(name, args):
         return _result({"snapshot_id": sid})
     if name == "ops_approve":
         cmd = _require(args, "command")
+        impact = args.get("impact")
+        if not isinstance(impact, str) or not impact.strip():
+            raise core.OpsxError(
+                "变更单缺少影响面 impact：先用只读预演（kubectl diff / "
+                "kubectl apply --dry-run=server / 目标内容与现内容对比）"
+                "确认 would-be 变更，写清将改什么状态、影响哪些服务，再提交审批")
+        snap_files = [str(f).strip() for f in (args.get("snapshot_files") or [])
+                      if str(f).strip()]
+        snap_cmds = [{"command": str(c["command"]), "name": str(c.get("name", ""))}
+                     for c in (args.get("snapshot_cmds") or [])]
         path = core.approve(
             cmd,
             ttl_seconds=args.get("ttl_seconds", 900),
             force=args.get("force", False),
             uses=args.get("uses", 1),
+            impact=impact,
+            snapshot_files=snap_files,
+            snapshot_cmds=snap_cmds,
         )
         stamp = json.loads(path.read_text(encoding="utf-8"))
         return _result({"stamp_file": path.name, "level": stamp["level"],

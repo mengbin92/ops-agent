@@ -670,7 +670,7 @@ _KUBECTL_FLAGS_WITH_VALUE = frozenset({
     "--revision", "--image", "--type", "-p", "--patch", "--patch-file",
 })
 _KUBECTL_READ_VERBS = frozenset({"get", "describe", "logs", "top", "api-resources",
-                                 "explain", "version", "cluster-info"})
+                                 "explain", "version", "cluster-info", "diff"})
 
 
 def _kubectl_read_only(seg: str) -> bool:
@@ -740,6 +740,19 @@ def k8s_scope(cmd: str) -> dict:
         return {"context": ctx[-1] if ctx else "",
                 "namespace": ns[-1] if ns else ""}
     return {"context": "", "namespace": ""}
+
+
+def is_kubectl_diff(cmd: str) -> bool:
+    """命令是否含 kubectl diff 段。diff 被列进 R0 预演白名单，但它尊重
+    KUBECTL_EXTERNAL_DIFF 环境变量（可借此执行任意命令）：调用方须在执行前
+    剔除该变量，否则"只读预演"名不副实。命令行里的 `KUBECTL_EXTERNAL_DIFF=...`
+    赋值由锚定白名单（^kubectl）自然挡在 R0 之外。"""
+    for seg in _segments(cmd or ""):
+        s = _strip_comment(seg)
+        s = re.sub(r"^KUBECONFIG=[^\s]+[ \t]+", "", s)
+        if re.match(r"kubectl[ \t]+diff(?=[ \t]|$)", s):
+            return True
+    return False
 
 
 def local_env() -> dict:
@@ -931,15 +944,61 @@ def target_lock(target: str | None, wait: float = DEFAULT_LOCK_WAIT,
             _safe_audit("target-unlock", target=name, actor=actor, execution_id=execution_id)
 
 
+MAX_IMPACT_CHARS = 2000       # 影响面说明上限：确认框要整段给人看完
+MAX_SNAPSHOT_DECL = 64        # 单次审批最多声明的快照文件/命令条数
+
+
+def _norm_snap_cmds(cmds) -> list[list[str]]:
+    """快照命令归一化为 [command, name] 排序列表：戳里存 dict、工具侧传 tuple，比对比齐。"""
+    out = []
+    for c in cmds or []:
+        if isinstance(c, dict):
+            out.append([str(c.get("command") or ""), str(c.get("name") or "")])
+        elif isinstance(c, (list, tuple)) and len(c) == 2:
+            out.append([str(c[0] or ""), str(c[1] or "")])
+    return sorted(out)
+
+
+def _validate_declarations(impact, snapshot_files, snapshot_cmds):
+    """变更单字段（影响面 + 快照声明）的形状校验，返回值即归一化结果。
+
+    None 表示"未提供"（旧入口/CLI 直批）：戳里没有对应键，执行时不做强一致校验。
+    """
+    if impact is not None:
+        if not isinstance(impact, str) or not impact.strip():
+            raise OpsxError("影响面 impact 须为非空字符串：写清将改什么状态、影响哪些服务")
+        impact = redact(impact.strip())[:MAX_IMPACT_CHARS]
+    if snapshot_files is not None:
+        if not isinstance(snapshot_files, list) or len(snapshot_files) > MAX_SNAPSHOT_DECL:
+            raise OpsxError(f"snapshot_files 须为不超过 {MAX_SNAPSHOT_DECL} 项的路径列表")
+        if any(not isinstance(f, str) or not f.strip() for f in snapshot_files):
+            raise OpsxError("snapshot_files 各项须为非空路径字符串")
+        snapshot_files = sorted(str(f).strip() for f in snapshot_files)
+    if snapshot_cmds is not None:
+        if not isinstance(snapshot_cmds, list) or len(snapshot_cmds) > MAX_SNAPSHOT_DECL:
+            raise OpsxError(f"snapshot_cmds 须为不超过 {MAX_SNAPSHOT_DECL} 项的命令列表")
+        for c in snapshot_cmds:
+            command = c.get("command") if isinstance(c, dict) else (c[0] if isinstance(c, (list, tuple)) and c else None)
+            if not isinstance(command, str) or not command.strip():
+                raise OpsxError("snapshot_cmds 各项须含非空 command")
+        snapshot_cmds = [{"command": c[0], "name": c[1]}
+                         for c in _norm_snap_cmds(snapshot_cmds)]
+    return impact, snapshot_files, snapshot_cmds
+
+
 def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
             target: str | None = None, env: dict | None = None,
-            uses: int = 1) -> Path:
+            uses: int = 1, impact: str | None = None,
+            snapshot_files: list[str] | None = None,
+            snapshot_cmds: list | None = None) -> Path:
     if type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise OpsxError("审批 TTL 须为正整数秒")
     if type(force) is not bool:
         raise OpsxError("force 须为布尔值")
     if type(uses) is not int or not 1 <= uses <= MAX_APPROVAL_USES:
         raise OpsxError(f"审批可用次数须为 1-{MAX_APPROVAL_USES} 的整数（默认 1：一次一变）")
+    impact, snapshot_files, snapshot_cmds = _validate_declarations(
+        impact, snapshot_files, snapshot_cmds)
     level, _ = classify(cmd)
     if level == "R0":
         raise OpsxError("只读命令无需审批戳")
@@ -965,6 +1024,14 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
         "uses": uses,
         "used": 0,
     }
+    # 变更单（影响面 + 快照声明）随戳保存：只在使用新入口声明时才写入键，
+    # 执行侧据此强校验"执行的快照参数 = 批准的快照计划"。
+    if impact is not None:
+        stamp["impact"] = impact
+    if snapshot_files is not None:
+        stamp["snapshot_files"] = snapshot_files
+    if snapshot_cmds is not None:
+        stamp["snapshot_cmds"] = snapshot_cmds
     p = STATE_DIR / "approvals" / (stamp["cmd_hash"] + ".json")
     _ensure_state_dir()
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -982,7 +1049,9 @@ def approve(cmd: str, ttl_seconds: int = 900, force: bool = False,
             fcntl.flock(handle, fcntl.LOCK_UN)
     prune_approvals()  # 顺带清理过期戳
     _safe_audit("approve", cmd=cmd, level=level, ttl=ttl_seconds, force=force, target=target,
-          env=env, uses=uses)
+          env=env, uses=uses, impact=impact,
+          declared_snapshots={"files": len(snapshot_files or []),
+                              "cmds": len(snapshot_cmds or [])})
     return p
 
 
@@ -1131,6 +1200,44 @@ def revoke(cmd: str, target: str | None = None) -> bool:
     return existed
 
 
+def get_stamp(cmd: str, target: str | None = None) -> dict | None:
+    """读取审批戳原文（不判有效期、不消耗次数）。执行前核对声明用。"""
+    p = STATE_DIR / "approvals" / (cmd_hash(cmd, target) + ".json")
+    if not p.exists():
+        return None
+    try:
+        stamp = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return stamp if isinstance(stamp, dict) else None
+
+
+def check_snapshot_declaration(cmd: str, target: str | None,
+                               snapshot_files, snapshot_cmds) -> str | None:
+    """审批戳声明过快照计划时，执行参数必须与之完全一致。
+
+    人批准的是整条变更单（含"改前备份什么"），不是一条孤立的命令字符串：
+    执行侧少带/多带快照都意味着实际执行内容与批准内容不符。旧戳与 CLI 直批
+    （戳里没有声明键）不做强校验。返回错误消息或 None。
+    """
+    stamp = get_stamp(cmd, target)
+    if not stamp or "snapshot_files" not in stamp:
+        return None
+    want_files = sorted(str(f) for f in stamp.get("snapshot_files") or [])
+    want_cmds = _norm_snap_cmds(stamp.get("snapshot_cmds"))
+    got_files = sorted(str(f) for f in (snapshot_files or []))
+    got_cmds = _norm_snap_cmds(snapshot_cmds)
+    if want_files != got_files or want_cmds != got_cmds:
+        return (
+            "[opsx] 拒绝执行：快照参数与审批戳声明不一致"
+            f"（批准的文件 {len(want_files)} 个/命令 {len(want_cmds)} 条；"
+            f"本次传入文件 {len(got_files)} 个/命令 {len(got_cmds)} 条）。\n"
+            "人批准的快照计划是变更单的一部分：按批准内容执行，"
+            "或先 ops_revoke 再重新提交变更单。"
+        )
+    return None
+
+
 def collect_state() -> dict:
     """快照与审批戳的统一读取，opsx list / MCP / agent 工具共用。"""
     sdir = STATE_DIR / "snapshots"
@@ -1248,10 +1355,13 @@ def _snapshot_file_into(d: Path, path_str: str, items: list) -> None:
     })
 
 
-def run_shell(cmd: str, timeout: int) -> subprocess.CompletedProcess:
-    """超时终止整个进程组，避免 shell 退出后子进程继续变更。"""
+def run_shell(cmd: str, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
+    """超时终止整个进程组，避免 shell 退出后子进程继续变更。
+
+    env 缺省继承当前进程环境；仅用于剔除 R0 预演命令的危险变量
+    （如 kubectl diff 的 KUBECTL_EXTERNAL_DIFF），不改变命令语义。"""
     with subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, encoding="utf-8", errors="replace",
+                          text=True, encoding="utf-8", errors="replace", env=env,
                           start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -1720,6 +1830,10 @@ def exec_change(
             output = redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
             print(output, file=sys.stderr)
             return 2, None, output
+    declared = check_snapshot_declaration(cmd, None, snapshot_files, snapshot_cmds)
+    if declared:
+        _safe_audit("exec-abort", cmd=cmd, reason="快照参数与审批声明不一致")
+        return 2, None, declared
 
     _validate_lock_args(None, lock_wait)   # 参数错误要在建记录之前就失败
     rec = execution.begin("exec", cmd, None, resolve_env(cmd, None), phase="lock")
@@ -1770,6 +1884,10 @@ def exec_change(
             execution.update(rec["id"], phase="exec")
             dispatched = True   # 从这一刻起命令可能已经生效
             exit_code, status, output, err = _run_change(cmd, timeout)
+            if sid is None and classify(cmd)[0] != "R0":
+                # 变更没带任何回滚材料：明说，别让人误以为 ops_rollback 能救
+                output += ("\n[opsx] 注意：本次变更没有任何快照（未声明 snapshot_files/"
+                           "snapshot_cmds），无自动回滚点；如需回滚只能按命令语义人工恢复。")
             execution.finish(rec["id"], status, exit_code=exit_code, error=err,
                              output=output)
     except TargetBusy as e:
