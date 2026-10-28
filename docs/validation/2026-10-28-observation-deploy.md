@@ -24,6 +24,7 @@
 | 编码边界 | 服务器未安装 `zh_CN.UTF-8`；SSH 会话转发该 locale 会导致 1 个 repl history 用例失败（环境编码，非代码缺陷）。service 已显式 `LANG=C.UTF-8` |
 | 完整规则巡检 | `inspect --target local --json`：24/24 ok，warn/critical/unknown/error 全 0，complete=true，退出 0 |
 | 真实模型调用 | 同一 .env 下 `opsagent -p` 真实请求退出 0，模型回复"正常。" |
+| 日志粗筛（logscan） | journald `docker.service` 实扫 6821 行/149 组/1.1s 无超时；`docker logs mysql` 正常；存量噪声：dockerd 日志已有 warn/error（非观察期引入） |
 | systemd 托管 | root 用户级 `opsagent-schedule.service`，enabled + active，`Linger=yes`，`Restart=always` |
 | 自动拉起 | kill 主进程后 `NRestarts=1` 恢复，任务频率/预算/下次执行时间不变 |
 | 证据索引 | 服务器 `~/.ops-agent-trial/validation/deploy-20261028.json`（0600） |
