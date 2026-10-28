@@ -12,6 +12,7 @@
 完整历史见 [CHANGELOG](CHANGELOG.md)，安装与升级见对应发布公告；维护者流程见[发版说明](docs/ops/releasing.md)。
 
 后续工作见[下一阶段规划](docs/plans/2026-10-25-next-stage.md)：真实环境验收、连续 7 天只读观察、正式发布门禁与 `v0.1.0` 收口。
+当前进展：**7 天只读观察进行中**（2026-10-28 16:57 起于 `obsServer`，见[部署记录](docs/validation/2026-10-28-observation-deploy.md)）。
 
 ## Agent 形态（opsagent）
 

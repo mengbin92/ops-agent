@@ -1,8 +1,9 @@
 # Linux 常驻只读巡检
 
-连续观察的调度器部署在已选 Linux 目标 `localServer`，由用户级 systemd 托管。
+当前（2026-10-28 起）连续 7 天观察的调度器部署在别名目标 `obsServer`，由 root 用户级 systemd 托管。
 Mac 仅用于管理：关闭终端、休眠或断开 SSH 都不会停止服务器上的调度。
-实际部署与验证见[试运行记录](../validation/2026-10-26-readonly-trial.md)。
+实际部署与验证见[7 天观察部署记录](../validation/2026-10-28-observation-deploy.md)；
+更早的 `localServer` 试运行记录见[2026-10-26 记录](../validation/2026-10-26-readonly-trial.md)，该环境已不再运行调度。
 
 ## 当前运行布局
 
@@ -27,27 +28,27 @@ Mac 仅用于管理：关闭终端、休眠或断开 SSH 都不会停止服务�
 
 ## 日常管理
 
-以下命令使用已经配置的 OpenSSH `Host localServer` 别名；它与 `opsx targets` 的注册别名相互独立。
+以下命令使用已经配置的 OpenSSH `Host obsServer` 别名；它与 `opsx targets` 的注册别名相互独立。
 在其他管理机执行时，先确认同名 SSH 别名已配置。
 
 ```bash
 # 后台服务状态与近期日志
-ssh localServer 'systemctl --user status opsagent-schedule.service --no-pager'
-ssh localServer 'journalctl --user -u opsagent-schedule.service -n 40 --no-pager'
+ssh obsServer 'systemctl --user status opsagent-schedule.service --no-pager'
+ssh obsServer 'journalctl --user -u opsagent-schedule.service -n 40 --no-pager'
 
 # 调度心跳、排期与实际运行记录
-ssh localServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule status'
-ssh localServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule runs --id sch-335370 --tail 20'
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule status'
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule runs --id sch-200a62 --tail 20'
 
 # 仅在没有正在执行的任务时重启本调度服务
-ssh localServer 'systemctl --user restart opsagent-schedule.service'
+ssh obsServer 'systemctl --user restart opsagent-schedule.service'
 
 # 停用托管：阻止当次运行及后续自动启动
-ssh localServer 'systemctl --user disable --now opsagent-schedule.service'
+ssh obsServer 'systemctl --user disable --now opsagent-schedule.service'
 ```
 
-Mac 的旧任务已停用，原记录保存在本机及服务器的私有备份中。不要同时恢复 Mac 排期与 Linux 服务；
-两台机器的文件锁不能互相阻止重复巡检。切回 Mac 前先停用 Linux 服务，再核对旧状态与凭据。
+观察期间保持唯一调度：不要同时恢复 Mac 或其他主机的排期。文件锁不能跨机器阻止重复巡检，
+迁移前先停用本服务，再核对旧状态与凭据。
 
 ## 连续观察的边界
 
