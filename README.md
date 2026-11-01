@@ -1,7 +1,8 @@
 # ops-agent
 
 默认只读、高风险操作需会话内授权并附风险说明与快照回滚的运维智能体。
-自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端。
+自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端，
+也可以 A2A 协议与其它 agent 互联（见 [A2A 协议形态](#a2a-协议形态)，可选依赖）。
 
 > 📣 **最新发布**：[v0.1.0-rc.1 发布公告](docs/releases/release-v0.1.0-rc.1.md)（首个候选版、守门与巡检可靠性修复） · [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1)
 
@@ -627,6 +628,84 @@ W4 已支持单向 webhook、事件去重与恢复通知；双向 IM 对话尚�
 
 确认流与 CLI 形态一致：变更单 → `ops_approve`（弹窗=授权，建戳）→ `ops_exec`（再弹窗=双保险，校验戳）→ 报告 snapshot_id 与回滚。R3 仍需 `force=true` + 会话内显式确认。
 `ops_rollback` 先返回目标/文件/差异预览，核对后带 `confirm=true` 重试才真正回滚（执行前自动保存回滚前副本）。
+
+## A2A 协议形态
+
+第五种形态：把同一组受控能力以 [A2A（Agent-to-Agent）](https://a2a-protocol.org) 协议暴露给其它
+agent/编排器调用，也能反向调用别人的 A2A agent。服务端基于官方 `a2a-sdk`（协议 1.0）。
+
+**依赖是单独的**：A2A 需要 protobuf/starlette 等第三方包，因此只有这个形态才装；
+REPL / 单发 / RPC / MCP / 巡检 / 调度 / 通知仍保持零第三方依赖。
+
+```bash
+python3 -m pip install -r requirements-a2a.txt   # 要求 Python >= 3.10
+./opsagent a2a doctor                            # 依赖与环境自检
+
+# 服务端（只绑本机；非回环必须配 token，否则拒绝启动）
+export OPSAGENT_A2A_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+./opsagent a2a serve                                   # 127.0.0.1:8080
+./opsagent a2a serve --host 0.0.0.0 --port 8080        # 对外必须带 token
+
+# 先看能力声明（公开，无需 token）
+./opsagent a2a card
+
+# 客户端：调用任意 A2A agent
+./opsagent a2a call http://127.0.0.1:8080 "看一下磁盘和 nginx 状态"
+```
+
+AgentCard 位于 `/.well-known/agent-card.json`，`skills` 直接从 `skills/` 目录生成，
+所以对方看到的能力清单，就是这台机器上真正能 `skill` 载入的 playbook。
+
+### 写操作怎么确认
+
+A2A 没有终端确认框，但**不会因此放开写操作**。沿用同一条守门链路，只是把「问人」换成协议状态机：
+
+```
+调用方 ──SendMessage("重启 nginx")──▶ 模型调 ops_approve
+                                      │ ctx.ask_user 抛中断
+                                      ▼
+        ◀── INPUT_REQUIRED + 整张变更单 ──┘   （状态停在 INPUT_REQUIRED，不建戳、不执行）
+
+调用方 ──SendMessage("确认执行", task_id=同一 task)──▶ 重新 ops_approve（自动通过）→ ops_exec
+```
+
+- R0 只读命令照旧直通，不需要确认。
+- R1–R3 一律中断；变更单里带执行环境、风险级别、可用次数、影响面、回滚点与完整命令。
+- **一次答复只批准一个待确认项**：模型在同一轮里发起第二个变更会再次中断，不会被同一个「确认」顺带放行。
+- 批准词沿用工具既有判定：`确认执行` / `确认` / `yes` / `y`，其它回答一律视为拒绝。
+- 拒绝会撤销并确认无审批戳、无执行记录；批准则正常建戳，`opsx audit` 里能看到 `approve` 事件。
+
+### 安全边界
+
+| 项 | 行为 |
+|---|---|
+| 监听地址 | 默认 `127.0.0.1`；`--host 0.0.0.0` 等非回环地址**未配 token 直接拒绝启动**（不是警告后继续跑） |
+| 鉴权 | RPC 端点强制 `Authorization: Bearer <token>`，定长比较；AgentCard 公开（仅能力声明，不含主机/凭据） |
+| 凭据 | token 只从 `OPSAGENT_A2A_TOKEN` 或 `--token` 读；写进命令行会留在 `ps` 与 shell 历史，建议用环境变量 |
+| 会话 | `context_id` → `a2a-<context_id>` 会话，同目录可 `/resume`；同一 context 串行，全局并发默认 2；常驻会话上限 200（LRU，正文仍在磁盘，正在执行的不会被淘汰） |
+| 超时 | 单任务墙钟预算默认 600s（`--timeout`），到点任务落 `FAILED` 而不是 `COMPLETED` |
+| 背压 | 并发槽默认 2；等不到槽 30s 就明确报「服务繁忙」，不让调用方无限挂在 WORKING |
+| 输入 | 单条消息上限 20,000 字符，超长直接拒绝（引导先用 logscan 粗筛或分段） |
+| 代理 | 客户端默认 `trust_env=False`（忽略 `HTTP_PROXY`），需要代理时显式 `--proxy` |
+
+### 已知边界
+
+- **不声明流式**：AgentCard 里 `streaming=false`。`SendStreamingMessage` 未做验证，不在 card 上声明未验证的能力。
+- **取消不保证停下**：Python 线程无法中断，已发出的命令可能仍在目标机执行；取消消息会明确提示按执行记录核实（与 `unknown` 语义一致）。
+- **任务状态在内存里**：`InMemoryTaskStore`，服务重启后旧 `task_id` 失效（会话仍在磁盘，可 `/resume` 继续看历史）。要长期挂起的确认流程需接持久化 task store。
+- **单一信任域**：同一 token 下的调用方共享会话空间。多租户隔离需在前面加网关，不要直接把这个端口开放给不互信的多方。
+- A2A 1.0 与 0.3 不兼容（方法名 `SendMessage` vs `message/send`）。对端是 0.3 时需要它先升级，或在 `create_jsonrpc_routes` 打开 `enable_v0_3_compat`（本版未启用）。
+
+### 验证
+
+```bash
+python3 -m unittest tests.test_a2a -v        # 22 项：安全闸门/中断语义/会话修补/客户端纯函数/会话上限（纯 stdlib，CI 必跑）
+python3 -m unittest tests.test_a2a_e2e -v    # 10 项：真实 uvicorn + 官方客户端 + 桩 LLM（无 SDK 自动跳过）
+```
+
+端到端覆盖：Card 可发现、无 token 401、只读任务完成且带回真实命令输出、写操作转 INPUT_REQUIRED 并带出变更单、
+拒绝后无审批戳无执行记录、批准后留下 `approve` 审计、会话落盘可回看、终态 task 不可复用、
+超长/空消息被拒。
 
 ## 演进
 

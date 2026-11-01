@@ -6,6 +6,14 @@
 
 ### Added
 
+- **A2A 协议形态（`opsagent a2a`）**：基于官方 `a2a-sdk` 1.3.0（协议 1.0，protobuf 类型 + `SendMessage` 方法名）把同一组受控能力以 AgentCard + JSON-RPC 暴露，并可反向调用其它 A2A agent。
+  - `opsagent a2a serve|card|call|doctor`；skill 列表直接从 `skills/` 目录生成 AgentCard，能力声明与可加载 playbook 一致。
+  - **只读直通 / 写操作二次确认**：R0 命令沿用既有守门直接执行；R1–R3 转 `TASK_STATE_INPUT_REQUIRED` 并带出整张变更单，调用方带同一 `task_id` 回复「确认执行」才建戳执行。一次答复只批准一个待确认项，拒绝路径不产生审批戳与执行记录。
+  - **依赖可选**：SDK 懒加载，`requirements-a2a.txt` 独立管理；REPL/单发/RPC/MCP/巡检/调度/通知等形态仍零第三方依赖，缺依赖时给安装命令并退出 2（要求 Python ≥ 3.10）。
+  - **安全默认**：只绑 `127.0.0.1`；非回环监听未配 `OPSAGENT_A2A_TOKEN` 直接拒绝启动；RPC 端点强制 Bearer 校验（定长比较），AgentCard 公开以便客户端先发现能力。
+  - A2A 的 `context_id` 映射为 `a2a-<context_id>` 会话，落在同一 `sessions/` 目录，可 `/resume` 回看；同一 context 串行执行，全局并发默认 2。
+  - 新增 20 项回归（`tests/test_a2a.py` 11 项 + `tests/test_a2a_e2e.py` 7 项，后者真实 uvicorn 服务端 + 官方客户端 + 桩 LLM，未装 SDK 自动跳过）。
+
 - 7 天只读观察部署：`obsServer` 固定 `cc941d78` 用户级 systemd 托管（每 3 小时，`sch-200a62`），2026-10-28 16:57 起计时；实机自检 321/321、规则巡检 24/24、真实模型调用通过；通知渠道未配置为已知未完成项。证据见 docs/validation/2026-10-28-observation-deploy.md。
 
 - 写操作工具层默认"先预演后执行"：`kubectl diff` 与 `kubectl apply/create/replace/patch/set/scale/annotate/label --dry-run=server|client|true` 进入 R0 白名单，would-be 变更零摩擦预演；`KUBECTL_EXTERNAL_DIFF` 赋值失配锚定白名单、进程环境变量由 bash 工具执行前剔除，堵死借 diff 执行任意命令的绕过。
@@ -14,6 +22,19 @@
 - 快照声明与执行参数强一致：审批戳声明过快照计划后，core/remote `exec_change` 校验执行参数与声明完全一致，不一致拒绝执行；未带任何快照的变更执行后明确警告无自动回滚点。
 
 ### Fixed
+
+- **A2A 首轮交付的 code review 修复**（11 项）：
+  - `requirements-a2a.txt` 版本冲突：`sse-starlette 3.6.0` 声明 `starlette>=0.49.1`，原锁的 `0.41.3` 会导致 `ResolutionImpossible`（或在已有环境被 pip 破坏性降级成"能跑但元数据不成立"）。改为 `starlette==0.49.1` + `uvicorn==0.34.0`，并实际安装 + 跑通全量用例验证。
+  - 确认中断后的会话修补（settle）从锁外移入会话锁内，避免同 context 并发任务重复补写悬空 tool_call。
+  - 复用终态 task 的请求显式拒绝（SDK 已在 handler 层拦截，executor 内保留纵深防御，不再可能被 `start_work` 重新激活）。
+  - 执行槽获取加 30s 上限并明确报「服务繁忙」，不再让调用方无限挂在 WORKING。
+  - 入口限制单条消息 20,000 字符，超长粘贴引导走 logscan/分段。
+  - IPv6 监听时 AgentCard 里的 URL 补方括号，否则客户端无法解析。
+  - 客户端不再依赖签名随版本变动的 `get_message_text`，直接遍历 `Part.text`。
+  - `a2a_client.send()` 在已有事件循环内调用时改走新线程，避免 `asyncio.run` 嵌套崩溃。
+  - CLI 异常分支引用了仅在 call 分支导入的模块（潜在 `NameError`），改为本地常量。
+  - 缺 uvicorn / 端口被占用时给可执行提示，不再抛出裸 ImportError 或 uvicorn 栈。
+  - 常驻会话表加上限（200）并做 LRU 淘汰：`Session` 缓存全部 messages，不设限等于长期运行的内存泄漏；正在执行（持锁）的会话不淘汰，避免同一 sid 出现两把锁。
 
 - 修复 Docker inspect 格式串中的重定向样式文本、引号内 grep 管道符和正则尾部 `$` 被误判为 R2；共享 shell 分段与写标记检查保留引用和转义语义。
 - 补齐 Docker 对象只读别名、固定 `xargs ... docker inspect` 与数字行号 `sed -n`；真实重定向、任意脚本及 Docker 写操作仍需审批。

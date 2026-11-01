@@ -10,6 +10,7 @@
   opsagent schedule ...         定时巡检：list / add / remove / run（--once 适合 cron）
   opsagent notify ...           单渠道通知：setup / test / list / retry / mute
   opsagent events ...           事件时间线：异常、恢复、通知与运行状态变化
+  opsagent a2a ...              A2A 协议形态：serve / card / call / doctor（需 requirements-a2a.txt）
 """
 from __future__ import annotations
 
@@ -139,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["budget"]:
         import usage
         return _budget_cli(usage, argv[1:])
+    if argv[:1] == ["a2a"]:  # 协议形态：serve / card / call / doctor
+        from agent import a2a_cli
+        return a2a_cli.cli(argv[1:])
     p = argparse.ArgumentParser(prog="opsagent", description="ops-agent 独立运维智能体",
                                 epilog="巡检：opsagent inspect [--target all]；"
                                        "定时：opsagent schedule [status|list|add|run]；"
