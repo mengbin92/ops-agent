@@ -213,8 +213,10 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
             warning = deadline_warning
             emit("text", warning)
             return (final_text + "\n" if final_text else "") + warning
-        messages = compact([{"role": "system", "content": system or _default_system()}]
-                           + session.messages)
+        # 压缩只看会话消息：系统提示不占 COMPACT_KEEP_RECENT 的名额，
+        # 保证最近 N 条真实会话消息一定原样送达。
+        messages = ([{"role": "system", "content": system or _default_system()}]
+                    + compact(session.messages))
         chat_kwargs = {"deadline": ctx.deadline} if ctx.deadline is not None else {}
         msg = llm._validate_message(llm.chat(
             messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta,

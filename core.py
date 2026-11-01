@@ -1340,7 +1340,33 @@ def begin_snapshot() -> tuple[str, Path]:
     return sid, d
 
 
+def sensitive_snapshot_path(path_str: str) -> str | None:
+    """快照源的敏感路径判定：与命令读取同一套规则（含等价写法与 realpath）。
+
+    没有这一层，`cat ~/.ssh/id_rsa` 被拒而 `snapshot_file` 原样拷贝——凭据经快照
+    落盘（还会被 state_backup 打进 state.tar）、回滚预览的 diff 只做模式脱敏，
+    shadow 哈希这类形态会原样进入确认框与模型上下文。快照通道必须同样收紧。
+    """
+    if not isinstance(path_str, str) or not path_str.strip():
+        return None
+    for probe in _path_probes(path_str):
+        if sensitive_path(probe):
+            return probe
+        expanded = os.path.expanduser(probe)
+        real = os.path.realpath(expanded)
+        if real != probe and sensitive_path(real):
+            return probe  # 符号链接/相对路径最终指向凭据文件
+        if sensitive_dir(probe) or sensitive_dir(real):
+            return probe  # 敏感目录内的文件（.ssh/config、快照原件等）同样不拷贝
+    return None
+
+
 def _snapshot_file_into(d: Path, path_str: str, items: list) -> None:
+    hit = sensitive_snapshot_path(path_str)
+    if hit:
+        raise OpsxError(
+            f"快照源是敏感路径，拒绝复制: {hit}。密钥/私钥/Secret 文件不进快照；"
+            "确需变更凭据文件请人工备份（cp）后再走变更流程。")
     src = Path(path_str)
     if not src.is_file():
         raise OpsxError(f"快照源不是文件: {path_str}")
@@ -1806,6 +1832,8 @@ def exec_change(
     timeout: int = EXEC_TIMEOUT,
     actor: str = "cli",
     lock_wait: float = DEFAULT_LOCK_WAIT,
+    target: str | None = None,
+    transport=None,
 ) -> tuple[int, str | None, str]:
     """原子执行：守门→锁→重验→快照→消耗审批→执行→记录状态。
 
@@ -1814,41 +1842,50 @@ def exec_change(
 
     锁覆盖"快照 + 执行"整段而不是只锁执行：两个会话交错时，后一个的快照可能
     已经包含前一个的改动，"回滚到快照"就回到一个中间态。
+
+    target/transport 供 remote.exec_change 复用同一份骨架（本机/远程曾各维护
+    一份 110 行拷贝，守门修复只落一半就是事故）：transport 提供远程差异点
+    snap_file_into / snap_cmd_into / write_meta / run_change，缺省用本机实现。
     """
     import execution
+    import remote  # 快照异常里要认 RemoteError；与 resolve_env 一样延迟导入避免成环
     snapshot_files = snapshot_files or []
     snapshot_cmds = snapshot_cmds or []
-    code, msg = _prepare_exec(cmd, None)
+    snap_file_into = transport.snap_file_into if transport else _snapshot_file_into
+    snap_cmd_into = transport.snap_cmd_into if transport else _snapshot_cmd_into
+    write_meta = transport.write_meta if transport else _write_meta
+    run_change = transport.run_change if transport else _run_change
+    where = f"目标 {target}" if target else "本机"
+    code, msg = _prepare_exec(cmd, target)
     if code != 0:
         # 不在这里打印：调用方（CLI / agent 工具 / MCP）都会展示返回的 msg，
         # 再打一遍就等于同一个错误出现两次。
         return code, None, msg
     for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
-        code, _ = check_snapshot_cmd(c)
+        code, _ = check_snapshot_cmd(c, target=target)
         if code != 0:
-            _safe_audit("exec-abort", cmd=cmd, reason=f"快照命令未通过守门: {c}")
+            _safe_audit("exec-abort", cmd=cmd, target=target, reason=f"快照命令未通过守门: {c}")
             output = redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
-            print(output, file=sys.stderr)
             return 2, None, output
-    declared = check_snapshot_declaration(cmd, None, snapshot_files, snapshot_cmds)
+    declared = check_snapshot_declaration(cmd, target, snapshot_files, snapshot_cmds)
     if declared:
-        _safe_audit("exec-abort", cmd=cmd, reason="快照参数与审批声明不一致")
+        _safe_audit("exec-abort", cmd=cmd, target=target, reason="快照参数与审批声明不一致")
         return 2, None, declared
 
-    _validate_lock_args(None, lock_wait)   # 参数错误要在建记录之前就失败
-    rec = execution.begin("exec", cmd, None, resolve_env(cmd, None), phase="lock")
+    _validate_lock_args(target, lock_wait)   # 参数错误要在建记录之前就失败
+    rec = execution.begin("exec", cmd, target, resolve_env(cmd, target), phase="lock")
     sid = None
     dispatched = False   # 命令是否真的下发过：决定中断时记 unknown 还是 aborted
     try:
-        with target_lock(None, wait=lock_wait, actor=actor, execution_id=rec["id"]):
-            env = resolve_env(cmd, None)
+        with target_lock(target, wait=lock_wait, actor=actor, execution_id=rec["id"]):
+            env = resolve_env(cmd, target)
             execution.update(rec["id"], env=env, host=env.get("host"))
-            code, msg = check(cmd, None, env)  # 锁内重验：等锁期间审批可能过期/被撤销
+            code, msg = check(cmd, target, env)  # 锁内重验：等锁期间审批可能过期/被撤销
             if code != 0:
-                _safe_audit("exec-abort", cmd=cmd, reason="等锁后审批失效")
+                _safe_audit("exec-abort", cmd=cmd, target=target, reason="等锁后审批失效")
                 execution.finish(rec["id"], "aborted", error=msg, phase="lock")
                 return code, None, msg
-            code, msg = _prepare_exec(cmd, None)  # 锁内再查一次 unknown：等锁期间可能新增
+            code, msg = _prepare_exec(cmd, target)  # 锁内再查一次 unknown：等锁期间可能新增
             if code != 0:
                 execution.finish(rec["id"], "aborted", error=msg, phase="lock")
                 return code, None, msg
@@ -1858,32 +1895,31 @@ def exec_change(
                 items: list = []
                 try:
                     for f in snapshot_files:
-                        _snapshot_file_into(d, f, items)
+                        snap_file_into(d, f, items)
                     for c, name in snapshot_cmds:
-                        _snapshot_cmd_into(d, c, name, items)
-                    _write_meta(d, sid, items)
-                except (OpsxError, subprocess.SubprocessError, OSError) as e:
+                        snap_cmd_into(d, c, name, items)
+                    write_meta(d, sid, items)
+                except (OpsxError, remote.RemoteError,
+                        subprocess.SubprocessError, OSError) as e:
                     shutil.rmtree(d, ignore_errors=True)
-                    output = redact(f"[opsx] 快照失败，已中止执行: {e}")
-                    print(output, file=sys.stderr)
-                    _safe_audit("exec-abort", cmd=cmd, reason=str(e))
+                    output = redact(f"[opsx] {where}快照失败，已中止执行: {e}")
+                    _safe_audit("exec-abort", cmd=cmd, target=target, reason=str(e))
                     execution.finish(rec["id"], "aborted", error=output, phase="snapshot")
                     return 3, None, output
                 execution.update(rec["id"], snapshot_id=sid, phase="authorize")
-            remaining = None
             if classify(cmd)[0] != "R0":
-                # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有
-                remaining = consume_stamp(cmd, None, env)
-                if remaining is None:
+                # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有。
+                # 剩余次数只对审批路径有意义，consume_stamp 的审计里已留痕。
+                if consume_stamp(cmd, target, env) is None:
                     # 审批在"确定要执行"的这一刻才消耗；已经失效就不该再跑
                     output = redact("[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
-                    _safe_audit("exec-abort", cmd=cmd, snapshot_id=sid, reason="审批戳已失效")
+                    _safe_audit("exec-abort", cmd=cmd, target=target, snapshot_id=sid,
+                                reason="审批戳已失效")
                     execution.finish(rec["id"], "aborted", error=output, phase="exec")
                     return 2, sid, output
-            del remaining  # 剩余次数只对审批路径有意义，已在 consume_stamp 审计里留痕
             execution.update(rec["id"], phase="exec")
             dispatched = True   # 从这一刻起命令可能已经生效
-            exit_code, status, output, err = _run_change(cmd, timeout)
+            exit_code, status, output, err = run_change(cmd, timeout)
             if sid is None and classify(cmd)[0] != "R0":
                 # 变更没带任何回滚材料：明说，别让人误以为 ops_rollback 能救
                 output += ("\n[opsx] 注意：本次变更没有任何快照（未声明 snapshot_files/"
@@ -1891,13 +1927,14 @@ def exec_change(
             execution.finish(rec["id"], status, exit_code=exit_code, error=err,
                              output=output)
     except TargetBusy as e:
-        _safe_audit("exec-abort", cmd=cmd, reason=str(e))
+        _safe_audit("exec-abort", cmd=cmd, target=target, reason=str(e))
         execution.finish(rec["id"], "aborted", error=str(e), phase="lock")
         return EXEC_ABORT_LOCK, None, str(e)
     except BaseException as e:  # 含 Ctrl-C：命令可能改了一半，不能当成"没执行"
+        remote_cmd = "远端命令" if target else "命令"
         reason = (f"{type(e).__name__}: {e}" if not isinstance(e, KeyboardInterrupt)
-                  else "用户中断（Ctrl-C），无法确认命令是否完成")
-        _safe_audit("exec-abort", cmd=cmd, snapshot_id=sid, reason=reason)
+                  else f"用户中断（Ctrl-C），无法确认{remote_cmd}是否完成")
+        _safe_audit("exec-abort", cmd=cmd, target=target, snapshot_id=sid, reason=reason)
         # 命令没下发（还在拿锁/做快照/校验）就是明确的中止；下发过才谈得上"结果未知"
         execution.finish(rec["id"], "unknown" if dispatched else "aborted", error=reason)
         if isinstance(e, (OpsxError, KeyboardInterrupt)):
@@ -1905,8 +1942,8 @@ def exec_change(
                                    f"执行记录 {rec['id']} "
                                    + ("需核实" if dispatched else "命令未执行"))) from e
         raise
-    _safe_audit("exec", cmd=cmd, snapshot_id=sid, exit_code=exit_code,
-          execution_id=rec["id"], output=output[:EXEC_AUDIT_OUTPUT])
+    _safe_audit("exec", cmd=cmd, target=target, snapshot_id=sid, exit_code=exit_code,
+                execution_id=rec["id"], output=output[:EXEC_AUDIT_OUTPUT])
     prune_snapshots()
     execution.prune()
     return exit_code, sid, output

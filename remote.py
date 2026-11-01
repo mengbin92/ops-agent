@@ -163,6 +163,14 @@ def ssh_argv(name: str, remote_cmd: str | None = None) -> list[str]:
     opts = t.get("options", [])
     if not isinstance(opts, list) or not all(isinstance(o, str) and "\x00" not in o for o in opts):
         raise RemoteError(f"目标 {name} 的 options 须为字符串数组")
+    # host/user/identity 拒绝前导 '-' 是防把配置值当选项；这里反过来：不带 '-'
+    # 的词会被 ssh 当成目标主机（第一个非选项词），命令报错指向一个不存在的
+    # "主机名"，而审批提示里显示的却是注册 host。唯一合法的裸值是 `-o` 的
+    # 跟随参数（分开写的 "-o" "Key=value" 形态）。
+    bare = [o for i, o in enumerate(opts)
+            if not o.startswith("-") and (i == 0 or opts[i - 1] != "-o")]
+    if bare:
+        raise RemoteError(f"目标 {name} 的 options 各项须以 - 开头（或作为 -o 的参数）: {bare!r}")
     argv += opts
     argv.append(host)
     if remote_cmd is not None:
@@ -240,11 +248,6 @@ def _target_mode(name: str, path_str: str) -> int | None:
     return _target_stat(name, path_str)[0]
 
 
-def _target_owner(name: str, path_str: str) -> str:
-    """属主/属组名（只用于报告与核对，不用于恢复：改属主通常需要 root）。"""
-    return _target_stat(name, path_str)[1] or "?"
-
-
 def _target_machine(name: str) -> str:
     """目标机指纹：hostname + machine-id 的前 12 位。
 
@@ -292,16 +295,26 @@ def _target_resolved_path(name: str, path_str: str) -> str:
     raise RemoteError(f"无法确认远程文件真实路径: {path_str}")
 
 
-def _pull_file(name: str, path_str: str, d: Path, items: list) -> None:
+def _pull_file(name: str, path_str: str, d: Path, items: list,
+               timeout: int = IO_TIMEOUT) -> None:
     """远程文件拉回本地存档。取不到就 abort——没有快照不允许执行。
 
     同时记录权限与属主：回滚要把权限一起还原，否则"内容对了、权限松了"
     等于把 0600 的密钥文件恢复成 0644。
+    timeout：大文件慢链路需要比 IO_TIMEOUT 更长的窗口——跟随变更执行的预算，
+    否则"变更本身有一小时、快照 300MB 只有 120s"，回滚点形同虚设。
     """
+    hit = core.sensitive_snapshot_path(path_str)
+    if hit:
+        # 与本机 _snapshot_file_into 同一条红线：凭据文件不进快照（本机无法
+        # stat 远程文件，按路径形态判定，同 sensitive_command 的 strict 语义）。
+        raise RemoteError(
+            f"快照源是敏感路径，拒绝拉取: {hit}。密钥/私钥/Secret 文件不进快照；"
+            "确需变更凭据文件请在目标机人工备份。")
     dest = _dest(d, path_str)
     resolved = _target_resolved_path(name, path_str)
     try:
-        r = _ssh(name, f"cat -- {shlex.quote(resolved)}", timeout=IO_TIMEOUT)
+        r = _ssh(name, f"cat -- {shlex.quote(resolved)}", timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise RemoteError(f"远程取快照超时: {path_str}") from e
     if r.returncode != 0:
@@ -317,12 +330,13 @@ def _pull_file(name: str, path_str: str, d: Path, items: list) -> None:
     items.append(item)
 
 
-def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list) -> None:
+def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list,
+                 timeout: int = IO_TIMEOUT) -> None:
     code, msg = core.check_snapshot_cmd(cmd, target=name)
     if code != 0:
         raise RemoteError(msg)
     try:
-        r = _ssh(name, cmd, timeout=IO_TIMEOUT)
+        r = _ssh(name, cmd, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise RemoteError(f"远程抓取状态超时: {cmd}") from e
     if r.returncode != 0:
@@ -340,13 +354,16 @@ def _write_meta(d: Path, sid: str, name: str, items: list) -> None:
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def snapshot_file(name: str, path_str: str) -> str:
-    """远程文件快照：拉回本地存档（回滚时推回目标机）。"""
+def snapshot_file(name: str, path_str: str, timeout: int = IO_TIMEOUT) -> str:
+    """远程文件快照：拉回本地存档（回滚时推回目标机）。
+
+    timeout：大文件慢链路的取回预算，默认 IO_TIMEOUT；跟随变更执行时可传执行超时。
+    """
     sid, d = core.begin_snapshot()
     items: list = []
     try:
         with _fixed_target(name):
-            _pull_file(name, path_str, d, items)
+            _pull_file(name, path_str, d, items, timeout=timeout)
             _write_meta(d, sid, name, items)
     except (RemoteError, OSError):
         shutil.rmtree(d, ignore_errors=True)
@@ -356,7 +373,8 @@ def snapshot_file(name: str, path_str: str) -> str:
     return sid
 
 
-def snapshot_cmd(name: str, cmd: str, label: str = "") -> str:
+def snapshot_cmd(name: str, cmd: str, label: str = "",
+                 timeout: int = IO_TIMEOUT) -> str:
     get_target(name)
     code, msg = core.check_snapshot_cmd(cmd, target=name)
     if code != 0:
@@ -365,7 +383,7 @@ def snapshot_cmd(name: str, cmd: str, label: str = "") -> str:
     items: list = []
     try:
         with _fixed_target(name):
-            _capture_cmd(name, cmd, label, d, items)
+            _capture_cmd(name, cmd, label, d, items, timeout=timeout)
             _write_meta(d, sid, name, items)
     except (RemoteError, OSError):
         shutil.rmtree(d, ignore_errors=True)
@@ -375,11 +393,36 @@ def snapshot_cmd(name: str, cmd: str, label: str = "") -> str:
     return sid
 
 
+class _ExecTransport:
+    """remote.exec_change 注入 core.exec_change 骨架的远程差异点。
+
+    守门、锁、执行记录、防重放与消耗审批的本别在 core.exec_change 一份实现；
+    这里只提供"快照怎么取、meta 怎么写、命令怎么跑"的远程答案。
+    """
+
+    def __init__(self, name: str, timeout: int):
+        self.name = name
+        self.timeout = timeout
+
+    def snap_file_into(self, d: Path, path_str: str, items: list) -> None:
+        _pull_file(self.name, path_str, d, items, timeout=self.timeout)
+
+    def snap_cmd_into(self, d: Path, cmd: str, label: str, items: list) -> None:
+        _capture_cmd(self.name, cmd, label, d, items, timeout=self.timeout)
+
+    def write_meta(self, d: Path, sid: str, items: list) -> None:
+        _write_meta(d, sid, self.name, items)
+
+    def run_change(self, cmd: str, timeout: int) -> tuple[int, str, str, str | None]:
+        return _run_remote_change(self.name, cmd, timeout)
+
+
 def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
                 snapshot_cmds: list[tuple[str, str]] | None = None,
                 timeout: int = core.EXEC_TIMEOUT, actor: str = "cli",
                 lock_wait: float = core.DEFAULT_LOCK_WAIT) -> tuple[int, str | None, str]:
-    """远程原子执行：守门→锁→重验→远程快照→消耗审批→ssh 执行→记录状态。
+    """远程原子执行：与 core.exec_change 共用同一份骨架（守门→锁→重验→快照→
+    消耗审批→执行→记录状态），远程差异点经 _ExecTransport 注入。
 
     返回 (exit_code, snapshot_id, output)，与 core.exec_change 同形
     （exit=2 无授权、3 快照失败、4 超时、120 有未核实执行、121 目标被占用）。
@@ -387,104 +430,14 @@ def exec_change(name: str, cmd: str, snapshot_files: list[str] | None = None,
     远程超时与 SSH 255 都记 unknown 而不是 failed：这两种情况下远端可能已经
     执行了一半，标 failed 会让人以为"没生效"而重跑，正是最危险的误判。
     """
-    import execution
-    snapshot_files = snapshot_files or []
-    snapshot_cmds = snapshot_cmds or []
     get_target(name)  # 先把"打错目标名"报出来，而不是误导用户去建审批戳
-    code, msg = core._prepare_exec(cmd, name)
-    if code != 0:
-        return code, None, msg
-    for c, _ in snapshot_cmds:  # 快照命令本身也过守门：否则可把写操作藏进抓取参数
-        code, _ = core.check_snapshot_cmd(c, target=name)
-        if code != 0:
-            core._safe_audit("exec-abort", cmd=cmd, target=name, reason=f"快照命令未通过守门: {c}")
-            output = core.redact(f"[opsx] 快照命令未通过守门，已中止执行: {c}")
-            print(output, file=sys.stderr)
-            return 2, None, output
-    declared = core.check_snapshot_declaration(cmd, name, snapshot_files, snapshot_cmds)
-    if declared:
-        core._safe_audit("exec-abort", cmd=cmd, target=name, reason="快照参数与审批声明不一致")
-        return 2, None, declared
-
-    core._validate_lock_args(name, lock_wait)   # 参数错误要在建记录之前就失败
-    # env 必须与审批时同源（core.resolve_env = target_env + k8s 作用域）：
-    # 用 target_env 会漏掉 kubectl 命令的 k8s 键，导致远程 kubectl 变更永远判定
-    # "执行环境已变化"，重新批准也不通。
-    env = core.resolve_env(cmd, name)
-    rec = execution.begin("exec", cmd, name, env, phase="lock")
-    sid = None
-    dispatched = False   # 命令是否真的下发过：决定中断时记 unknown 还是 aborted
-    try:
-        with _fixed_target(name), core.target_lock(
-                name, wait=lock_wait, actor=actor, execution_id=rec["id"]):
-            env = core.resolve_env(cmd, name)
-            execution.update(rec["id"], env=env)
-            code, msg = core.check(cmd, name, env)  # 锁内重验：等锁期间审批可能过期
-            if code != 0:
-                core._safe_audit("exec-abort", cmd=cmd, target=name, reason="等锁后审批失效")
-                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
-                return code, None, msg
-            code, msg = core._prepare_exec(cmd, name)
-            if code != 0:
-                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
-                return code, None, msg
-            if snapshot_files or snapshot_cmds:
-                execution.update(rec["id"], phase="snapshot")
-                sid, d = core.begin_snapshot()
-                items: list = []
-                try:
-                    for f in snapshot_files:
-                        _pull_file(name, f, d, items)
-                    for c, label in snapshot_cmds:
-                        _capture_cmd(name, c, label, d, items)
-                    _write_meta(d, sid, name, items)
-                except (RemoteError, OSError, subprocess.SubprocessError) as e:
-                    shutil.rmtree(d, ignore_errors=True)
-                    output = core.redact(f"[opsx] 远程快照失败，已中止执行: {e}")
-                    print(output, file=sys.stderr)
-                    core._safe_audit("exec-abort", cmd=cmd, target=name, reason=str(e))
-                    execution.finish(rec["id"], "aborted", error=output, phase="snapshot")
-                    return 3, None, output
-                execution.update(rec["id"], snapshot_id=sid, phase="authorize")
-            if core.classify(cmd)[0] != "R0":
-                # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有
-                remaining = core.consume_stamp(cmd, name, env)
-                if remaining is None:
-                    output = core.redact(
-                        "[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
-                    core._safe_audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
-                               reason="审批戳已失效")
-                    execution.finish(rec["id"], "aborted", error=output, phase="exec")
-                    return 2, sid, output
-            execution.update(rec["id"], phase="exec")
-            dispatched = True   # 从这一刻起远端可能已经生效
-            exit_code, status, output, err = _run_remote_change(name, cmd, timeout)
-            if sid is None and core.classify(cmd)[0] != "R0":
-                output += ("\n[opsx] 注意：本次变更没有任何快照（未声明 snapshot_files/"
-                           "snapshot_cmds），无自动回滚点；如需回滚只能按命令语义人工恢复。")
-            execution.finish(rec["id"], status, exit_code=exit_code, error=err,
-                             output=output)
-    except core.TargetBusy as e:
-        core._safe_audit("exec-abort", cmd=cmd, target=name, reason=str(e))
-        execution.finish(rec["id"], "aborted", error=str(e), phase="lock")
-        return core.EXEC_ABORT_LOCK, None, str(e)
-    except BaseException as e:  # 含 Ctrl-C：远端命令可能仍在跑，不能当成"没执行"
-        reason = (f"{type(e).__name__}: {e}" if not isinstance(e, KeyboardInterrupt)
-                  else "用户中断（Ctrl-C），无法确认远端命令是否完成")
-        core._safe_audit("exec-abort", cmd=cmd, target=name, snapshot_id=sid,
-                         reason=reason)
-        # 命令没下发（还在拿锁/做快照/校验）就是明确的中止；下发过才谈得上"结果未知"
-        execution.finish(rec["id"], "unknown" if dispatched else "aborted", error=reason)
-        if isinstance(e, (core.OpsxError, KeyboardInterrupt)):
-            raise core.OpsxError(core.redact(
-                f"[opsx] 变更未完成：{reason}；执行记录 {rec['id']} "
-                + ("需核实" if dispatched else "命令未执行"))) from e
-        raise
-    core._safe_audit("exec", cmd=cmd, target=name, snapshot_id=sid, exit_code=exit_code,
-               execution_id=rec["id"], output=output[:core.EXEC_AUDIT_OUTPUT])
-    core.prune_snapshots()
-    execution.prune()
-    return exit_code, sid, output
+    # _fixed_target 冻结注册表读取：快照、审批与下发用同一目标，锁名解析
+    # （core._lock_name 会读 targets.json）也在这段内保持一致。
+    with _fixed_target(name):
+        return core.exec_change(cmd, snapshot_files=snapshot_files,
+                                snapshot_cmds=snapshot_cmds, timeout=timeout,
+                                actor=actor, lock_wait=lock_wait, target=name,
+                                transport=_ExecTransport(name, timeout))
 
 
 def _run_remote_change(name: str, cmd: str, timeout: int) -> tuple[int, str, str, str | None]:
@@ -509,19 +462,31 @@ def _run_remote_change(name: str, cmd: str, timeout: int) -> tuple[int, str, str
 
 
 def _remote_read(name: str, path_str: str) -> tuple[bool, bytes]:
-    """读取目标机当前文件内容（回滚预览/回滚前副本用）。返回 (是否存在, 内容)。"""
+    """读取目标机当前文件内容（回滚预览/回滚前副本用）。返回 (是否存在, 内容)。
+
+    协议与 _target_resolved_path 同一思路：标记从尾部解析。rc/MOTD 噪声出现在
+    输出前部不再致命——Ubuntu 非交互 ssh 会 source .bashrc，登录脚本往 stdout
+    打印任何内容都会让"标记必须在行首"的旧协议永远失败，回滚在那种主机上不可用。
+    结束标记前恒定补一个 \\n（printf '\\nOPSX-EXISTS-END\\n'），因此截取内容后
+    去掉恰好一个末尾换行即可无损还原文件字节。
+    """
     q = shlex.quote(path_str)
     remote_cmd = (f"if [ -e {q} ]; then printf 'OPSX-EXISTS\\n'; cat -- {q}; "
-                  "else printf 'OPSX-MISSING\\n'; fi")
+                  "printf '\\nOPSX-EXISTS-END\\n'; else printf 'OPSX-MISSING\\n'; fi")
     try:
         r = _ssh(name, remote_cmd, timeout=IO_TIMEOUT)
     except subprocess.TimeoutExpired as e:
         raise RemoteError(f"读取远程文件超时: {path_str}") from e
     if r.returncode != 0:
         raise RemoteError(f"读取远程文件失败({r.returncode}): {path_str}: {_text(r)[:300]}")
-    if r.stdout.startswith(b"OPSX-EXISTS\n"):
-        return True, r.stdout[len(b"OPSX-EXISTS\n"):]
-    if r.stdout.startswith(b"OPSX-MISSING\n"):
+    end = r.stdout.rfind(b"\nOPSX-EXISTS-END\n")
+    if end >= 0:
+        start = r.stdout.rfind(b"OPSX-EXISTS\n", 0, end)
+        if start >= 0:
+            content = r.stdout[start + len(b"OPSX-EXISTS\n"):end + 1]
+            return True, content[:-1]  # 去掉结束标记前恒定补的那个 \n
+    missing = r.stdout.rfind(b"OPSX-MISSING\n")
+    if missing >= 0 and not r.stdout[missing + len(b"OPSX-MISSING\n"):].strip():
         return False, b""
     raise RemoteError(f"远程文件状态无法判定: {path_str}")
 
@@ -650,11 +615,6 @@ def _parse_restore_info(stdout: bytes) -> dict:
                  "size": int(size) if size.isdigit() else None,
                  "mode": mode if re.fullmatch(r"[0-7]{1,4}", mode) else None}
     return found or {"had": None, "size": None, "mode": None}
-
-
-def _parse_restore(stdout: bytes) -> tuple[bool | None, int | None]:
-    info = _parse_restore_info(stdout)
-    return info["had"], info["size"]
 
 
 def rollback(snapshot_id: str, confirm: bool = False) -> str:

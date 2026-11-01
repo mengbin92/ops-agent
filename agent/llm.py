@@ -13,6 +13,7 @@ chat(on_delta=fn)    → SSE 流式：每个 content 增量回调 fn(text)，
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import http.client
 import os
@@ -52,6 +53,14 @@ class LLMError(Exception):
 class BudgetExhausted(LLMError):
     """日预算耗尽：LLMError 的子类（既有调用方照常接住），但跨天才恢复，
     重试无意义——schedule 的执行循环对它不重试，只报告。"""
+
+
+def _provider_default_model() -> str:
+    """当前 provider 的默认模型：单一事实来源在各 provider 模块的 DEFAULT_MODEL。"""
+    if os.environ.get("OPSAGENT_PROVIDER", "").strip().lower() == "anthropic":
+        from . import llm_anthropic  # 函数内导入：llm_anthropic 顶层反向导入本模块
+        return llm_anthropic.DEFAULT_MODEL
+    return DEFAULT_MODEL
 
 
 def is_budget_exhausted(err: BaseException) -> bool:
@@ -125,6 +134,19 @@ def _accumulate_tool_call(tools_acc: dict, delta: dict) -> None:
         acc["function"]["name"] += fn["name"]
     if fn.get("arguments"):
         acc["function"]["arguments"] += fn["arguments"]
+
+
+@contextlib.contextmanager
+def _response_errors():
+    """响应读取/解析的统一异常出口（openai 与 anthropic 两个 provider 共用）。"""
+    try:
+        yield
+    except (ValueError, RecursionError) as e:
+        raise LLMError(f"LLM 响应解析失败: {e}") from e
+    except (OSError, http.client.HTTPException) as e:
+        raise LLMError(f"LLM API 读取失败: {e}") from e
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        raise LLMError(f"LLM 流式响应格式异常: {e}") from e
 
 
 def _validate_message(msg: dict) -> dict:
@@ -236,19 +258,13 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
     }
     if tools:
         body["tools"] = tools
-    try:
+    with _response_errors():
         if on_delta is not None:
             used_stream = {}
             msg = _chat_stream(body, timeout, on_delta, used_stream)
             return msg, used_stream.get("tokens")
         with _post(body, timeout) as resp:
             data = json.loads(resp.read().decode())
-    except (ValueError, RecursionError) as e:
-        raise LLMError(f"LLM 响应解析失败: {e}") from e
-    except (OSError, http.client.HTTPException) as e:
-        raise LLMError(f"LLM API 读取失败: {e}") from e
-    except (KeyError, IndexError, TypeError, AttributeError) as e:
-        raise LLMError(f"LLM 流式响应格式异常: {e}") from e
     try:
         choice = data["choices"][0]
         if choice.get("finish_reason") in {"length", "content_filter"}:
@@ -278,10 +294,7 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
 
     cb = tracked_delta if on_delta is not None else None
     attempt = 0
-    actual_model = model or os.environ.get(
-        "OPSAGENT_MODEL", "claude-sonnet-4-5"
-        if os.environ.get("OPSAGENT_PROVIDER", "").strip().lower() == "anthropic"
-        else DEFAULT_MODEL)
+    actual_model = model or os.environ.get("OPSAGENT_MODEL", _provider_default_model())
     while True:
         attempt_timeout = timeout
         if deadline is not None:

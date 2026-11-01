@@ -220,12 +220,15 @@ def call_tool(name, args):
             if record is None:
                 raise core.OpsxError(f"没有这条执行记录: {args.get('execution_id')}")
             return _result(record)
-        if args.get("tail", 20) <= 0:
-            raise core.OpsxError("tail 须为正整数")
+        tail = args.get("tail", 20)
+        # 与 agent 工具同一契约（1-200）：无界 tail 会把数百条记录整段拉进
+        # 模型上下文，各暴露面必须一致拒绝。
+        if type(tail) is not int or not 1 <= tail <= 200:
+            raise core.OpsxError("tail 须为 1-200 的整数")
         summary = execution.summary()
         return _result({"summary": summary,
                         "records": execution.list_records(
-                            tail=args.get("tail", 20),
+                            tail=tail,
                             status=args.get("status") or None)})
     if name == "ops_rollback":
         sid = _require(args, "snapshot_id")
@@ -259,8 +262,18 @@ def call_tool(name, args):
         path = core.STATE_DIR / "audit.jsonl"
         events = []
         if tail and path.exists():
-            for line in path.read_text(encoding="utf-8").strip().splitlines()[-tail:]:
-                events.append(json.loads(line))
+            # 断行/半行容忍：崩溃瞬间的半条记录不能让审计查询本身变砖——
+            # 与 opsx audit / usage.recent 同一策略（跳过坏行，证据尽量可读）。
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-tail:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    events.append({"ts": "", "event": "audit-corrupt-line",
+                                   "raw": line[:200]})
         return _result({"events": events})
 
 

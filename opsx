@@ -418,7 +418,15 @@ def main(argv: list[str] | None = None) -> int:
                 _print_execution(cmd, args.target or None, since=started)
             elif args.sub == "rollback":
                 _print_rollback_execution(args.snapshot_id, plan.get("target"), since=started)
-        return core.EXEC_ABORT_LOCK if isinstance(e, core.TargetBusy) else 1
+        # 退出码契约（与 opsx exec / opsx scenario rollback 一致）：
+        # 121 = 没执行（目标被占用）；120 = 已下发但结果未知，必须先核实。
+        # _UncertainChange（远端 rollback 中断）此前落到普通的 1，自动化会把
+        # "需核实"当成"失败"重跑一个其实已经生效的回滚。
+        if isinstance(e, core.TargetBusy):
+            return core.EXEC_ABORT_LOCK
+        if isinstance(e, remote._UncertainChange):
+            return core.EXEC_ABORT_UNKNOWN
+        return 1
 
 
 if __name__ == "__main__":

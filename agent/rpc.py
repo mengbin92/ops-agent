@@ -122,51 +122,54 @@ def serve(model: str | None = None) -> None:
         answer = peer.request("ask_user", {"question": question})
         return answer if answer is not None else "（客户端未回答，视为拒绝）"
 
-    while True:
-        msg = inbox.get()
-        if msg is None:
-            return
-        msg_id = msg.get("id")
-        method = msg.get("method")
-        if "id" not in msg:
-            continue  # 通知忽略
-        try:
-            if method not in {"ping", "reset", "prompt"}:
-                peer.send({"jsonrpc": "2.0", "id": msg_id,
-                           "error": {"code": -32601, "message": f"未知方法: {method}"}})
-                continue
-            params = msg.get("params", {})
-            if not isinstance(params, dict) or (method == "prompt" and (
-                    not isinstance(params.get("text"), str) or not params["text"].strip()
-                    or ("stream" in params and not isinstance(params["stream"], bool)))):
-                peer.send({"jsonrpc": "2.0", "id": msg_id,
-                           "error": {"code": -32602, "message": "Invalid params"}})
-                continue
-            if method == "ping":
-                result = {}
-            elif method == "reset":
-                session = sess_mod.Session()
-                result = {"session_id": session.id}
-            elif method == "prompt":
-                stream = params.get("stream", False)
-                events: list = []
+    try:
+        while True:
+            msg = inbox.get()
+            if msg is None:
+                return
+            msg_id = msg.get("id")
+            method = msg.get("method")
+            if "id" not in msg:
+                continue  # 通知忽略
+            try:
+                if method not in {"ping", "reset", "prompt"}:
+                    peer.send({"jsonrpc": "2.0", "id": msg_id,
+                               "error": {"code": -32601, "message": f"未知方法: {method}"}})
+                    continue
+                params = msg.get("params", {})
+                if not isinstance(params, dict) or (method == "prompt" and (
+                        not isinstance(params.get("text"), str) or not params["text"].strip()
+                        or ("stream" in params and not isinstance(params["stream"], bool)))):
+                    peer.send({"jsonrpc": "2.0", "id": msg_id,
+                               "error": {"code": -32602, "message": "Invalid params"}})
+                    continue
+                if method == "ping":
+                    result = {}
+                elif method == "reset":
+                    session = sess_mod.Session()
+                    result = {"session_id": session.id}
+                elif method == "prompt":
+                    stream = params.get("stream", False)
+                    events: list = []
 
-                def push(kind, payload) -> None:
-                    if stream:
-                        peer.send({"jsonrpc": "2.0", "method": "event",
-                                   "params": {"kind": kind, "payload": payload}})
-                    else:
-                        events.append({"kind": kind, "payload": payload})
+                    def push(kind, payload) -> None:
+                        if stream:
+                            peer.send({"jsonrpc": "2.0", "method": "event",
+                                       "params": {"kind": kind, "payload": payload}})
+                        else:
+                            events.append({"kind": kind, "payload": payload})
 
-                ctx = tools.ToolContext(ask_user=ask_user, model=model,
-                                        session_id=session.id)
-                text = loop.run_turn(params.get("text", ""), session, ctx, on_event=push,
-                                     on_delta=(lambda delta: push("delta", delta)) if stream else None,
-                                     model=model)
-                result = {"text": text, "session_id": session.id}
-                if not stream:
-                    result["events"] = events
-            peer.send({"jsonrpc": "2.0", "id": msg_id, "result": result})
-        except Exception as e:  # noqa: BLE001 —— 单条消息异常不崩循环
-            peer.send({"jsonrpc": "2.0", "id": msg_id,
-                       "error": {"code": -32603, "message": tools.core.redact(str(e))}})
+                    ctx = tools.ToolContext(ask_user=ask_user, model=model,
+                                            session_id=session.id)
+                    text = loop.run_turn(params.get("text", ""), session, ctx, on_event=push,
+                                         on_delta=(lambda delta: push("delta", delta)) if stream else None,
+                                         model=model)
+                    result = {"text": text, "session_id": session.id}
+                    if not stream:
+                        result["events"] = events
+                peer.send({"jsonrpc": "2.0", "id": msg_id, "result": result})
+            except Exception as e:  # noqa: BLE001 —— 单条消息异常不崩循环
+                peer.send({"jsonrpc": "2.0", "id": msg_id,
+                           "error": {"code": -32603, "message": tools.core.redact(str(e))}})
+    except KeyboardInterrupt:
+        return  # SIGINT：读线程是 daemon，进程随主线程一起干净退出

@@ -747,10 +747,11 @@ def _current_items(rec: dict, signal: dict | None) -> dict:
         key = anomaly.get("id") or anomaly.get("name")
         if not key:
             continue
-        # unknown/error 是"测不到"，不是"正常"：单独一级，且比异常更该提醒
-        # （磁盘 98% 突然变成探针超时，比继续报 98% 更危险）。
-        status = anomaly.get("status")
-        severity = {"critical": "critical", "warn": "warning"}.get(status, "unreachable")
+        # 状态->级别用 checks 的权威映射（STATUS_TO_SEVERITY）：unknown/error 仍
+        # 是"测不到"单独一级；词汇表外的状态取安全默认 warning，而不是静默映成
+        # 最吓人的 unreachable。
+        severity = checks.STATUS_TO_SEVERITY.get(anomaly.get("status"),
+                                                 checks.DEFAULT_SEVERITY)
         items[f"check:{key}"] = {
             "severity": severity, "kind": "check", "task_id": task_id, "run_id": run_id,
             "target": anomaly.get("target"),
@@ -1179,6 +1180,80 @@ def _config_error(message: str, now: float) -> None:
     events.append("notify-config-error", error=message)
 
 
+def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
+                    rec: dict, now: float, result: dict) -> bool:
+    """投递本轮要发的内容并落送达后的状态标记与事件（调用方须已持有 notify.mutex）。
+
+    从 process_run 拆出的"发送"职责：组包 -> 判静默 -> HTTP 送达 -> 状态/事件
+    落账。恢复/去重/重试语义与拆分前完全一致；返回本段是否改了状态，
+    由调用方合并进 dirty 决定是否写盘。
+    """
+    dirty = False
+    fingerprints = [item["fingerprint"] for item in to_send] + \
+                   [item["fingerprint"] for item in recoveries]
+    if not fingerprints:
+        return dirty
+    composed = _compose(to_send, recoveries, rec, now)
+    reason = _suppression_reason(cfg, composed["severity"], now) if cfg else "unconfigured"
+    notif = {
+        "id": _new_notification_id(), "created": now, "created_iso": _now_iso(now),
+        "kind": "anomaly" if not recoveries else ("recovery" if not to_send else "mixed"),
+        "severity": composed["severity"], "title": composed["title"],
+        "text": composed["text"], "items": composed["items"],
+        "recoveries": composed["recoveries"],
+        "task_id": rec.get("task_id"), "run_id": rec.get("run_id"),
+        "session_id": rec.get("session_id"), "report_path": rec.get("report_path"),
+        "report_paths": rec.get("report_paths") or [],
+        "fingerprints": fingerprints,
+        "endpoint": redact_endpoint(cfg.get("url", "")) if cfg else None,
+        "status": "failed", "attempts": 0, "last_error": None,
+        "next_attempt_ts": 0, "http_status": None,
+    }
+    if reason in (None, "unconfigured", "disabled"):
+        delivered = reason in ("unconfigured", "disabled")
+        if reason is None:
+            _deliver(cfg, notif)
+            _store_notification(notif, result)
+            events.append("notify-sent" if notif["status"] == "sent"
+                          else "notify-failed",
+                          notification=notif["id"], severity=composed["severity"],
+                          title=composed["title"], attempts=notif["attempts"],
+                          error=notif.get("last_error"), endpoint=notif["endpoint"],
+                          task=rec.get("task_id"), run=rec.get("run_id"))
+            _mark_notified(state, fingerprints, now, notif["id"],
+                           delivered=notif["status"] == "sent")
+            dirty = True
+            delivered = notif["status"] == "sent"
+        else:
+            # 未配置/已停用：没有可送达的受众，恢复态直接落状态，事件留痕
+            result["notification"] = None
+        if delivered:
+            # 只有真送达（或根本没有渠道/已停用，无需送达）才把状态清成"已恢复"；
+            # 发送失败时保留 pending_recovery，下一轮再补发，避免"恢复消息丢了"。
+            _mark_recovered(state, [r["fingerprint"] for r in recoveries], now)
+            for rec_item in recoveries:
+                events.append("anomaly-recovered",
+                              fingerprint=rec_item["fingerprint"],
+                              title=rec_item.get("title"), task=rec.get("task_id"),
+                              run=rec.get("run_id"))
+            dirty = dirty or bool(recoveries)
+        result["notification"] = notif if reason is None else result["notification"]
+    else:
+        notif["status"] = "muted"
+        notif["muted_reason"] = reason
+        record_muted = _should_record_muted(state, fingerprints, now, cfg)
+        if record_muted:
+            _store_notification(notif, result)
+            events.append("notify-muted", reason=reason, title=composed["title"],
+                          task=rec.get("task_id"), run=rec.get("run_id"),
+                          count=len(fingerprints))
+        changed = _mark_muted(state, fingerprints, now, touch=record_muted)
+        dirty = dirty or record_muted or changed
+        # 恢复项保持 pending_recovery：解除静默后补发"已恢复"
+        result["notification"] = notif
+    return dirty
+
+
 def process_run(rec: dict, signal: dict | None = None) -> dict:
     """一次运行结束后调用：更新异常状态 -> 写事件 -> 必要时发一条通知。
 
@@ -1239,68 +1314,8 @@ def process_run(rec: dict, signal: dict | None = None) -> dict:
                 entry["event_severity"] = item["severity"]
                 dirty = True
             items_state[item["fingerprint"]] = entry
-        fingerprints = [item["fingerprint"] for item in to_send] + \
-                       [item["fingerprint"] for item in recoveries]
-        if fingerprints:
-            composed = _compose(to_send, recoveries, rec, now)
-            reason = _suppression_reason(cfg, composed["severity"], now) if cfg \
-                else "unconfigured"
-            notif = {
-                "id": _new_notification_id(), "created": now, "created_iso": _now_iso(now),
-                "kind": "anomaly" if not recoveries else ("recovery" if not to_send else "mixed"),
-                "severity": composed["severity"], "title": composed["title"],
-                "text": composed["text"], "items": composed["items"],
-                "recoveries": composed["recoveries"],
-                "task_id": rec.get("task_id"), "run_id": rec.get("run_id"),
-                "session_id": rec.get("session_id"), "report_path": rec.get("report_path"),
-                "report_paths": rec.get("report_paths") or [],
-                "fingerprints": fingerprints,
-                "endpoint": redact_endpoint(cfg.get("url", "")) if cfg else None,
-                "status": "failed", "attempts": 0, "last_error": None,
-                "next_attempt_ts": 0, "http_status": None,
-            }
-            if reason in (None, "unconfigured", "disabled"):
-                delivered = reason in ("unconfigured", "disabled")
-                if reason is None:
-                    _deliver(cfg, notif)
-                    _store_notification(notif, result)
-                    events.append("notify-sent" if notif["status"] == "sent"
-                                  else "notify-failed",
-                                  notification=notif["id"], severity=composed["severity"],
-                                  title=composed["title"], attempts=notif["attempts"],
-                                  error=notif.get("last_error"), endpoint=notif["endpoint"],
-                                  task=rec.get("task_id"), run=rec.get("run_id"))
-                    _mark_notified(state, fingerprints, now, notif["id"],
-                                   delivered=notif["status"] == "sent")
-                    dirty = True
-                    delivered = notif["status"] == "sent"
-                else:
-                    # 未配置/已停用：没有可送达的受众，恢复态直接落状态，事件留痕
-                    result["notification"] = None
-                if delivered:
-                    # 只有真送达（或根本没有渠道/已停用，无需送达）才把状态清成"已恢复"；
-                    # 发送失败时保留 pending_recovery，下一轮再补发，避免"恢复消息丢了"。
-                    _mark_recovered(state, [r["fingerprint"] for r in recoveries], now)
-                    for rec_item in recoveries:
-                        events.append("anomaly-recovered",
-                                      fingerprint=rec_item["fingerprint"],
-                                      title=rec_item.get("title"), task=rec.get("task_id"),
-                                      run=rec.get("run_id"))
-                    dirty = dirty or bool(recoveries)
-                result["notification"] = notif if reason is None else result["notification"]
-            else:
-                notif["status"] = "muted"
-                notif["muted_reason"] = reason
-                record_muted = _should_record_muted(state, fingerprints, now, cfg)
-                if record_muted:
-                    _store_notification(notif, result)
-                    events.append("notify-muted", reason=reason, title=composed["title"],
-                                  task=rec.get("task_id"), run=rec.get("run_id"),
-                                  count=len(fingerprints))
-                changed = _mark_muted(state, fingerprints, now, touch=record_muted)
-                dirty = dirty or record_muted or changed
-                # 恢复项保持 pending_recovery：解除静默后补发"已恢复"
-                result["notification"] = notif
+        # 发送与送达后的状态/事件落账在 _apply_delivery（锁仍在本函数手里）
+        dirty = _apply_delivery(state, cfg, to_send, recoveries, rec, now, result) or dirty
         if dirty:
             # 状态没变就不写盘：未配置/持续被去重的巡检不该每轮都 fsync 一次
             _prune_state(state, now)

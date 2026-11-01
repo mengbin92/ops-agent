@@ -168,8 +168,7 @@ class StreamPrinter:
             rows += max(1, math.ceil(w / width)) if w else 1
         return rows
 
-    def _repaint(self) -> None:
-        rendered = markdown.render(self._buf, color=_USE_COLOR)
+    def _repaint(self, rendered: str) -> None:
         if self._printed_rows:
             # 光标上移已打印行数并清到屏幕尾，再重绘
             sys.stdout.write(f"\033[{self._printed_rows}A\033[J")
@@ -183,20 +182,22 @@ class StreamPrinter:
             sys.stdout.write(delta)
             sys.stdout.flush()
             return
-        if self._rows_of(markdown.render(self._buf)) > self._max_rows():
+        # 每次增量只渲染一次，行数估算与重绘共用同一份结果
+        rendered = markdown.render(self._buf, color=_USE_COLOR)
+        if self._rows_of(rendered) > self._max_rows():
             # 超出屏幕：旧块保持不动，之后只追加增量（尾部为未渲染原文）
             self._overflow = True
             sys.stdout.write(delta)
             sys.stdout.flush()
             return
-        self._repaint()
+        self._repaint(rendered)
 
     def finish(self) -> str:
         if self._overflow or not sys.stdout.isatty():
             sys.stdout.write("\n")
             sys.stdout.flush()
         else:
-            self._repaint()
+            self._repaint(markdown.render(self._buf, color=_USE_COLOR))
         text, self._buf, self._printed_rows, self._overflow = self._buf, "", 0, False
         return text
 
@@ -256,7 +257,13 @@ def _pick_session() -> sess_mod.Session | None:
         return None
     if not choice.isdigit() or not (1 <= int(choice) <= len(sessions[:20])):
         return None
-    return sess_mod.Session(sessions[int(choice) - 1]["id"])
+    picked = sessions[int(choice) - 1]
+    try:
+        return sess_mod.Session(picked["id"])
+    except (OSError, ValueError) as e:
+        # 损坏/刚被并发修剪的会话文件不该炸掉 REPL：警告后留在当前会话
+        warn(f"[会话恢复失败] {picked['id']}: {e}")
+        return None
 
 
 def _pause_goal(state: ReplState) -> None:

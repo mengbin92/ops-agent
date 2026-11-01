@@ -49,8 +49,14 @@ def _prune_sessions() -> None:
         files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
     except OSError:  # 并发子代理同时建会话/修剪时 stat 可能失败，跳过本次
         return
+    # 近 24h 有活动的会话不删：子代理/工作流会瞬间制造大量新会话文件，纯按
+    # 保留数删最旧会误删仍在使用的空闲会话（下次 append 即发现文件被截断、
+    # 目标丢失）。增长仍有界：至多多保留一天的 churn。
+    floor = time.time() - 24 * 3600
     for p in files[:-SESSION_KEEP]:
         try:
+            if p.stat().st_mtime >= floor:
+                continue
             p.unlink()
         except OSError:
             pass
@@ -128,24 +134,54 @@ class Session:
 
 
 def list_sessions() -> list[dict]:
-    """按修改时间倒序列出会话：{id, mtime, turns, preview}。preview 取首条用户消息。"""
+    """按修改时间倒序列出会话：{id, mtime, turns, preview}。preview 取首条用户消息。
+
+    纯文本流式读取，不构造 Session、不开 r+b：列表操作不能给会话文件加锁、
+    改权限或补写换行。校验标准与 Session 装载一致，加载不了的会话不出现在列表。
+    """
     d = core.STATE_DIR / "sessions"
     if not d.exists():
         return []
     out = []
     for p in d.glob("*.jsonl"):
         preview, turns = "", 0
+        torn_tail = False  # 崩溃留下的半行只在恰为末行时容忍（与 _load 一致）
         try:
-            for rec in Session(p.stem).messages:
-                if rec.get("role") == "user":
-                    turns += 1
-                    if not preview:
-                        preview = str(rec.get("content", ""))[:60]
-        except (OSError, ValueError):
-            continue
-        try:
+            with p.open(encoding="utf-8", errors="replace") as f:
+                empty = True
+                for i, line in enumerate(f):
+                    if torn_tail:  # 坏行之后还有内容 → 不是末行残留，文件损坏
+                        raise ValueError("会话文件损坏")
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, RecursionError):
+                        if i > 0 and not line.endswith("\n"):
+                            torn_tail = True
+                            continue
+                        raise ValueError("会话文件损坏")
+                    if i == 0:
+                        if not isinstance(rec, dict) \
+                                or type(rec.get("format")) is not int \
+                                or rec["format"] != FORMAT_VERSION \
+                                or rec.get("id") != p.stem:
+                            raise ValueError("不支持的会话格式")
+                        empty = False
+                        continue
+                    if not isinstance(rec, dict):
+                        raise ValueError("会话记录不是对象")
+                    _validate_record(rec, i + 1)
+                    try:  # 与 _load 同关：过深嵌套的会话不能进恢复列表
+                        rec = core.redact_obj(rec)
+                    except RecursionError:
+                        raise ValueError("会话消息嵌套过深") from None
+                    if rec.get("role") == "user":
+                        turns += 1
+                        if not preview:
+                            preview = str(rec.get("content", ""))[:60]
+                if empty:
+                    raise ValueError("会话文件为空")
             mtime = p.stat().st_mtime
-        except OSError:  # 列目录与修剪并发：文件刚被删就跳过
+        except (OSError, ValueError):
             continue
         out.append({"id": p.stem, "mtime": mtime, "turns": turns, "preview": preview})
     return sorted(out, key=lambda s: s["mtime"], reverse=True)

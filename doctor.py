@@ -19,7 +19,6 @@
 """
 from __future__ import annotations
 
-import json
 import http.client
 import os
 import sys

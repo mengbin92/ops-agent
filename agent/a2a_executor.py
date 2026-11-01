@@ -22,6 +22,8 @@
   因此取消消息明确写「请核实执行记录」，与项目既有的 unknown 语义保持一致。
 - A2A 通道没有 REPL 那样的实时确认框，所以「无人值守语义」不适用于此形态：
   ask_user 永远可用（由调用方承担答复责任），这一点与 schedule/subagent 相反。
+  例外：`--read-only` 起服时不建确认通道（ask_user=None），写操作由 tools.py
+  既有的守门分支降级为明确拒绝（不建审批戳），R0 只读命令不受影响。
 """
 from __future__ import annotations
 
@@ -107,7 +109,8 @@ def _resume_prompt(answer: str) -> str:
 
 
 def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
-                   max_concurrent: int = MAX_CONCURRENT_DEFAULT):
+                   max_concurrent: int = MAX_CONCURRENT_DEFAULT,
+                   read_only: bool = False):
     """构造执行器。
 
     基类在函数内取：模块导入时不要求 a2a-sdk 已安装（内核保持零依赖）。
@@ -117,9 +120,11 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
 
     class OpsAgentExecutor(s.AgentExecutor):
         def __init__(self, model=None, timeout=TIMEOUT_DEFAULT,
-                     max_concurrent=MAX_CONCURRENT_DEFAULT):
+                     max_concurrent=MAX_CONCURRENT_DEFAULT,
+                     read_only: bool = False):
             self.model = model
             self.timeout = timeout
+            self.read_only = read_only  # 只读起服：不建确认通道，写工具走拒绝路径
             self._sem = asyncio.Semaphore(max_concurrent)
             self._sessions: "OrderedDict[str, sess_mod.Session]" = OrderedDict()
             self._locks: dict[str, threading.Lock] = {}
@@ -173,7 +178,10 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                 raise NeedUserInput(question)
 
             ctx = tools.ToolContext(
-                ask_user=ask_user, model=self.model, session_id=sess.id,
+                # 只读模式不给确认通道：ops_approve 等写工具见 ask_user=None 会
+                # 返回明确的拒绝文案（不建审批戳），R0 只读命令照常执行。
+                ask_user=None if self.read_only else ask_user,
+                model=self.model, session_id=sess.id,
                 deadline=time.monotonic() + self.timeout)
 
             def on_event(kind, payload):
@@ -335,4 +343,5 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                     "可能仍会在目标机上生效——请用执行记录核实实际状态。",
                     task_id=task_id, context_id=context_id))
 
-    return OpsAgentExecutor(model=model, timeout=timeout, max_concurrent=max_concurrent)
+    return OpsAgentExecutor(model=model, timeout=timeout,
+                            max_concurrent=max_concurrent, read_only=read_only)

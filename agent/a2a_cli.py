@@ -31,6 +31,9 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout", type=int, default=600, help="单任务墙钟预算秒（默认 600）")
     s.add_argument("--max-concurrent", type=int, default=2,
                    help="同时执行的 A2A 任务上限（默认 2）")
+    s.add_argument("--read-only", action="store_true",
+                   help="只读模式：不提供人工确认通道，写操作一律拒绝；"
+                        "R0 只读命令与 AgentCard/skills 照常")
 
     c = sub.add_parser("card", help="打印 AgentCard（JSON）")
     c.add_argument("--host", default="127.0.0.1")
@@ -94,7 +97,8 @@ def cli(argv: list[str]) -> int:
                 return EXIT_UNAVAILABLE
             return a2a_server.serve(host=args.host, port=args.port, token=args.token,
                                     model=args.model, timeout=args.timeout,
-                                    max_concurrent=args.max_concurrent)
+                                    max_concurrent=args.max_concurrent,
+                                    read_only=args.read_only)
 
         # call
         from . import a2a_client

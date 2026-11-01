@@ -227,11 +227,14 @@ def record(model: str, prompt_tokens=None, completion_tokens=None,
                 for old_day in sorted(state["days"])[:-31]:
                     state["days"].pop(old_day, None)
             _save_state(state)
-        if path.exists() and path.stat().st_size > USAGE_ROTATE_BYTES:
-            try:
-                path.replace(path.with_suffix(".jsonl.1"))
-            except OSError:
-                pass
+            # 轮转必须在同一把锁内：daemon 与 CLI 同时"查大小→改名"会让第二个
+            # replace 提前覆盖 .jsonl.1，把上一代账单顶掉（数据丢失且无告警）。
+            # 追加留在锁外——O_APPEND 单条 write 原子即可。
+            if path.exists() and path.stat().st_size > USAGE_ROTATE_BYTES:
+                try:
+                    path.replace(path.with_suffix(".jsonl.1"))
+                except OSError:
+                    pass
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -318,14 +321,6 @@ def reserve_call() -> tuple[str | None, str | None]:
         except OSError as e:
             raise core.OpsxError(f"无法预留调用预算: {e}") from e
         return key, None
-
-
-def ensure_budget() -> None:
-    """兼容占位：预算耗尽返回说明由 llm.chat 转成 LLMError 子类抛出。
-    直接调用本函数的 CLI 场景用 check_budget 的返回值。"""
-    reason = check_budget()
-    if reason:
-        raise core.OpsxError(reason)
 
 
 # ---------------------------------------------------------------- 展示

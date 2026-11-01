@@ -57,6 +57,21 @@ LOCAL_CONFIG_FIELDS = ("tags", "env", "services", "checks", "enabled")
 
 OK, WARN, CRITICAL, UNKNOWN, ERROR = "ok", "warn", "critical", "unknown", "error"
 
+# 检查状态 -> 通知级别的唯一权威映射（notify 只引用，不得在别处重映）。
+# unknown/error 是"测不到"而不是"正常"：映成单独的 unreachable 级（不可采集），
+# 比 critical 更该提醒——磁盘 98% 突然变成探针超时，比继续报 98% 更危险。
+# 词汇表之外的状态（上游 bug、手工改坏的摘要文件）默认 warning：必须提醒，
+# 但不能像旧实现 .get(status, "unreachable") 那样静默升到最吓人的一级。
+# ok 本不该出现在异常清单里，真出现也按 warning 提醒而不是装作没事。
+STATUS_TO_SEVERITY = {
+    OK: "warning",
+    WARN: "warning",
+    CRITICAL: "critical",
+    UNKNOWN: "unreachable",
+    ERROR: "unreachable",
+}
+DEFAULT_SEVERITY = "warning"
+
 DEFAULTS = {
     "disk_paths": ["/"],
     "disk_warn_pct": 85,

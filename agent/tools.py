@@ -35,6 +35,8 @@ OUTPUT_LIMIT = 30_000   # 超限输出落盘，预览只留前 3 万字符
 SPILL_DIR = core.STATE_DIR / "outputs"
 SPILL_KEEP = 200        # 落盘输出保留份数，超出按时间删最旧
 READ_LIMIT = 2000       # read 默认返回行数
+# agent 自身的凭据环境变量：不进入任何子进程环境（R0 的 env/echo 会原样回显）
+SECRET_ENV_KEYS = ("OPSAGENT_API_KEY", "OPSAGENT_A2A_TOKEN")
 
 
 class ToolContext:
@@ -135,12 +137,11 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         code, out = remote.run(target, cmd, timeout=timeout)
         return f"[target={target} exit={code}]\n" + _cap(out, f"bash-{target}")
     try:
-        child_env = None
-        if core.is_kubectl_diff(cmd):
-            # diff 尊重 KUBECTL_EXTERNAL_DIFF（可借此执行任意命令）：
-            # R0 预演剔除该变量后执行，"只读预演"才名实相符。
-            child_env = {k: v for k, v in os.environ.items()
-                         if k != "KUBECTL_EXTERNAL_DIFF"}
+        # 子进程环境剔除 agent 自身凭据与 diff 外部执行器：R0 的 env/echo 会原样
+        # 回显环境变量；KUBECTL_EXTERNAL_DIFF 只可能被 kubectl diff 消费，
+        # 无条件剔除更稳（diff 段的识别漏一条就是任意命令执行）。
+        drop = set(SECRET_ENV_KEYS) | {"KUBECTL_EXTERNAL_DIFF"}
+        child_env = {k: v for k, v in os.environ.items() if k not in drop}
         r = core.run_shell(cmd, timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         return f"[超时] 命令超过 {timeout:g}s 未结束，已终止"
@@ -241,6 +242,20 @@ def _ask_user(args: dict, ctx: ToolContext) -> str:
     return answer if isinstance(answer, str) else "[ask_user 不可用] 用户未回答，视为用户拒绝。"
 
 
+def _normalize_snapshot_args(args: dict) -> tuple[list[str], list[tuple[str, str]]]:
+    """快照参数归一化：ops_approve 与 ops_exec 必须共用同一份规则
+    （去空白项、strip、去重、排序），两边判定错位会让已批准的多文件
+    变更单永远无法通过 core.check_snapshot_declaration 执行。"""
+    files = [str(f) for f in (args.get("snapshot_files") or [])]
+    legacy = args.get("snapshot_file")
+    if isinstance(legacy, str):  # ops_exec 的旧版单文件参数
+        files.append(legacy)
+    snap_files = sorted({f.strip() for f in files if f.strip()})
+    snap_cmds = [(str(c["command"]), str(c.get("name", "")))
+                 for c in (args.get("snapshot_cmds") or []) if str(c["command"]).strip()]
+    return snap_files, snap_cmds
+
+
 def _ops_approve(args: dict, ctx: ToolContext) -> str:
     if ctx.ask_user is None:  # 没有确认通道时不能自建审批戳（否则可绕过人类授权）
         return ("[opsx 拒绝] 当前形态没有可确认的用户通道，不创建审批戳。"
@@ -260,10 +275,7 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
                     "（k8s: kubectl diff -f ... 或 kubectl apply --dry-run=server "
                     "--context <c> -f ...；文件: 对比目标内容与当前内容），"
                     "写清将改什么状态、影响哪些服务，再提交审批。")
-        snap_files = sorted({str(f).strip() for f in (args.get("snapshot_files") or [])
-                             if str(f).strip()})
-        snap_cmds = [(str(c["command"]), str(c.get("name", "")))
-                     for c in (args.get("snapshot_cmds") or []) if str(c["command"]).strip()]
+        snap_files, snap_cmds = _normalize_snapshot_args(args)
         warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
         uses = args.get("uses", 1)
         # 次数必须出现在确认框里：否则模型用 uses=100 换来的授权，人看起来和 1 次一样
@@ -308,22 +320,16 @@ def _ops_revoke(args: dict, ctx: ToolContext) -> str:
             else f"没有可撤销的{where}审批戳（可能已过期或未创建）")
 
 
-def _snapshot_filespec(args: dict) -> list[str]:
-    return [args["snapshot_file"]] if args.get("snapshot_file") else []
-
-
 def _ops_exec(args: dict, ctx: ToolContext) -> str:
     """带快照的原子执行：等价于 opsx exec；带 target 时在目标机执行。"""
     cmd = args["command"]
     target = args.get("target") or None
-    snap_cmds = []
-    for spec in args.get("snapshot_cmds", []):
-        snap_cmds.append((spec["command"], spec.get("name", "")))
+    snap_files, snap_cmds = _normalize_snapshot_args(args)
     started = time.time()
     if target:
-        code, sid, output = remote.exec_change(target, cmd, _snapshot_filespec(args), snap_cmds)
+        code, sid, output = remote.exec_change(target, cmd, snap_files, snap_cmds)
     else:
-        code, sid, output = core.exec_change(cmd, _snapshot_filespec(args), snap_cmds)
+        code, sid, output = core.exec_change(cmd, snap_files, snap_cmds)
     out_text = _cap(output, f"exec-{target or 'local'}") if output else "(无输出)"
     sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     where = f"目标 {target} " if target else "本机"
@@ -394,8 +400,9 @@ def _ops_executions(args: dict, ctx: ToolContext) -> str:
             return f"[错误] 没有这条执行记录: {args.get('execution_id')!r}"
         return execution.format_record(record)
     tail = args.get("tail", 20)
-    if type(tail) is not int or tail <= 0:
-        return "[错误] tail 须为正整数"
+    if type(tail) is not int or not 1 <= tail <= 200:
+        # 上限与 _events 一致：无界 tail 会把数百条记录整段拉进模型上下文
+        return "[错误] tail 须为 1-200 的整数"
     summary = execution.summary()
     text = execution.format_list(execution.list_records(
         tail=tail, status=args.get("status") or None))
@@ -803,8 +810,9 @@ def _schedule(args: dict, ctx: ToolContext) -> str:
                 except schedule_mod.ScheduleError:
                     prefix = True  # 任务已删除：按 id 前缀查历史
             tail = args.get("tail", 20)
-            if type(tail) is not int or tail < 0:
-                return "[错误] tail 须为非负整数"
+            if type(tail) is not int or not 0 <= tail <= 200:
+                # 上限与 _events 一致：无界 tail 会把数百条记录整段拉进模型上下文
+                return "[错误] tail 须为 0-200 的整数"
             return schedule_mod.format_runs(task_id=key or None, tail=tail, prefix=prefix)
         return "[错误] action 应为 list / runs / add / remove / pause / resume"
     except schedule_mod.ScheduleError as e:
@@ -970,7 +978,8 @@ REGISTRY: dict[str, dict] = {
                            "timeout_seconds": {"type": "integer",
                                                "description": "整任务时间预算秒数（60-86400，默认 900）"},
                            "id": {"type": "string", "description": "任务 id（可用唯一前缀）"},
-                           "tail": {"type": "integer", "description": "runs 的条数，默认 20"}},
+                           "tail": {"type": "integer",
+                                    "description": "runs 的条数（默认 20，上限 200）"}},
                           ["action"]),
         "handler": _schedule, "read_only": False,
     },
@@ -1039,8 +1048,12 @@ REGISTRY: dict[str, dict] = {
                           "否则拒绝执行。",
                           {"command": {"type": "string"},
                            "target": {"type": "string", "description": "已注册的 SSH 目标名；省略=本机"},
-                           "snapshot_file": {"type": "string", "description": "执行前需快照的文件（可选；"
-                                                                              "审批声明过则必须与之一致）"},
+                           "snapshot_files": {"type": "array", "items": {"type": "string"},
+                                              "description": "执行前需快照的文件列表"
+                                                             "（审批声明过则必须与之一致；"
+                                                             "与旧参数 snapshot_file 合并取并集）"},
+                           "snapshot_file": {"type": "string", "description": "执行前需快照的单个文件（旧参数，"
+                                                                              "等价于 snapshot_files 的单元素）"},
                            "snapshot_cmds": {"type": "array", "items": {"type": "object",
                                              "properties": {"command": {"type": "string"},
                                                             "name": {"type": "string"}},
@@ -1061,7 +1074,8 @@ REGISTRY: dict[str, dict] = {
                           {"action": {"type": "string", "enum": ["list", "show"],
                                       "default": "list"},
                            "execution_id": {"type": "string"},
-                           "tail": {"type": "integer", "default": 20},
+                           "tail": {"type": "integer", "default": 20,
+                                    "description": "list 的条数（默认 20，上限 200）"},
                            "status": {"type": "string",
                                       "enum": ["running", "succeeded", "failed", "unknown",
                                                "aborted"]}},
@@ -1097,7 +1111,14 @@ def tool_schemas(ctx: ToolContext | None = None) -> list[dict]:
 
 def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     """工具出口统一脱敏：模型收到的工具结果与会话记录都不含明文密钥。"""
-    return core.redact(_dispatch(name, args, ctx))
+    out = _dispatch(name, args, ctx)
+    # 正则脱敏之外，已知配置值按原文精确替换（同 llm.LLMError 的做法）：
+    # env/echo 的输出不呈密钥格式，逐值抹除才兜得住。
+    for key in SECRET_ENV_KEYS:
+        value = os.environ.get(key, "")
+        if len(value) > 4:
+            out = out.replace(value, core.REDACTED)
+    return core.redact(out)
 
 
 def _dispatch(name: str, args: dict, ctx: ToolContext) -> str:

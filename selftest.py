@@ -1153,13 +1153,24 @@ def test_session_prune():
     keep = agent_session.SESSION_KEEP
     agent_session.SESSION_KEEP = 3
     try:
+        # 旧会话（>24h 无活动）按保留数修剪：增长必须有界。
+        old = _t.time() - 25 * 3600
         for i in range(5):
             s = agent_session.Session(f"test-prune-{i:04d}")
             s.append({"role": "user", "content": str(i)})
-            _t.sleep(0.01)
+            os.utime(s.path, (old, old))
         agent_session.Session()  # 新会话触发修剪
         remaining = [p for p in Path(core.STATE_DIR, "sessions").glob("test-prune-*.jsonl")]
         assert len(remaining) <= 3, remaining
+        # 近 24h 有活动的会话不删：子代理/工作流的高频会话文件不能误杀
+        # 正在使用的空闲会话（下次 append 即截断、目标丢失）。
+        for i in range(5):
+            s = agent_session.Session(f"test-fresh-{i:04d}")
+            s.append({"role": "user", "content": str(i)})
+            _t.sleep(0.01)
+        agent_session.Session()  # 再触发一次修剪
+        fresh = [p for p in Path(core.STATE_DIR, "sessions").glob("test-fresh-*.jsonl")]
+        assert len(fresh) == 5, "新会话不应被按数修剪删除"
     finally:
         agent_session.SESSION_KEEP = keep
 
@@ -1229,7 +1240,9 @@ def test_remote_exec_snapshot_and_rollback():
             return resolved
         calls.append((name, cmd, stdin))
         if "OPSX-EXISTS" in cmd:
-            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nremote-v1\n", stderr=b"")
+            # _remote_read 尾标记协议：内容 + 恒定补一个 \n + OPSX-EXISTS-END
+            return subprocess.CompletedProcess(
+                [], 0, stdout=b"OPSX-EXISTS\nremote-v1\n\nOPSX-EXISTS-END\n", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"remote-v1\n", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -1359,7 +1372,8 @@ def test_opsx_cli_remote_end_to_end():
         f'echo "$@" >> "{log}"\n'
         'case "$*" in\n'
         '  *"OPSX-RESOLVED"*) printf \'OPSX-RESOLVED\\000/etc/nginx/nginx.conf\\000\' ;;\n'
-        '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\' ;;\n'
+        '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\'; '
+        'printf \'\\nOPSX-EXISTS-END\\n\' ;;\n'
         "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
         '  *".opsx-restore."*) cat > "$OPSX_TEST_PUSHED" ; '
         'printf \'opsx-restored had=1 size=%s mode=600\\n\' "$(wc -c < "$OPSX_TEST_PUSHED" | tr -d \' \')" ;;\n'
@@ -1485,7 +1499,8 @@ def test_remote_rollback_failure_reported():
         if resolved is not None:
             return resolved
         if "OPSX-EXISTS" in cmd:
-            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\nv1", stderr=b"")
+            return subprocess.CompletedProcess(
+                [], 0, stdout=b"OPSX-EXISTS\nv1\nOPSX-EXISTS-END\n", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"v1", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -2313,13 +2328,20 @@ def test_bash_sanitizes_kubectl_external_diff_env():
         _, kwargs = run.call_args
         assert kwargs.get("env") is not None, "diff 执行应传入剔除后的环境"
         assert "KUBECTL_EXTERNAL_DIFF" not in kwargs["env"]
-        # 非 diff 命令不受影响：继承环境（env=None）
+        # 非 diff 命令同样不再裸继承环境：agent 自身凭据（API key / A2A token）
+        # 必须剔除——R0 白名单里的 env / echo $VAR 会原样回显环境变量。
         with mock.patch.object(core, "run_shell") as run:
             run.return_value = subprocess.CompletedProcess("kubectl get pods", 0, "pods", "")
-            agent_tools.dispatch("bash", {"command": "kubectl get pods"},
-                                 agent_tools.ToolContext())
+            os.environ["OPSAGENT_API_KEY"] = "sk-test-do-not-leak-123456"
+            try:
+                agent_tools.dispatch("bash", {"command": "kubectl get pods"},
+                                     agent_tools.ToolContext())
+            finally:
+                del os.environ["OPSAGENT_API_KEY"]
         _, kwargs = run.call_args
-        assert kwargs.get("env") is None
+        assert kwargs.get("env") is not None, "非 diff 命令也应传剔除后的环境"
+        assert "OPSAGENT_API_KEY" not in kwargs["env"], "子进程环境不得含 agent 凭据"
+        assert "KUBECTL_EXTERNAL_DIFF" not in kwargs["env"]
     finally:
         del os.environ["KUBECTL_EXTERNAL_DIFF"]
 
@@ -3307,7 +3329,8 @@ def test_remote_rollback_target_check_and_backup():
         if resolved is not None:
             return resolved
         if "OPSX-EXISTS" in cmd:
-            return subprocess.CompletedProcess([], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n", stderr=b"")
+            return subprocess.CompletedProcess(
+                [], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n\nOPSX-EXISTS-END\n", stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"archived-v1\n", stderr=b"")
         if ".opsx-restore." in cmd:      # 原子恢复脚本（mktemp → chmod → mv）
@@ -6059,7 +6082,7 @@ def test_review_exec_rechecks_approval_after_snapshot():
         remote_cmd = "systemctl restart snapshot-bound"
         core.approve(remote_cmd, ttl_seconds=60, target="web1")
 
-        def pull_then_revoke(name, src, d, items):
+        def pull_then_revoke(name, src, d, items, timeout=None):
             dest = d / "file.txt"
             dest.write_text("before")
             items.append({"type": "file", "src": src, "dest": "file.txt"})
@@ -6821,8 +6844,8 @@ def test_remote_restore_atomic_keeps_mode_and_rebuilds():
         assert target.read_bytes() == payload, target.read_bytes()
         assert stat_mod.S_IMODE(target.stat().st_mode) == 0o640, \
             oct(stat_mod.S_IMODE(target.stat().st_mode))
-        had, size = remote._parse_restore(r.stdout)
-        assert had is True and size == len(payload), (had, size, r.stdout)
+        info = remote._parse_restore_info(r.stdout)
+        assert info["had"] is True and info["size"] == len(payload), (info, r.stdout)
         assert not list(Path(td).glob(".opsx-restore.*")), "临时文件必须清理"
 
         # chmod 失败 → 原文件一个字节都没变，且不留临时文件
@@ -6838,8 +6861,8 @@ def test_remote_restore_atomic_keeps_mode_and_rebuilds():
         r3 = subprocess.run(["/bin/sh", "-c", script], input=payload,
                             capture_output=True)
         assert r3.returncode == 0, r3.stderr
-        had3, _ = remote._parse_restore(r3.stdout)
-        assert had3 is False and target.read_bytes() == payload, (had3, r3.stdout)
+        info3 = remote._parse_restore_info(r3.stdout)
+        assert info3["had"] is False and target.read_bytes() == payload, (info3, r3.stdout)
         assert stat_mod.S_IMODE(target.stat().st_mode) == 0o640, \
             oct(stat_mod.S_IMODE(target.stat().st_mode))
 
@@ -7074,8 +7097,9 @@ def test_rollback_without_backcast_is_uncertain():
         if ".opsx-restore." in cmd:
             return subprocess.CompletedProcess([], 0, b"", b"")   # 后验被吞掉
         if "OPSX-EXISTS" in cmd:
-            # 目标机当前内容（回滚前副本要读它）
-            return subprocess.CompletedProcess([], 0, b"OPSX-EXISTS\nv2\n", b"")
+            # 目标机当前内容（回滚前副本要读它）；尾标记协议同上
+            return subprocess.CompletedProcess(
+                [], 0, b"OPSX-EXISTS\nv2\n\nOPSX-EXISTS-END\n", b"")
         return subprocess.CompletedProcess([], 0, b"ok\n", b"")
 
     orig = remote._ssh
@@ -7519,13 +7543,14 @@ def test_w5_review_execution_interfaces_ignore_another_process_record():
 def test_w5_review_execution_queries_reject_zero_and_negative_tail():
     import mcp_server
     from agent import tools as agent_tools
-    for tail in (0, -1):
+    # 无界 tail 会把数百条执行记录整段拉进模型上下文：非正数与超上限都拒绝。
+    for tail in (0, -1, 201):
         text = agent_tools.dispatch('ops_executions', {'tail': tail}, agent_tools.ToolContext())
-        assert 'tail 须为正整数' in text
+        assert 'tail 须为' in text and '整数' in text, text
         result = mcp_server.handle_message({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                                            'params': {'name': 'ops_executions',
                                                       'arguments': {'tail': tail}}})['result']
-        assert result['isError'] and 'tail 须为正整数' in result['content'][0]['text']
+        assert result['isError'] and 'tail 须为' in result['content'][0]['text']
 
 
 

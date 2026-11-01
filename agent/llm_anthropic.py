@@ -12,10 +12,10 @@ BASE_URL 末尾带 /v1 时按代理惯例只补 /messages，否则补 /v1/messag
 from __future__ import annotations
 
 import json
-import http.client
 import os
 
-from .llm import LLMError, _api_key, _request, _usage_tokens, _validate_message
+from .llm import (LLMError, _api_key, _request, _response_errors, _usage_tokens,
+                  _validate_message)
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -225,19 +225,13 @@ def chat_once(messages: list[dict], tools: list[dict] | None = None,
     返回 (message, (input_tokens, output_tokens) | None)。
     """
     body = _body(messages, tools, model, stream=on_delta is not None)
-    try:
+    with _response_errors():
         if on_delta is not None:
             used_stream = {}
             msg = _chat_stream(body, timeout, on_delta, used_stream)
             return msg, used_stream.get("tokens")
         with _request(_endpoint(), body, _headers(), timeout) as resp:
             data = json.loads(resp.read().decode())
-    except (ValueError, RecursionError) as e:
-        raise LLMError(f"LLM 响应解析失败: {e}") from e
-    except (OSError, http.client.HTTPException) as e:
-        raise LLMError(f"LLM API 读取失败: {e}") from e
-    except (KeyError, IndexError, TypeError, AttributeError) as e:
-        raise LLMError(f"LLM 流式响应格式异常: {e}") from e
     msg = _message(data)
     raw_usage = data.get("usage") if isinstance(data, dict) else None
     return msg, _usage_tokens(raw_usage, "input_tokens", "output_tokens")

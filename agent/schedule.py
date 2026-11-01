@@ -231,6 +231,25 @@ def _next_run(entry: dict, now: float) -> float:
     return _next_daily(daily, now)
 
 
+def _next_claimed_run(entry: dict, now: float) -> float:
+    """领取到期任务时推进 next_run：every_seconds 沿固定网格，daily 按本地日历。
+
+    every_seconds 以既有 next_run 为相位锚点，推进到 now 之后的第一个网格点
+    （anchor + k*every），不随领取/执行耗时滑动——按"领取时刻+间隔"滑动会让
+    名义时点每个周期后移（领取延迟+执行时长，实测 5 天漂移 20 分钟且无上界）。
+    """
+    every, daily = entry.get("every_seconds"), entry.get("daily")
+    if (every is not None) == (daily is not None):
+        raise ScheduleError("every_seconds 与 daily 必须二选一")
+    if every is None:
+        return _next_daily(daily, now)
+    anchor = _run_time(entry)
+    step = _interval(every)
+    if anchor > now:
+        return anchor
+    return anchor + step * (math.floor((now - anchor) / step) + 1)
+
+
 def _run_time(entry: dict) -> float:
     value = entry.get("next_run", 0)
     try:
@@ -574,10 +593,15 @@ def _update_entry_state(task_id: str, run_id: str, status: str,
                     if status == "succeeded":
                         it["last_success"] = now
                     if reanchor and it.get("enabled", True):
-                        try:
-                            it["next_run"] = _next_run(it, now)
-                        except ScheduleError:
-                            pass  # 损坏的时间留给 run_due 停用
+                        # every_seconds 任务的 next_run 已在领取时（_claim_due）按固定
+                        # 网格推进，这里再按"完成时刻+间隔"重锚会让名义时点每轮滑动
+                        # （领取延迟+执行时长，无上界）。daily 任务保留重锚：跨夏令时
+                        # 必须按本地日历重算，固定 86400 会跑偏。
+                        if it.get("every_seconds") is None:
+                            try:
+                                it["next_run"] = _next_run(it, now)
+                            except ScheduleError:
+                                pass  # 损坏的时间留给 run_due 停用
             meta["last_scan"] = now
             _safe_save(items, meta)
     except (ScheduleError, OSError):
@@ -612,7 +636,14 @@ def reconcile_runs(records: bool = False):
             fresh["finished"] = _iso()
             fresh["finished_ts"] = time.time()
             fresh["error"] = "进程退出，本次执行中断（未完成）"
-            _write_run(fresh, locked=True)
+            try:
+                _write_run(fresh, locked=True)
+            except OSError as e:
+                # 磁盘满等单条写失败只影响这一条（与 _begin_run 同样的取舍：
+                # 记账让位于巡检）：审计留痕后继续对账其余记录，daemon 不许死。
+                _safe_audit("schedule-reconcile-failed", run_id=fresh.get("run_id"),
+                            task_id=fresh.get("task_id"), error=str(e))
+                continue
             updated.append(fresh)
     for rec in updated:
         _safe_audit("schedule-interrupted", run_id=rec["run_id"], task_id=rec.get("task_id"))
@@ -1128,7 +1159,7 @@ def _claim_due(task_id: str, now: float) -> dict | None:
                 return None
             if now < _run_time(target):
                 return None
-            target["next_run"] = _next_run(target, now)
+            target["next_run"] = _next_claimed_run(target, now)
             target["last_run"] = now
             meta["last_scan"] = now
             _save(items, meta)
@@ -1354,8 +1385,13 @@ def _sleep_seconds() -> float:
             return 1.0  # 让下一轮 run_due 停用损坏条目。
     if not values:
         return 60.0
-    # 已经过期（例如写盘失败导致 next_run 没推进）：退避 30s，不要 1 秒一次反复打端点
-    return max(30.0, min(60.0, min(values) - now))
+    nearest = min(values)
+    if nearest <= now:
+        # 已经过期（例如写盘失败导致 next_run 没推进）：退避 30s，不要 1 秒一次反复打端点
+        return 30.0
+    # 正常等待贴合最近到期时刻：下限 1s（到期前 5s 不该白等 30s——这段差值是
+    # 名义时点漂移的主要来源之一），上限 60s（新增/改期任务靠下一轮扫描拾起）。
+    return max(1.0, min(60.0, nearest - now))
 
 
 def _print_record(rec: dict, prefix: str = "") -> None:
@@ -1377,14 +1413,19 @@ def daemon(model: str | None = None, once: bool = False) -> int:
             print("[schedule] 已有调度进程在运行，本次未执行（退出码 3）")
             return 3  # 明确区分"没跑"与"跑完且正常"
         alert_heartbeat_if_stale()  # 上次心跳过期 = 调度中断过，先于本轮执行告警
-        interrupted = reconcile_runs(records=True)
+        try:
+            interrupted = reconcile_runs(records=True)
+        except OSError as e:
+            # 锁文件打不开（磁盘满/只读 home）等整体性失败：对账让位于本轮执行，
+            # 遗留的 running 记录下一轮再对（双保险：reconcile 内部还有逐条兜底）。
+            _safe_audit("schedule-reconcile-failed", error=str(e))
+            interrupted = []
         for rec in interrupted:
             _notify_run(rec)  # 上次的中断也要能推到人，而不是只在 --once 退出码里
         _notify_pending_runs()  # 停机/对账期间产生的终态记录补齐通知
         if interrupted:
             print(f"[schedule] 发现 {len(interrupted)} 次中断的执行（见 schedule runs）")
         if once:
-            _notify_pending_runs()
             for notif in _safe_retry_notifications():
                 print(f"[schedule] 通知重试 {notif['id']}：{notif['status']}")
             try:

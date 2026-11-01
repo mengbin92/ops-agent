@@ -38,5 +38,27 @@ jobs:
         run: ./opsx selftest
       - name: Roadmap review regressions
         run: python -m unittest discover -s tests -p 'test_*.py' -v
-      - name: W8 local recovery drill
-        run: python scripts/w8_acceptance.py --output "$RUNNER_TEMP/w8-local-evidence.json"
+        # W8 恢复演练由上面的 unittest 套件执行（tests/test_w8_acceptance.py
+        # 以子进程跑同一脚本并做断言）。这里不再单独跑一遍：每个 CI 腿双跑
+        # 同一个最慢步骤，只是把账单翻倍。
+
+  # A2A 是唯一面向网络的入口，依赖可选（requirements-a2a.txt）——但"可选"
+  # 不能等于"永不测试"：不装 SDK 时 15 个用例全跳过，鉴权/状态机回归会
+  # 在全绿的 CI 里悄悄溜进发布。单独一条腿装上再跑。
+  a2a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install optional A2A dependencies
+        run: python -m pip install -r requirements-a2a.txt
+      - name: Compile
+        run: python -m compileall -q core.py execution.py remote.py agent mcp_server.py
+      - name: A2A unit and end-to-end tests
+        run: python -m unittest tests.test_a2a tests.test_a2a_e2e -v

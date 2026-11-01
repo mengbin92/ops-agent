@@ -3,17 +3,22 @@
 不依赖 a2a-sdk —— 这些是「不装 SDK 也必须成立」的约束，CI 里照常执行。
 真正的协议端到端在 test_a2a_e2e.py（无 SDK 时自动跳过）。
 """
+import asyncio
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import core  # noqa: E402
-from agent import a2a_client, a2a_executor, a2a_server, a2a_sdk, session as sess_mod  # noqa: E402
+from agent import (a2a_cli, a2a_client, a2a_executor, a2a_server,  # noqa: E402
+                   a2a_sdk, session as sess_mod, tools)
 
 
 class SecurityGateTests(unittest.TestCase):
@@ -92,6 +97,132 @@ class ConfirmationInterruptTests(unittest.TestCase):
         self.assertIn("ops_approve", prompt)
         self.assertIn("ops_exec", prompt)
         self.assertIn("确认执行", prompt)
+
+
+def _stub_sdk():
+    """SDK 替身：build_executor 在类定义期只用到 AgentExecutor 基类与 pb/ph 符号。
+
+    不 import a2a-sdk 就能构造真执行器，测试 _run 的会话/ask_user 机制。
+    """
+    return SimpleNamespace(pb=SimpleNamespace(), ph=SimpleNamespace(),
+                           AgentExecutor=object)
+
+
+class _ExecutorLoopMixin:
+    """3.9 上 asyncio.Semaphore() 构造会取当前事件循环；同进程里别的测试
+    asyncio.run 过之后主线程 loop 被置空，get_event_loop 直接 RuntimeError。
+    构造执行器前补一个一次性 loop，用完还原。3.10+ 上构造不再取 loop，无副作用。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._fresh_loop = None
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            self._fresh_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._fresh_loop)
+
+    def tearDown(self):
+        if self._fresh_loop is not None:
+            asyncio.set_event_loop(None)
+            self._fresh_loop.close()
+        super().tearDown()
+
+
+class SingleUseApprovalTests(_ExecutorLoopMixin, unittest.TestCase):
+    """单次使用不变量：一次存储答复只批准**一个**变更。
+
+    续跑轮里模型重新提交 ops_approve 时，ask_user 第一次返回存储答复；
+    同一轮的第二个写操作必须重新中断（NeedUserInput → INPUT_REQUIRED），
+    不能被同一个答复顺带批准。
+    """
+
+    def _run_turn(self, read_only, resuming, answer, simulate):
+        """真执行器 + 假 run_turn：simulate 扮演模型对 ctx.ask_user 的调用序列。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(core, "STATE_DIR", Path(tmp)), \
+                 mock.patch.object(a2a_executor, "sdk", _stub_sdk), \
+                 mock.patch.object(a2a_executor.loop, "run_turn", simulate):
+                ex = a2a_executor.build_executor(read_only=read_only)
+                sess = ex._session("inv1")
+                return ex._run(sess, "[A2A 人工确认] ...", resuming, answer)
+
+    def test_second_write_in_same_resumed_turn_reinterrupts(self):
+        """同轮第二个 ops_approve 必须重新中断。
+
+        若有人把 ask_user 改成「每次都返回存储答复」，第二个变更会拿到
+        旧答复而非 NeedUserInput，simulate 走错分支，本测试失败。
+        """
+        def simulate(prompt, sess, ctx, model=None, on_event=None):
+            first = ctx.ask_user("批准变更 A？")   # 重新提交的第一个 ops_approve
+            assert first == "确认执行", f"首次确认应返回存储答复，得到 {first!r}"
+            try:
+                second = ctx.ask_user("批准变更 B？")   # 同轮第二个变更
+            except a2a_executor.NeedUserInput:
+                return "re-interrupted"
+            return f"auto-approved-second-with:{second!r}"
+
+        out = self._run_turn(read_only=False, resuming=True, answer="确认执行",
+                             simulate=simulate)
+        self.assertEqual(out, "re-interrupted")
+
+    def test_new_turn_gets_no_stale_answer(self):
+        """新任务轮（非续跑）第一次确认就必须中断：答复不能跨轮残留。"""
+        def simulate(prompt, sess, ctx, model=None, on_event=None):
+            with self.assertRaises(a2a_executor.NeedUserInput):
+                ctx.ask_user("批准此变更？")
+            return "interrupted"
+
+        out = self._run_turn(read_only=False, resuming=False, answer="",
+                             simulate=simulate)
+        self.assertEqual(out, "interrupted")
+
+
+class ReadOnlyModeTests(_ExecutorLoopMixin, unittest.TestCase):
+    """--read-only 起服：不建人工确认通道，写操作降级为明确拒绝（不是崩溃）。"""
+
+    def test_cli_threads_read_only_flag_to_serve(self):
+        with mock.patch.object(a2a_server, "serve", return_value=0) as serve:
+            self.assertEqual(a2a_cli.cli(["serve", "--read-only"]), 0)
+            self.assertIs(serve.call_args.kwargs["read_only"], True)
+            serve.reset_mock()
+            self.assertEqual(a2a_cli.cli(["serve"]), 0)   # 默认行为不变
+            self.assertIs(serve.call_args.kwargs["read_only"], False)
+
+    def test_serve_threads_read_only_to_executor(self):
+        captured = {}
+
+        def fake_build_executor(**kwargs):
+            captured.update(kwargs)
+            raise a2a_sdk.A2AUnavailable("stop before uvicorn")
+
+        with mock.patch.object(a2a_executor, "build_executor", fake_build_executor), \
+                redirect_stderr(StringIO()):
+            self.assertEqual(a2a_server.serve(read_only=True), 2)
+        self.assertIs(captured["read_only"], True)
+
+    def test_read_only_context_refuses_write_without_crash(self):
+        captured = {}
+
+        def simulate(prompt, sess, ctx, model=None, on_event=None):
+            captured["ctx"] = ctx
+            return "done"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(core, "STATE_DIR", Path(tmp)), \
+                 mock.patch.object(a2a_executor, "sdk", _stub_sdk), \
+                 mock.patch.object(a2a_executor.loop, "run_turn", simulate):
+                ex = a2a_executor.build_executor(read_only=True)
+                sess = ex._session("ro1")
+                # 续跑轮同样安全：模型重提 ops_approve 也只会拿到拒绝文案
+                self.assertEqual(ex._run(sess, "重启 nginx", True, "确认执行"), "done")
+        self.assertIsNone(captured["ctx"].ask_user)
+        # 写尝试经真实 dispatch 落成「拒绝」字符串返回给模型，不抛异常
+        result = tools.dispatch("ops_approve", {"command": "systemctl restart nginx"},
+                                captured["ctx"])
+        self.assertIn("拒绝", result)
+        self.assertIn("不创建审批戳", result)
 
 
 class ClientHelperTests(unittest.TestCase):

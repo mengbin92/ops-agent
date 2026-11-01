@@ -78,6 +78,10 @@ def dirs() -> list[Path]:
 _PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 # 替换后残留的单大括号占位符（{{...}} 模板大括号不会命中，见 substitute）
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([a-z][a-z0-9_]{0,30})\}(?!\})")
+# Go 模板控制 token（docker --format 是重灾区）：{{end}}/{{else}} 里内嵌字面
+# "{end}"/"{else}"，同名参数的逐 token 替换会把合法格式串改坏（substitute 按
+# "{key}" 子串替换，不认模板语义）。load() 直接拒绝这类参数名。
+RESERVED_PARAM_NAMES = frozenset({"if", "else", "end"})
 _DEFAULT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$"
 _PATH_PATTERN = r"^/[A-Za-z0-9._@+/-]{1,200}$"
 EXPECT_KEYS = ("expect", "expect_contains", "expect_not", "expect_not_contains",
@@ -146,6 +150,11 @@ def load(name: str) -> dict:
     for key, spec in params_raw.items():
         if not _PARAM_NAME_RE.fullmatch(str(key)):
             raise ScenarioError(f"场景 {name} 的参数名非法: {key!r}")
+        if key in RESERVED_PARAM_NAMES:
+            raise ScenarioError(
+                "场景 %s 的参数名 %r 是保留名：Go 模板 {{%s}} 内嵌字面 {%s}，"
+                "参数替换会改坏 docker --format 这类命令，请改名（如 %s_1）"
+                % (name, key, key, key, key))
         spec = spec or {}
         if not isinstance(spec, dict):
             raise ScenarioError(f"场景 {name} 的参数 {key} 的定义须为对象")
@@ -191,7 +200,7 @@ def load(name: str) -> dict:
                 or not spec["command"].strip():
             raise ScenarioError(f"场景 {name} 的 exec.snapshot_cmds 每项须含 command")
 
-    return {
+    scen = {
         "name": name,
         "description": description,
         "params": params,
@@ -203,6 +212,36 @@ def load(name: str) -> dict:
                                    for spec in snap_cmds]},
         "postcheck": _norm_checks(name, raw.get("postcheck"), "postcheck"),
     }
+    _validate_placeholders(name, scen)
+    return scen
+
+
+def _validate_placeholders(name: str, scen: dict) -> None:
+    """load() 时校验每条命令里的 {param} 占位符都对得上声明的参数。
+
+    resolve_params 会拒绝未声明的参数，所以命令里出现未声明占位符注定在某个
+    替换点炸掉——最糟的位置是 postcheck：那时变更已经执行完，ScenarioError 裸奔
+    出 run()，没有结论、没有报告、没有回滚提示（变更零验证落地）。配置错误在
+    读定义时就报出来。只查命令字符串：expect* 匹配的是命令输出、description 是
+    给人看的文案（允许提 {param}），二者都不做替换。
+    """
+    declared = set(scen["params"])
+    fields = []
+    for stage in ("precheck", "postcheck"):
+        for i, check in enumerate(scen[stage], 1):
+            fields.append((f"{stage}[{i}].cmd", check["cmd"]))
+    fields.append(("exec.cmd", scen["exec"]["cmd"]))
+    for i, snapshot_path in enumerate(scen["exec"]["snapshot_files"], 1):
+        fields.append((f"exec.snapshot_files[{i}]", snapshot_path))
+    for i, spec in enumerate(scen["exec"]["snapshot_cmds"], 1):
+        fields.append((f"exec.snapshot_cmds[{i}].command", spec["command"]))
+    for field, text in fields:
+        unknown = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(text)} - declared)
+        if unknown:
+            raise ScenarioError(
+                f"场景 {name} 的 {field} 用了未声明的占位符: "
+                + ", ".join("{" + token + "}" for token in unknown)
+                + f"（该场景的参数: {sorted(declared) or '无'}）")
 
 
 def _norm_checks(name: str, raw, what: str) -> list[dict]:
@@ -367,12 +406,6 @@ def _render_checks(results: list[dict], full_output: bool = False) -> list[str]:
     return lines
 
 
-def _compact(results: list[dict]) -> list[dict]:
-    """执行记录里保存的紧凑探针结果（给人看；完整输出在场景报告里）。"""
-    return [{"cmd": r["cmd"], "exit": r["exit"], "passed": r["passed"],
-             "detail": r["detail"][:200]} for r in results[:MAX_CHECKS]]
-
-
 # ---------------------------------------------------------------- 报告
 
 def _report_dir() -> Path:
@@ -472,6 +505,11 @@ def _run_scenario(scen: dict, resolved: dict, tgt: str | None,
     snap_files = [substitute(p, resolved) for p in scen["exec"]["snapshot_files"]]
     snap_cmds = [(substitute(spec["command"], resolved), spec["name"])
                  for spec in scen["exec"]["snapshot_cmds"]]
+    # 保险丝：后验命令必须在变更执行前就能完整替换。load() 只能证明占位符
+    # "已声明"，"声明了却没默认值也没传入"的可选参数要等此刻的 resolved 才能
+    # 证明——不能把替换失败留到变更执行之后（那等于变更零验证落地）。
+    for check in scen["postcheck"]:
+        substitute(check["cmd"], resolved)
 
     # ---- 执行（含快照与守门/审批）
     exec_started = time.time()

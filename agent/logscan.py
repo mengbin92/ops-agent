@@ -18,6 +18,8 @@ DEFAULT_LINES = 200_000     # 默认只扫最近 N 行：故障定位通常有�
 DEFAULT_TOP = 10
 SAMPLE_LEN = 200            # 每条聚类保留的样本行长度上限
 TIME_BUDGET = 30.0          # 单次扫描秒数上限；超时按部分扫描如实标注
+GROUP_LIMIT = 5000          # distinct 聚类上限（镜像 checks.SIGNAL_ANOMALY_LIMIT）：
+                            # 全唯一行输入也不能无界增长，超限后如实标注截断
 
 # 级别映射：error 优先于 warn（一行多命中取高级别）
 _LEVEL_RULES = [
@@ -97,6 +99,7 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
     total = 0
     scanned = 0
     partial = False
+    groups_capped = False
     ts_hits = 0
     start = time.monotonic()
 
@@ -124,6 +127,11 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
                                  Counter())[level or "kw"] += 1
         key = (level or "kw", _skeleton(line))
         g = groups.get(key)
+        if g is None and len(groups) >= GROUP_LIMIT:
+            # 全唯一行输入：不再新建聚类（已有聚类继续累计），防止 groups 无界
+            # 增长；只置截断标记，模式谱系不完整由结果如实标注。
+            groups_capped = True
+            continue
         if g is None:
             g = groups[key] = {"level": level or "kw", "skeleton": key[1],
                                "count": 0, "first_line": total, "last_line": total,
@@ -138,6 +146,7 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
                     key=lambda g: (-g["count"], g["level"] != "error", g["first_line"]))
     return {
         "total": total, "scanned": scanned, "partial": partial,
+        "groups_truncated": groups_capped,
         "time_parse_rate": (ts_hits / scanned) if scanned else 0.0,
         "level_counts": dict(level_counts),
         "buckets": {b: dict(c) for b, c in sorted(bucket_counts.items())},
@@ -249,7 +258,10 @@ def format_report(desc: str, report: dict) -> str:
             detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             out.append(f"  {bucket:<18} {bar} {detail}")
     if report["groups"]:
-        out.append(f"== 可疑聚类 Top {len(report['groups'])}（共 {report['group_total']} 组，按次数排序）==")
+        cap_note = (f"；已达 {GROUP_LIMIT} 组上限，其后新出现的模式未再收录"
+                    if report.get("groups_truncated") else "")
+        out.append(f"== 可疑聚类 Top {len(report['groups'])}（共 {report['group_total']} 组"
+                   f"{cap_note}，按次数排序）==")
         for i, g in enumerate(report["groups"], 1):
             span = f"{g['first_ts'] or '?'} → {g['last_ts'] or '?'}"
             loc = f"L{g['first_line']}→L{g['last_line']}"
