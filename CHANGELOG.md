@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] - 2026-11-01
+
+候选版：全项目审查（codex review）20 项发现的根因修复 + A2A 协议形态与 7 天观察沉淀。
+真实环境连续 7 天只读观察进行中（day5），按发版纪律仍为候选版，不替代 latest。
+
 ### Added
 
 - **A2A 协议形态（`opsagent a2a`）**：基于官方 `a2a-sdk` 1.3.0（协议 1.0，protobuf 类型 + `SendMessage` 方法名）把同一组受控能力以 AgentCard + JSON-RPC 暴露，并可反向调用其它 A2A agent。
@@ -22,6 +27,21 @@
 - 快照声明与执行参数强一致：审批戳声明过快照计划后，core/remote `exec_change` 校验执行参数与声明完全一致，不一致拒绝执行；未带任何快照的变更执行后明确警告无自动回滚点。
 
 ### Fixed
+
+- **全项目审查修复（2026-11-01，20 项 + 若干小项）**：
+  - **守门**：敏感文件绕过快照通道封堵——`core._snapshot_file_into` / `remote._pull_file` 拒绝敏感路径（与 `cat` 同一套判定），MCP `ops_snapshot_file`、`opsx snapshot --file`、`ops_exec` 快照声明与远程拉取四个入口一并收紧；凭据不再经快照落盘/进 `state.tar`/回流回滚预览。
+  - **守门**：`core.exec_change` 与 `remote.exec_change` 合并为单一骨架（远程差异点经 `_ExecTransport` 注入），消除 110 行双拷贝漂移；远程执行记录补齐 `host` 字段；快照拉取/抓取接受执行超时（大文件慢链路不再被 IO_TIMEOUT=120s 一刀切）。
+  - **远程**：`_remote_read` 改尾标记协议（与 `_target_resolved_path` 同思路），rc/MOTD 噪声不再让远程回滚预览/回滚前副本全部失败；`opsx rollback` 对 `_UncertainChange` 返回 120（与 exec/scenario rollback 契约一致，不再被自动化当"失败"重跑）；ssh `options` 缺 `-` 前缀时在发 SSH 前拒绝（不再被当目标主机解析）。
+  - **agent 工具**：`ops_exec` 支持 `snapshot_files` 数组并与 `ops_approve` 共用同一份参数归一化（多文件变更单不再"批准后必被拒"）；bash 子进程环境剔除 `OPSAGENT_API_KEY`/`OPSAGENT_A2A_TOKEN`（R0 `env`/`echo` 不再回显凭据），dispatch 额外按值清洗；`ops_executions`/schedule `tail` 收口 1-200（MCP 同步 1-200）。
+  - **会话**：修剪跳过 24h 内有活动的会话文件（子代理/工作流高频建会话不再误删活跃空闲会话）；`list_sessions` 改纯文本流式读取（列表操作不再写文件/全量解析）。
+  - **调度**：every 任务改槽位网格锚定、finish 不再重锚（漂移从"无上界累积"变为常数 ≤60s，day5 实测 20min 漂移的根因）；daemon 启动对账与逐条记录写盘容忍 OSError（磁盘满不再裸崩）；睡眠下限 30s→1s（到期任务不再恒定晚 30s）；删除 `--once` 冗余通知调用。
+  - **场景**：占位符在 load 时全量校验 + postcheck 执行前兜底替换（后验拼写错误不再"变更已执行、验证没跑"）；保留字参数名 `if/else/end` 拒绝（不再打碎 docker `{{end}}` 模板）。
+  - **通知/巡检**：checks 状态→severity 单一映射（未知状态不再静默通知为最高级别"不可采集"）；`notify.process_run` 抽出 `_apply_delivery`；logscan 聚类组数上限 5000（全唯一行输入不再无界占内存，截断如实标注）。
+  - **MCP**：`ops_audit` 断行/半行容忍（崩溃瞬间的半条审计不再让查询变砖，坏行如实标注）。
+  - **usage**：账本轮转移入状态锁内（daemon+CLI 并发轮转不再提前清掉归档代），补轮转测试。
+  - **A2A**：`opsagent a2a serve --read-only`（写操作在无确认通道时自动降级为拒绝）；补"一次答复只批准一个变更"不变量测试（变异验证）。
+  - **内核小项**：rpc SIGINT 干净退出；`/resume` 损坏会话不再崩 REPL；流式渲染去重复 render；compact 不再把系统消息计入保留窗口；Anthropic 默认模型名单一来源；跨目标同 host:port 防重放补回归。
+  - **CI**：新增独立 A2A job（装 `requirements-a2a.txt` 跑单测+e2e，此前全部静默跳过）；W8 演练不再每腿双跑；删除无调用死代码（`usage.ensure_budget`、`scenario._compact`、`remote._target_owner`/`_parse_restore`、doctor 未用 import）。
 
 - **A2A 首轮交付的 code review 修复**（11 项）：
   - `requirements-a2a.txt` 版本冲突：`sse-starlette 3.6.0` 声明 `starlette>=0.49.1`，原锁的 `0.41.3` 会导致 `ResolutionImpossible`（或在已有环境被 pip 破坏性降级成"能跑但元数据不成立"）。改为 `starlette==0.49.1` + `uvicorn==0.34.0`，并实际安装 + 跑通全量用例验证。
@@ -68,5 +88,6 @@
 - 动态 shell 参数需审批；远程内容 glob、内容 brace 展开保守拒绝；本机内容 glob 复核实际匹配及软链接目标，上限 1024 项。
 - 明确畸形会话拒绝恢复；规则证据采集/保存失败由程序将调度结论降为“不完整”。
 
-[Unreleased]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.1...HEAD
+[Unreleased]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.2...HEAD
+[0.1.0-rc.2]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1
