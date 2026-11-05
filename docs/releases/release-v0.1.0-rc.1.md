@@ -9,6 +9,10 @@ v0.1.0-rc.1 是首个 **候选发布版本（prerelease）**，包含独立 Agen
 **不宣称已通过受控变更正式版验收**。本地演练的 `local_status=passed` 与 `overall_status=blocked`
 同时保留，详见 [W8 验收](../ops/w8-real-environment.md)。
 
+> **2026-11-05 补记**：连续 7 天只读观察已于 2026-11-04 完成（56/56 成功、0 漏跑，末次 17:37），
+> 真实 LLM 调用已验证；真实通知渠道、SSH 恢复、断线 unknown、服务后验仍未执行，发布判定不变。
+> 见[验收记录](../validation/2026-11-05-w8-acceptance.md)。
+
 ## 发布内容
 
 ### 1. 独立 Agent 与受控运维能力
