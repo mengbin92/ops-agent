@@ -4,13 +4,18 @@
 
 ## [Unreleased]
 
+## [0.1.0-rc.3] - 2026-11-06
+
+候选版：通知新增 SMTP 邮箱渠道（与 webhook 二选一，通知语义不变）+ W8 7 天验收结论回填。
+真实通知渠道投递验收仍未执行，按发版纪律本版仍为候选版，不替代 latest。
+
 ### Added
 
 - **邮箱通知（SMTP）**：`notify` 新增 `channel: email`，与既有 webhook 渠道二选一，去重/恢复/
   静默/失败重试语义完全一致。`opsagent notify setup --channel email --smtp-host … --from …
   --to a@x,b@y [--smtp-user …] [--smtp-password …]`；465 端口走隐式 TLS，其它端口要求
   STARTTLS（本机回环中继除外，便于本地验证），密码也可用 `OPSAGENT_SMTP_PASSWORD` 提供。
-  收件人上限 20，地址/主机/端口在配置入口校验（拒绝空白与 CR/LF，防邮件头注入）。
+  收件人上限 20，地址/主机/端口在配置入口校验（拒绝空白、CR/LF、多 `@`、host 带端口，防邮件头注入）。
   事件与发件箱只记录 `smtp://host:port → N 个收件人`，SMTP 错误回显的密码/账号同样脱敏；
   `notify test`、`notify status` 与 `doctor` 均已支持邮箱渠道。
 
@@ -98,6 +103,7 @@
 - 动态 shell 参数需审批；远程内容 glob、内容 brace 展开保守拒绝；本机内容 glob 复核实际匹配及软链接目标，上限 1024 项。
 - 明确畸形会话拒绝恢复；规则证据采集/保存失败由程序将调度结论降为“不完整”。
 
-[Unreleased]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.2...HEAD
+[Unreleased]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.3...HEAD
+[0.1.0-rc.3]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.2...v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/mengbin92/ops-agent/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.1
