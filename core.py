@@ -74,7 +74,7 @@ _SENSITIVE_FILE_PATTERNS = [
     r"(?:^|/)etc/kubernetes/[^/\s]*\.conf$",
     r"(?i)(?:^|/)private/[^/\s]+\.pem$",
     r"(?:^|/)(?:shadow|gshadow)$",
-    # 通知配置里的 webhook URL 本身就是凭据（Slack/钉钉的 path 即 token）：
+    # 通知配置里的 webhook URL / SMTP 密码本身就是凭据（Slack/钉钉的 path 即 token）：
     # 0600 挡不住同 uid 的模型进程，必须按敏感文件拦截读取。
     r"(?:^|/)\.ops-agent/notify\.json$",
 ]
@@ -86,7 +86,7 @@ _SENSITIVE_DIR_PATTERNS = [
     r"(?i)(?:^|/)\.kube(?:/|$)",
     r"(?i)(?:^|/)\.config/gcloud(?:/|$)",
     r"(?:^|/)\.ops-agent/snapshots(?:/|$)",  # 默认状态目录：快照原件供恢复，不读进模型
-    # 整个状态目录的递归读取会顺带扫到 notify.json（webhook 凭据）。只匹配目录本身，
+    # 整个状态目录的递归读取会顺带扫到 notify.json（webhook/SMTP 凭据）。只匹配目录本身，
     # ~/.ops-agent/reports/*.md 这类子路径不受影响（巡检报告仍要能读）。
     r"(?:^|/)\.ops-agent/?$",
 ]

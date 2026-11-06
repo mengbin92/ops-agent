@@ -4670,6 +4670,70 @@ class _FakePost:
         return self.status, self.body
 
 
+class _FakeSmtp:
+    """最小 SMTP 桩：回环、无 TLS/认证，记录 DATA 内容，自检不联网。"""
+
+    def __init__(self):
+        import socket
+        import threading
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.host, self.port = self.sock.getsockname()[:2]
+        self.raw, self._data = [], False
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        try:
+            conn, _ = self.sock.accept()
+        except OSError:
+            return
+        with conn:
+            stream = conn.makefile("rwb")
+
+            def say(line):
+                stream.write(line + b"\r\n")
+                stream.flush()
+
+            say(b"220 localhost ESMTP")
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", "replace").rstrip("\r\n")
+                upper = text.upper()
+                if self._data:
+                    if text == ".":
+                        self._data = False
+                        say(b"250 queued")
+                    else:
+                        self.raw.append(text)
+                    continue
+                if upper.startswith(("EHLO", "HELO")):
+                    say(b"250-localhost")
+                    say(b"250 8BITMIME")
+                elif upper.startswith("DATA"):
+                    self._data = True
+                    say(b"354 End data with <CR><LF>.<CR><LF>")
+                elif upper.startswith("QUIT"):
+                    say(b"221 bye")
+                    return
+                else:
+                    say(b"250 OK")
+
+    def message(self):
+        self.thread.join(5)
+        from email import message_from_string
+        return message_from_string("\r\n".join(self.raw))
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def _payload_text(payload: dict) -> str:
     """四种 webhook 载荷里取纯文本（钉钉的 text 是对象，不是字符串）。"""
     text = payload.get("text")
@@ -4750,7 +4814,7 @@ def test_notify_config_validation():
         ({"quiet_hours": "08:00-08:00"}, "不能相同"),
         ({"enabled": "yes"}, "enabled"),
         ({"webhook": "x"}, "未知配置字段"),
-        ({"channel": "email"}, "channel"),
+        ({"channel": "sms"}, "channel"),
     ]
     for over, needle in cases:
         payload = {"channel": "webhook", "url": "https://hooks.example.com/x"}
@@ -5047,6 +5111,94 @@ def test_notify_cli_setup_status_and_errors():
     assert bad == 1 and "https" in err.getvalue()
     assert too_long == 1, "静默时长要有上限"
     assert notify.list_notifications(status="sent"), "test 通知应落发件箱"
+    _clean_notify()
+
+
+def test_notify_email_channel():
+    """邮箱渠道：配置校验、真实 SMTP 投递、密码不进输出与发件箱。"""
+    import smtplib
+    from agent import notify
+    _clean_notify()
+    cases = [
+        ({"channel": "email", "mail_from": "ops@example.com",
+          "mail_to": ["oncall@example.com"]}, "smtp_host"),
+        ({"channel": "email", "smtp_host": "smtp.example.com", "smtp_port": 70000,
+          "mail_from": "ops@example.com", "mail_to": ["oncall@example.com"]}, "smtp_port"),
+        ({"channel": "email", "smtp_host": "smtp.example.com",
+          "mail_from": "ops@example.com", "mail_to": []}, "mail_to"),
+        ({"channel": "email", "smtp_host": "smtp.example.com",
+          "mail_from": "ops@example.com\r\nBcc: x@example.com",
+          "mail_to": ["oncall@example.com"]}, "mail_from"),
+        ({"channel": "email", "smtp_host": "smtp.example.com",
+          "mail_from": "ops@example.com",
+          "mail_to": ["oncall@example.com", "not-an-address"]}, "mail_to"),
+        # 多个 @ 与 host 里塞端口都不能混过校验
+        ({"channel": "email", "smtp_host": "smtp.example.com",
+          "mail_from": "ops@example.com", "mail_to": ["a@b@c"]}, "mail_to"),
+        ({"channel": "email", "smtp_host": "smtp.example.com:465",
+          "mail_from": "ops@example.com", "mail_to": ["oncall@example.com"]}, "smtp_host"),
+    ]
+    for payload, needle in cases:
+        try:
+            notify.save_config(payload)
+            raise AssertionError(f"应拒绝: {payload}")
+        except notify.NotifyError as e:
+            assert needle in str(e), (payload, e)
+
+    server = _FakeSmtp()
+    saved_out, saved_err = sys.stdout, sys.stderr
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout, sys.stderr = out, err
+        # 不给 --channel：只给邮箱参数也应推断为 email
+        setup = notify.cli(["setup", "--smtp-host", server.host,
+                            "--smtp-port", str(server.port), "--from", "ops@example.com",
+                            "--to", "oncall@example.com",
+                            "--smtp-password", "SMTP-SECRET-9"])
+        sent = notify.cli(["test"])
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+    try:
+        assert (setup, sent) == (0, 0), (setup, sent, err.getvalue())
+        text = out.getvalue()
+        assert "SMTP-SECRET-9" not in text and "已发送（SMTP 250）" in text
+        assert "1 个收件人" in text and server.host in text
+        cfg = notify.load_config()
+        assert cfg["channel"] == "email" and cfg["mail_to"] == ["oncall@example.com"]
+        assert cfg["smtp_password"] == "SMTP-SECRET-9", "密码只应存在 0600 配置里"
+        assert "SMTP-SECRET-9" not in notify.describe_config(cfg)
+        path = core.STATE_DIR / "notify.json"
+        assert oct(path.stat().st_mode)[-3:] == "600"
+        parsed = server.message()
+        assert parsed["To"] == "oncall@example.com" and parsed["From"] == "ops@example.com"
+        # smtplib 以 SMTP policy 发送，UTF-8 正文是 8bit；get_payload(decode=True)
+        # 对 8bit 会走 raw-unicode-escape，这里直接看字符串正文。
+        body = parsed.get_payload()
+        assert "收到这条说明通知配置可用" in body, body
+        rec = notify.list_notifications(status="sent")[0]
+        assert rec["endpoint"] == f"smtp://{server.host}:{server.port} → 1 个收件人"
+        outbox = (core.STATE_DIR / "notifications" / f"{rec['id']}.json").read_text(
+            encoding="utf-8")
+        assert "SMTP-SECRET-9" not in outbox
+    finally:
+        server.close()
+
+    # SMTP 错误回显密码时必须脱敏
+    orig = notify.smtplib.SMTP
+
+    def boom(*args, **kwargs):
+        raise smtplib.SMTPAuthenticationError(535, b"auth failed for SMTP-SECRET-9")
+
+    notify.smtplib.SMTP = boom
+    try:
+        result = notify._deliver(notify.load_config(), {
+            "id": notify._new_notification_id(), "created": time.time(),
+            "title": "测试", "text": "正文", "attempts": 0})
+    finally:
+        notify.smtplib.SMTP = orig
+    assert result["status"] == "failed"
+    assert "SMTP-SECRET-9" not in result["last_error"], result["last_error"]
+    assert "[已脱敏]" in result["last_error"], result["last_error"]
     _clean_notify()
 
 

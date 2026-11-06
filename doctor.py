@@ -249,15 +249,18 @@ def _check_notify() -> list[dict]:
                       "修 ~/.ops-agent/notify.json 或 opsagent notify setup 重建")]
     if not cfg:
         return [_item("notify", WARN, "未配置通知渠道",
-                      "opsagent notify setup --url <webhook>；不配则异常只在本地记录")]
+                      "opsagent notify setup --url <webhook> 或 "
+                      "--smtp-host/--from/--to <邮箱>；不配则异常只在本地记录")]
     failed = notify.list_notifications(status="failed", tail=50)
-    endpoint = notify.redact_endpoint(cfg.get("url") or "")
-    detail = f"渠道 {cfg.get('format')} → {endpoint}"
+    endpoint = notify.describe_target(cfg)
+    channel = cfg.get("channel")
+    detail = f"渠道 {channel}" + (f"/{cfg.get('format')}" if channel == "webhook" else "") \
+        + f"｜{endpoint}"
     if not cfg.get("enabled", True):
         detail += "（已停用）"
     if failed:
         return [_item("notify", WARN, f"{detail}；发件箱 {len(failed)} 条失败待重试",
-                      "opsagent notify retry；持续失败核对 webhook 是否失效")]
+                      "opsagent notify retry；持续失败核对 webhook/SMTP 是否失效")]
     if not cfg.get("enabled", True):
         return [_item("notify", WARN, detail, "需要主动告警时启用通知渠道")]
     return [_item("notify", OK, detail)]

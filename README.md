@@ -384,6 +384,11 @@ running ──exit=0────────────────────
 ```bash
 ./opsagent notify setup --url https://hooks.slack.com/services/T0/B0/xxxx \
     --format slack --quiet-hours 23:00-07:00   # 也支持 feishu / dingtalk / generic
+# 或改用邮箱（SMTP）：465 走隐式 TLS，其它端口要求 STARTTLS
+./opsagent notify setup --channel email --smtp-host smtp.example.com --smtp-port 465 \
+    --from ops@example.com --to oncall@example.com,you@example.com \
+    --smtp-user ops@example.com --smtp-password '应用专用密码'
+# 密码也可用环境变量 OPSAGENT_SMTP_PASSWORD，避免进 shell 历史
 ./opsagent notify test                 # 发一条测试消息（不受静默影响）
 ./opsagent notify status               # 渠道、发件箱统计、待重试条数（URL 只显示到主机）
 ./opsagent notify list --status failed # 失败通知与下次重试时间
@@ -400,17 +405,21 @@ running ──exit=0────────────────────
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
+| `channel` | webhook | 渠道：`webhook` 或 `email`（只有一个启用渠道） |
 | `renotify_after` | 6 小时 | 同一异常再次提醒的最小间隔 |
 | `quiet_hours` | 无 | 静默时段（只压警告/恢复；**异常与"不可采集"仍然发送**） |
 | `mute_until` | 0 | 全静默：**连异常一起压**，只写事件与发件箱，可用 `notify mute` 设置 |
 | `enabled` | true | 总开关；停用等于不发送（事件照记） |
-| `timeout_seconds` | 8 | 单次 webhook 超时（3–30） |
+| `timeout_seconds` | 8 | 单次发送（webhook / SMTP）超时，3–30 秒 |
+| `smtp_host` / `smtp_port` | 无 / 587 | 邮件渠道；465 隐式 TLS，其余端口要求 STARTTLS（本机回环除外） |
+| `mail_from` / `mail_to` | 无 | 发件人与收件人（最多 20 个；邮箱地址不接受显示名/控制字符） |
+| `smtp_username` / `smtp_password` | 空 | SMTP 认证；密码也可用 `OPSAGENT_SMTP_PASSWORD` 提供 |
 
 - **恢复通知**只在"本次确实检查过该目标、且采集完整"时才发：只查 `web1` 的报告不会把
   `db1` 的旧告警清成已恢复；采集不完整就保持沉默，不猜。
 - 同一任务分批检查、失败重试会合并已采样的目标和分组，运行记录列出全部报告路径。
   规则异常或采集不完整不会被模型的"正常"结论覆盖；迟到的旧记录不会覆盖较新的观测。
-- **失败可查可重试**：发送失败落 `~/.ops-agent/notifications/<id>.json`（失败原因、HTTP 状态、
+- **失败可查可重试**：发送失败落 `~/.ops-agent/notifications/<id>.json`（失败原因、HTTP/SMTP 状态、
   下次重试时间），daemon 每轮最多重试 5 条，指数退避（1min 起，上限 1h，最多 5 次）。已恢复
   的旧告警标记 `superseded` 不再补发，避免"先收到恢复、又收到告警"。
 - **事件时间线**：`~/.ops-agent/events.jsonl`（0600，5MB 轮转一次，轮转后仍可 `--tail` 回看）。
@@ -418,9 +427,10 @@ running ──exit=0────────────────────
   正常巡检——否则时间线会变成第二个日志洪水。
 - **关联证据与会话**：消息里带 `run_id`、`session_id`（可 `/resume` 回看）、报告路径，以及每条
   异常的探针命令与输出片段；`schedule runs` 也会显示该次运行的通知状态。
-- **凭据**：webhook URL 的 path 往往就是 token。`notify.json` 0600，事件/发件箱/审计只存
-  `scheme://host/…`；`read` 与 `bash` 读取 `notify.json` 或整个状态目录会被拒绝。走系统代理
-  （`http_proxy`/`https_proxy`），内网 webhook 需要设 `no_proxy`。
+- **凭据**：webhook URL 的 path 往往就是 token，SMTP 密码同理。`notify.json` 0600，
+  事件/发件箱/审计只存脱敏后的目标（`scheme://host/…`，邮件为 `主机:端口 → N 个收件人`）；
+  `read` 与 `bash` 读取 `notify.json` 或整个状态目录会被拒绝。webhook 走系统代理
+  （`http_proxy`/`https_proxy`），内网 webhook 需要设 `no_proxy`；SMTP 不发代理。
 
 **长目标（goal）**：在 REPL 里让 agent 推进多步目标（"排查到定位为止""升级并验证完"）。
 每轮结束后按目标状态自动续跑，默认最多 6 轮（`max_rounds` 可调，上限 20），完成后自动停。
@@ -531,7 +541,7 @@ API 完全不可用时 workflow 的规则结果照常产出。
 `.env`（`.example`/`.sample`/`.template` 除外）、`.netrc`、`.kube/config`、
 `/etc/kubernetes/*.conf`、`/etc/ssh/ssh_host_*_key`、`/etc/ssl/private/*.pem`、
 `.aws/credentials`、`.docker/config.json`、`.config/gcloud/`、`/etc/shadow`、
-`~/.ops-agent/notify.json`（webhook URL 即凭据，0600 也挡不住同 uid 的模型进程）
+`~/.ops-agent/notify.json`（webhook URL / SMTP 密码即凭据，0600 也挡不住同 uid 的模型进程）
 与 `.ssh`/`.aws`/`.kube`/`.gnupg` 及整个 `~/.ops-agent` 目录（递归读取会顺带扫到
 `notify.json`；`~/.ops-agent/reports/` 下的报告仍可读）；命令入口（`opsx check`、hook、bash 工具、`opsx exec`）
 对引用这些文件或读取敏感目录内容的命令一律拒绝（`cat ~/.ssh/id_rsa`、经符号链接指向的私钥、
@@ -608,7 +618,7 @@ API 完全不可用时 workflow 的规则结果照常产出。
 调度侧的已知边界：任务串行执行，一个长任务会推迟后面的任务（不会并发）；时间预算在轮次
 与工具调用前检查，已启动的调用仍受自身超时约束；`interrupted` 判定依赖 pid 存活，pid 被
 复用（重启后同号进程）时可能误判为仍在运行；`missed` 依据心跳推断，写盘失败时会保守地少报；
-W4 已支持单向 webhook、事件去重与恢复通知；双向 IM 对话尚未接入。
+W4 已支持单向 webhook 与 SMTP 邮件、事件去重与恢复通知；双向 IM 对话尚未接入。
 
 ## MCP server 形态
 

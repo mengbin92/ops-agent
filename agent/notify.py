@@ -1,4 +1,5 @@
-"""单渠道通知：webhook（Slack / 飞书 / 钉钉 / 通用 JSON）+ 去重 / 恢复 / 静默 + 可重试发件箱。
+"""单渠道通知：webhook（Slack / 飞书 / 钉钉 / 通用 JSON）或 SMTP 邮件
++ 去重 / 恢复 / 静默 + 可重试发件箱。
 
 W4 的设计取舍：
 
@@ -9,18 +10,22 @@ W4 的设计取舍：
   一次运行最多一条消息（把本次所有新异常聚合成一条），避免 20 个异常刷 20 条。
 - **通知失败不丢**。落 `notifications/<id>.json`（failed + 下次重试时间），daemon 每轮
   重试有限条，人也随时可以 `opsagent notify retry`。
-- **凭据不外泄**。webhook URL 本身就是密钥：notify.json 0600，事件与发件箱只存脱敏后的
-  endpoint（scheme://host/…），URL 明文不进模型、不进审计、不进报告。
+- **凭据不外泄**。webhook URL 本身就是密钥，SMTP 密码同理：notify.json 0600，事件与
+  发件箱只存脱敏后的 endpoint（scheme://host/… 或主机+收件人数），URL/密码明文不进
+  模型、不进审计、不进报告。
 - **不把发送塞进巡检**。发送在内置超时内同步完成（默认 8s），失败只记状态不重试等待；
   真正阻塞巡检的网络问题会被上层的时间预算兜住。
 """
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import math
 import os
 import re
+import smtplib
+import ssl
 import sys
 import time
 import urllib.error
@@ -28,6 +33,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
+from email.message import EmailMessage
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -41,11 +47,15 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 CONFIG_FIELDS = ("channel", "url", "format", "timeout_seconds", "renotify_after",
-                 "quiet_hours", "mute_until", "enabled")
-CHANNELS = ("webhook",)
+                 "quiet_hours", "mute_until", "enabled",
+                 "smtp_host", "smtp_port", "smtp_username", "smtp_password",
+                 "mail_from", "mail_to")
+CHANNELS = ("webhook", "email")
 FORMATS = ("generic", "slack", "feishu", "dingtalk")
 DEFAULT_FORMAT = "generic"
 DEFAULT_TIMEOUT = 8
+DEFAULT_SMTP_PORT = 587
+MAX_RECIPIENTS = 20
 MIN_TIMEOUT, MAX_TIMEOUT = 3, 30
 DEFAULT_RENOTIFY = 6 * 3600          # 同一异常默认 6 小时提醒一次，不是每次巡检都发
 MIN_RENOTIFY, MAX_RENOTIFY = 300, 7 * 86400
@@ -183,6 +193,57 @@ def _validate_quiet_hours(value) -> str | None:
     return value
 
 
+def _validate_mail_addr(value, field: str) -> str:
+    """只接受裸地址：显示名/空白/控制字符都可能被用来注入邮件头。"""
+    if not isinstance(value, str):
+        raise NotifyError(f"{field} 须为字符串")
+    if not value.strip():
+        raise NotifyError(f"{field} 不能为空")
+    value = value.strip()
+    if len(value) > 320 or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f
+                               for ch in value):
+        raise NotifyError(f"{field} 不能包含空白或控制字符")
+    if value.count("@") != 1:
+        raise NotifyError(f"{field} 不是有效邮箱地址: {value}")
+    local, _, domain = value.partition("@")
+    if not local or not domain:
+        raise NotifyError(f"{field} 不是有效邮箱地址: {value}")
+    return value
+
+
+def _validate_mail_to(value) -> list[str]:
+    if isinstance(value, str):
+        value = [part for part in re.split(r"[,;]", value) if part.strip()]
+    if not isinstance(value, list) or not value:
+        raise NotifyError("mail_to 至少需要一个收件人")
+    if len(value) > MAX_RECIPIENTS:
+        raise NotifyError(f"mail_to 最多 {MAX_RECIPIENTS} 个收件人")
+    recipients: list[str] = []
+    for addr in value:
+        addr = _validate_mail_addr(addr, "mail_to")
+        if addr not in recipients:
+            recipients.append(addr)
+    return recipients
+
+
+def _validate_smtp_port(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise NotifyError("smtp_port 须为 1-65535 的整数")
+    return value
+
+
+def _validate_smtp_host(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise NotifyError("smtp_host 不能为空")
+    value = value.strip()
+    if ":" in value:
+        raise NotifyError("smtp_host 不能带端口（用 --smtp-port / smtp_port 单独指定）")
+    if len(value) > 253 or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f
+                               for ch in value):
+        raise NotifyError("smtp_host 不能包含空白或控制字符")
+    return value
+
+
 def _validate_config(raw) -> dict:
     if not isinstance(raw, dict):
         raise NotifyError("通知配置必须是 JSON 对象")
@@ -195,13 +256,19 @@ def _validate_config(raw) -> dict:
         raise NotifyError(f"channel 只支持 {list(CHANNELS)}（当前 {channel!r}）")
     cfg = {
         "channel": channel,
-        "url": _validate_url(raw.get("url")),
+        "url": "",
         "format": raw.get("format", DEFAULT_FORMAT),
         "timeout_seconds": raw.get("timeout_seconds", DEFAULT_TIMEOUT),
         "renotify_after": raw.get("renotify_after", DEFAULT_RENOTIFY),
         "quiet_hours": _validate_quiet_hours(raw.get("quiet_hours")),
         "mute_until": raw.get("mute_until", 0),
         "enabled": raw.get("enabled", True),
+        "smtp_host": "",
+        "smtp_port": DEFAULT_SMTP_PORT,
+        "smtp_username": "",
+        "smtp_password": "",
+        "mail_from": "",
+        "mail_to": [],
     }
     if cfg["format"] not in FORMATS:
         raise NotifyError(f"format 只支持 {list(FORMATS)}")
@@ -218,6 +285,25 @@ def _validate_config(raw) -> dict:
     cfg["mute_until"] = float(mute_until)
     if not isinstance(cfg["enabled"], bool):
         raise NotifyError("enabled 须为布尔值")
+    if channel == "webhook":
+        cfg["url"] = _validate_url(raw.get("url"))
+        return cfg
+    cfg["smtp_host"] = _validate_smtp_host(raw.get("smtp_host"))
+    cfg["smtp_port"] = _validate_smtp_port(raw.get("smtp_port", DEFAULT_SMTP_PORT))
+    username = raw.get("smtp_username", "")
+    if not isinstance(username, str):
+        raise NotifyError("smtp_username 须为字符串")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in username):
+        raise NotifyError("smtp_username 不能包含控制字符")
+    password = raw.get("smtp_password", "")
+    if not isinstance(password, str):
+        raise NotifyError("smtp_password 须为字符串")
+    if len(password) > 512 or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in password):
+        raise NotifyError("smtp_password 不能包含控制字符（上限 512 字符）")
+    cfg["smtp_username"] = username
+    cfg["smtp_password"] = password
+    cfg["mail_from"] = _validate_mail_addr(raw.get("mail_from"), "mail_from")
+    cfg["mail_to"] = _validate_mail_to(raw.get("mail_to"))
     return cfg
 
 
@@ -226,8 +312,9 @@ def load_config(required: bool = True) -> dict:
     path = _config_path()
     if not path.exists():
         if required:
-            raise NotifyError(f"未配置通知渠道（{path}）："
-                              "先运行 opsagent notify setup --url <webhook 地址>")
+            raise NotifyError(f"未配置通知渠道（{path}）：先运行 "
+                              "opsagent notify setup --url <webhook 地址> "
+                              "或 --smtp-host/--from/--to <邮箱>")
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -237,7 +324,7 @@ def load_config(required: bool = True) -> dict:
 
 
 def save_config(raw: dict) -> dict:
-    """校验后原子写入（0600）：配置含 webhook 凭据，不能给同机其他用户读。"""
+    """校验后原子写入（0600）：配置含 webhook/SMTP 凭据，不能给同机其他用户读。"""
     cfg = _validate_config(raw)
     core._ensure_state_dir()
     path = _config_path()
@@ -252,6 +339,16 @@ def save_config(raw: dict) -> dict:
     return cfg
 
 
+def describe_target(cfg: dict) -> str:
+    """给事件/发件箱/status 用的一行目标描述，不含 URL path、密码与收件人地址。"""
+    if not cfg:
+        return ""
+    if cfg.get("channel") == "email":
+        return (f"smtp://{cfg['smtp_host']}:{cfg['smtp_port']}"
+                f" → {len(cfg['mail_to'])} 个收件人")
+    return redact_endpoint(cfg.get("url") or "")
+
+
 def describe_config(cfg: dict) -> str:
     if not cfg:
         return "未配置（巡检仍会记录事件，只是不发消息；用 opsagent notify setup 初始化）"
@@ -260,8 +357,13 @@ def describe_config(cfg: dict) -> str:
     if cfg["mute_until"] > time.time():
         mute = f"｜静默至 {_now_iso(cfg['mute_until'])}"
     quiet = f"｜静默时段 {cfg['quiet_hours']}" if cfg["quiet_hours"] else ""
-    return (f"{state}｜渠道 {cfg['channel']}｜{redact_endpoint(cfg['url'])}"
-            f"｜格式 {cfg['format']}｜超时 {cfg['timeout_seconds']}s"
+    if cfg["channel"] == "email":
+        target = (f"渠道 email｜{describe_target(cfg)}"
+                  f"｜发件人 {cfg['mail_from']}")
+    else:
+        target = f"渠道 webhook｜{redact_endpoint(cfg['url'])}｜格式 {cfg['format']}"
+    return (f"{state}｜{target}"
+            f"｜超时 {cfg['timeout_seconds']}s"
             f"｜提醒间隔 {_human_duration(cfg['renotify_after'])}{quiet}{mute}")
 
 
@@ -558,12 +660,18 @@ def _backoff(attempts: int) -> int:
 
 
 def _safe_error(cfg: dict, message: str) -> str:
-    # 渠道可能在错误中回显 URL、path 或 token；这些已知凭据不能只依赖通用正则。
-    url = cfg["url"]
+    # 渠道可能在错误中回显 URL、path、token 或 SMTP 账号；这些已知凭据不能只依赖通用正则。
+    url = cfg.get("url") or ""
     parts = urllib.parse.urlsplit(url)
     secrets = [url, parts.path, parts.query]
     secrets += parts.path.split("/")
     secrets += [v for _, v in urllib.parse.parse_qsl(parts.query)]
+    password = cfg.get("smtp_password") or ""
+    if password:
+        secrets.append(password)
+    username = cfg.get("smtp_username") or ""
+    if len(username) >= 4:  # 太短的账号名替换会毁掉整条错误信息，且本身不构成秘密
+        secrets.append(username)
     for secret in sorted(set(secrets), key=len, reverse=True):
         if secret and secret != "/":
             message = message.replace(secret, core.REDACTED)
@@ -571,13 +679,61 @@ def _safe_error(cfg: dict, message: str) -> str:
     return core.redact(message)[:300]
 
 
+def _loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.strip().lower() == "localhost"
+
+
+def _send_email(cfg: dict, notif: dict) -> tuple[int, str]:
+    """SMTP 投递：465 走隐式 TLS；其它端口必须 STARTTLS（本机回环除外，便于本地中继）。"""
+    host, port = cfg["smtp_host"], cfg["smtp_port"]
+    context = ssl.create_default_context()
+    message = EmailMessage()
+    message["Subject"] = notif.get("title") or "ops-agent 通知"
+    message["From"] = cfg["mail_from"]
+    message["To"] = ", ".join(cfg["mail_to"])
+    message.set_content(notif.get("text") or "")
+    timeout = cfg.get("timeout_seconds", DEFAULT_TIMEOUT)
+    try:
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
+        else:
+            server = smtplib.SMTP(host, port, timeout=timeout)
+        with server:
+            server.ehlo()
+            if port != 465:
+                if server.has_extn("starttls"):
+                    server.starttls(context=context)
+                    server.ehlo()
+                elif not _loopback_host(host):
+                    raise NotifyError("远程 SMTP 必须支持 STARTTLS（或使用 465 端口）")
+            if cfg.get("smtp_username"):
+                server.login(cfg["smtp_username"], cfg["smtp_password"])
+            server.send_message(message)
+    except NotifyError:
+        raise
+    except (smtplib.SMTPException, OSError) as e:  # ssl.SSLError 也是 OSError
+        # 对方错误里可能回显收件人/认证信息，统一由 _safe_error 兜底再落盘
+        raise NotifyError(f"SMTP 发送失败: {type(e).__name__}: {e}") from e
+    return 250, "smtp accepted"
+
+
+def _send(cfg: dict, notif: dict) -> tuple[int, str]:
+    if cfg.get("channel") == "email":
+        return _send_email(cfg, notif)
+    return _post(cfg["url"], core.redact_obj(build_payload(cfg, notif)),
+                 cfg.get("timeout_seconds", DEFAULT_TIMEOUT))
+
+
 def _deliver(cfg: dict, notif: dict) -> dict:
     """发送并回写结果（调用方持有 notify.mutex）。"""
     notif["attempts"] = int(notif.get("attempts") or 0) + 1
     notif["last_attempt_iso"] = _now_iso()
+    email = cfg.get("channel") == "email"
     try:
-        status, body = _post(cfg["url"], core.redact_obj(build_payload(cfg, notif)),
-                             cfg.get("timeout_seconds", DEFAULT_TIMEOUT))
+        status, body = _send(cfg, notif)
     except NotifyError as e:
         notif.update({"status": "failed", "last_error": _safe_error(cfg, str(e)),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
@@ -587,17 +743,19 @@ def _deliver(cfg: dict, notif: dict) -> dict:
                       "last_error": _safe_error(cfg, f"{type(e).__name__}: {e}"),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
         return notif
-    channel_error = _response_error(cfg.get("format", DEFAULT_FORMAT), body) \
-        if 200 <= status < 300 else None
+    channel_error = (None if email or not 200 <= status < 300
+                     else _response_error(cfg.get("format", DEFAULT_FORMAT), body))
     if 200 <= status < 300 and channel_error is None:
-        notif.update({"status": "sent", "http_status": status, "sent_at": time.time(),
-                      "sent_iso": _now_iso(), "last_error": None, "next_attempt_ts": 0})
+        notif.update({"status": "sent", "sent_at": time.time(),
+                      "sent_iso": _now_iso(), "last_error": None, "next_attempt_ts": 0,
+                      **({"smtp_status": status} if email else {"http_status": status})})
     elif channel_error is not None:
         notif.update({"status": "failed", "http_status": status,
                       "last_error": _safe_error(cfg, channel_error),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
     else:
-        notif.update({"status": "failed", "http_status": status,
+        notif.update({"status": "failed",
+                      **({} if email else {"http_status": status}),
                       "last_error": _safe_error(cfg, f"HTTP {status}: {body}"),
                       "next_attempt_ts": time.time() + _backoff(notif["attempts"])})
     return notif
@@ -1205,7 +1363,7 @@ def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
         "session_id": rec.get("session_id"), "report_path": rec.get("report_path"),
         "report_paths": rec.get("report_paths") or [],
         "fingerprints": fingerprints,
-        "endpoint": redact_endpoint(cfg.get("url", "")) if cfg else None,
+        "endpoint": describe_target(cfg) if cfg else None,
         "status": "failed", "attempts": 0, "last_error": None,
         "next_attempt_ts": 0, "http_status": None,
     }
@@ -1390,10 +1548,22 @@ def cli(argv: list[str] | None = None) -> int:
         epilog="退出码：0 成功；1 参数/配置错误或发送失败")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="渠道配置、发件箱统计与最近通知")
-    setup = sub.add_parser("setup", help="配置 webhook（写入 ~/.ops-agent/notify.json，0600）")
-    setup.add_argument("--url", required=True, help="https webhook 地址（本机回环可用 http）")
+    setup = sub.add_parser("setup", help="配置 webhook 或邮箱（写入 ~/.ops-agent/notify.json，0600）")
+    setup.add_argument("--channel", default=None, choices=list(CHANNELS),
+                       help="通知渠道（默认保留旧值；给了 --url 视为 webhook，"
+                            "给了邮箱参数视为 email）")
+    setup.add_argument("--url", default=None, help="https webhook 地址（本机回环可用 http）")
     setup.add_argument("--format", default=None, choices=list(FORMATS),
-                       help=f"载荷格式（默认保留旧值，首次为 {DEFAULT_FORMAT}）")
+                       help=f"webhook 载荷格式（默认保留旧值，首次为 {DEFAULT_FORMAT}）")
+    setup.add_argument("--to", default=None,
+                       help="邮箱收件人，逗号分隔（email 渠道）")
+    setup.add_argument("--from", dest="mail_from", default=None, help="发件人地址（email 渠道）")
+    setup.add_argument("--smtp-host", default=None, help="SMTP 主机（email 渠道）")
+    setup.add_argument("--smtp-port", type=int, default=None,
+                       help=f"SMTP 端口（465 隐式 TLS，其余走 STARTTLS；默认 {DEFAULT_SMTP_PORT}）")
+    setup.add_argument("--smtp-user", default=None, help="SMTP 用户名（可空）")
+    setup.add_argument("--smtp-password", default=None,
+                       help="SMTP 密码（也可用环境变量 OPSAGENT_SMTP_PASSWORD，避免进 shell 历史）")
     setup.add_argument("--timeout", type=int, default=None, metavar="SECONDS",
                        help=f"发送超时（默认保留旧值，首次 {DEFAULT_TIMEOUT}s）")
     setup.add_argument("--renotify", type=int, default=None, metavar="SECONDS",
@@ -1429,8 +1599,19 @@ def cli(argv: list[str] | None = None) -> int:
             quiet = None if args.no_quiet_hours else (
                 args.quiet_hours if args.quiet_hours is not None
                 else old.get("quiet_hours"))
+            email_opts = any(value is not None for value in (
+                args.to, args.mail_from, args.smtp_host, args.smtp_port,
+                args.smtp_user, args.smtp_password))
+            if args.channel:
+                channel = args.channel
+            elif args.url:
+                channel = "webhook"
+            elif email_opts:
+                channel = "email"
+            else:
+                channel = old.get("channel") or "webhook"
             raw = {
-                "channel": "webhook", "url": args.url,
+                "channel": channel,
                 "format": args.format or old.get("format") or DEFAULT_FORMAT,
                 "timeout_seconds": args.timeout if args.timeout is not None
                 else old.get("timeout_seconds", DEFAULT_TIMEOUT),
@@ -1440,26 +1621,50 @@ def cli(argv: list[str] | None = None) -> int:
                 "enabled": old.get("enabled", True),
                 "mute_until": old.get("mute_until", 0),
             }
+            if channel == "webhook":
+                url = args.url if args.url is not None else old.get("url")
+                if not url:
+                    raise NotifyError("webhook 渠道需要 --url https://…")
+                raw["url"] = url
+            else:
+                raw.update({
+                    "smtp_host": args.smtp_host if args.smtp_host is not None
+                    else old.get("smtp_host"),
+                    "smtp_port": args.smtp_port if args.smtp_port is not None
+                    else old.get("smtp_port", DEFAULT_SMTP_PORT),
+                    "smtp_username": args.smtp_user if args.smtp_user is not None
+                    else old.get("smtp_username", ""),
+                    "smtp_password": args.smtp_password if args.smtp_password is not None
+                    else os.environ.get("OPSAGENT_SMTP_PASSWORD",
+                                        old.get("smtp_password", "")),
+                    "mail_from": args.mail_from if args.mail_from is not None
+                    else old.get("mail_from"),
+                    "mail_to": args.to if args.to is not None else old.get("mail_to"),
+                })
             cfg = save_config(raw)
-            events.append("notify-config", action="setup",
-                          endpoint=redact_endpoint(cfg["url"]), format=cfg["format"],
+            events.append("notify-config", action="setup", channel=cfg["channel"],
+                          endpoint=describe_target(cfg), format=cfg["format"],
                           renotify=cfg["renotify_after"], quiet=cfg["quiet_hours"])
             print(f"已写入 {_config_path()}（0600）")
             print(f"渠道: {describe_config(cfg)}")
+            if cfg["channel"] == "email" and cfg["smtp_username"] \
+                    and not cfg["smtp_password"]:
+                print("提示: 未设置 SMTP 密码（--smtp-password 或 OPSAGENT_SMTP_PASSWORD）")
             print("建议下一步: opsagent notify test")
             return 0
         if args.cmd == "test":
             cfg = load_config()
+            target = describe_target(cfg)
             notif = {
                 "id": _new_notification_id(), "created": time.time(),
                 "created_iso": _now_iso(), "kind": "test", "severity": "info",
                 "title": "ops-agent 测试通知",
                 "text": (f"[ops-agent] 测试通知\n时间: {_now_iso()}\n"
-                         f"渠道: {redact_endpoint(cfg['url'])}｜格式: {cfg['format']}\n"
-                         "收到这条说明 webhook 配置可用。"),
+                         f"渠道: {target}\n"
+                         "收到这条说明通知配置可用。"),
                 "items": [], "recoveries": [], "task_id": None, "run_id": None,
                 "session_id": None, "report_path": None, "fingerprints": [],
-                "endpoint": redact_endpoint(cfg["url"]), "status": "failed",
+                "endpoint": target, "status": "failed",
                 "attempts": 0, "last_error": None, "next_attempt_ts": 0,
                 "http_status": None,
             }
@@ -1471,7 +1676,10 @@ def cli(argv: list[str] | None = None) -> int:
                           attempts=notif["attempts"], error=notif.get("last_error"),
                           endpoint=notif["endpoint"])
             if notif["status"] == "sent":
-                print(f"已发送（HTTP {notif.get('http_status')}）→ {notif['endpoint']}")
+                marker = (f"SMTP {notif.get('smtp_status')}"
+                          if cfg["channel"] == "email"
+                          else f"HTTP {notif.get('http_status')}")
+                print(f"已发送（{marker}）→ {notif['endpoint']}")
                 reason = _suppression_reason(cfg, "critical", time.time())
                 if reason:
                     label = {"muted": "静默", "disabled": "停用"}.get(reason, reason)

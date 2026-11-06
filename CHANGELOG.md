@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- **邮箱通知（SMTP）**：`notify` 新增 `channel: email`，与既有 webhook 渠道二选一，去重/恢复/
+  静默/失败重试语义完全一致。`opsagent notify setup --channel email --smtp-host … --from …
+  --to a@x,b@y [--smtp-user …] [--smtp-password …]`；465 端口走隐式 TLS，其它端口要求
+  STARTTLS（本机回环中继除外，便于本地验证），密码也可用 `OPSAGENT_SMTP_PASSWORD` 提供。
+  收件人上限 20，地址/主机/端口在配置入口校验（拒绝空白与 CR/LF，防邮件头注入）。
+  事件与发件箱只记录 `smtp://host:port → N 个收件人`，SMTP 错误回显的密码/账号同样脱敏；
+  `notify test`、`notify status` 与 `doctor` 均已支持邮箱渠道。
+
 ## [0.1.0-rc.2] - 2026-11-01
 
 候选版：全项目审查（codex review）20 项发现的根因修复 + A2A 协议形态与 7 天观察沉淀。
