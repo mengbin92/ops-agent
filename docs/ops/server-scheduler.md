@@ -1,8 +1,9 @@
 # Linux 常驻只读巡检
 
-当前（2026-10-28 起）连续 7 天观察的调度器部署在别名目标 `obsServer`，由 root 用户级 systemd 托管。
+当前（2026-11-07 起）连续 7 天观察为 **R2 重计轮次**，调度器部署在别名目标 `obsServer`，由 root 用户级 systemd 托管。
 Mac 仅用于管理：关闭终端、休眠或断开 SSH 都不会停止服务器上的调度。
-实际部署与验证见[7 天观察部署记录](../validation/2026-10-28-observation-deploy.md)；
+R2 部署与验证见[R2 重启记录](../validation/2026-11-07-w8-observation-restart.md)；
+R1（2026-10-28 起，已归档为历史轮次）见[7 天观察部署记录](../validation/2026-10-28-observation-deploy.md)；
 更早的 `localServer` 试运行记录见[2026-10-26 记录](../validation/2026-10-26-readonly-trial.md)，该环境已不再运行调度。
 
 ## 当前运行布局
@@ -11,11 +12,13 @@ Mac 仅用于管理：关闭终端、休眠或断开 SSH 都不会停止服务�
 
 | 内容 | 路径或配置 |
 | --- | --- |
-| 固定版本源码 | `~/.local/share/ops-agent/releases/<commit>/` |
-| 当前版本入口 | `~/.local/share/ops-agent/current`，指向固定版本 |
-| 试运行状态 | `~/.ops-agent-trial/` |
-| 模型环境 | `~/.ops-agent-trial/.env`，权限 0600；不写入仓库或 service 文件 |
+| 固定版本源码 | `~/.local/share/ops-agent/releases/v0.1.0-rc.3/` |
+| 当前版本入口 | `~/.local/share/ops-agent/current`，指向上述固定版本 |
+| R2 试运行状态 | `~/.ops-agent-trial-r2/`（0700），与 R1 完全隔离 |
+| R1 归档状态 | `~/.ops-agent-trial/`（**冻结**，只读回看，不删除不覆盖） |
+| 模型环境 | `~/.ops-agent-trial-r2/.env`，权限 0600；不写入仓库或 service 文件 |
 | 用户级服务 | `~/.config/systemd/user/opsagent-schedule.service` |
+| unit 切换前备份 | `~/.config/systemd/user/opsagent-schedule.service.bak-20261107-r2` |
 | 自动恢复 | `Restart=always`，`RestartSec=10`；`UMask=0077` |
 | 登出后常驻 | `loginctl show-user "$USER" --property=Linger` 为 `Linger=yes` |
 
@@ -36,9 +39,12 @@ Mac 仅用于管理：关闭终端、休眠或断开 SSH 都不会停止服务�
 ssh obsServer 'systemctl --user status opsagent-schedule.service --no-pager'
 ssh obsServer 'journalctl --user -u opsagent-schedule.service -n 40 --no-pager'
 
-# 调度心跳、排期与实际运行记录
-ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule status'
-ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule runs --id sch-200a62 --tail 20'
+# 调度心跳、排期与实际运行记录（R2 状态目录）
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial-r2" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule status'
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial-r2" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule runs --id sch-35e3e0 --tail 20'
+
+# 回看 R1 历史证据（不要在这里 add / resume 任务）
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule list'
 
 # 仅在没有正在执行的任务时重启本调度服务
 ssh obsServer 'systemctl --user restart opsagent-schedule.service'
@@ -55,4 +61,20 @@ ssh obsServer 'systemctl --user disable --now opsagent-schedule.service'
 - 固定版本部署不会随 Mac 工作区修改而自动更新；更换执行版本后按观察规则判定是否重新计时。
 - `Restart=always` 恢复进程退出；服务器断电、网络中断或系统故障仍需按实际记录核对中断和漏跑。
 - 已核验 enabled、linger 和自动拉起；未实际重启服务器验收启动恢复。
-- 默认报告保留 100 份，运行记录保留 200 份；每日证据归档与通知送达仍须独立验收。
+- 默认报告保留 100 份，运行记录保留 200 份；R1 目录已有 87 份报告，故 R2 使用独立目录，
+  避免 56 份新报告触发轮转、冲掉观察期首日证据。
+- R2 沿用与 R1 相同的 SMTP 通知渠道配置（复制自 R1，权限 0600）；真实投递全链路证据见
+  [2026-11-06 渠道验收](../validation/2026-11-06-w8-notify-channel.md)，R2 期间的送达仍须按逐日记录核对。
+
+## 回退到 R1 状态
+
+仅在需要中止 R2 时执行（不删除任何证据）：
+
+```bash
+ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial-r2" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule pause sch-35e3e0'
+ssh obsServer 'cp -p "$HOME/.config/systemd/user/opsagent-schedule.service.bak-20261107-r2" "$HOME/.config/systemd/user/opsagent-schedule.service" && systemctl --user daemon-reload && systemctl --user restart opsagent-schedule.service'
+```
+
+> R1 目录的两条旧任务（`sch-200a62`、`sch-8a8d81`）已于 2026-11-07 从 `schedules.json` 移除
+> （原文件备份在 `~/.ops-agent-archive/remove-tasks-20261107-100923/`）；回退后该目录为**无任务静止状态**，
+> 不会与 R2 形成双调度。

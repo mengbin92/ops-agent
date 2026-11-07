@@ -8,14 +8,15 @@
 
 ## 发布与升级
 
-- [v0.1.0-rc.3](docs/releases/release-v0.1.0-rc.3.md)：候选版；通知新增 SMTP 邮箱渠道（与 webhook 二选一，去重/恢复/静默/失败重试语义不变）+ W8 7 天验收结论回填；真实渠道投递验收待执行。
+- [v0.1.0-rc.3](docs/releases/release-v0.1.0-rc.3.md)：候选版；通知新增 SMTP 邮箱渠道（与 webhook 二选一，去重/恢复/静默/失败重试语义不变）+ W8 7 天验收结论回填；真实渠道投递与 W8 通知全链路已于 2026-11-06 验收通过（见发布公告补记）。
 - [v0.1.0-rc.2](docs/releases/release-v0.1.0-rc.2.md)：候选版；全项目 codex review 的 20 项根因修复（敏感文件绕快照封堵、exec_change 骨架统一、排期网格锚定、场景占位符 load 校验等）+ 41 项新回归；A2A `--read-only` 服务模式；CI 独立 A2A job。
 - [v0.1.0-rc.1](docs/releases/release-v0.1.0-rc.1.md)：首个候选版，含独立 Agent、巡检通知、受控变更、离线恢复与 52 项审查回归；真实环境和连续 7 天验收待完成。
 
 完整历史见 [CHANGELOG](CHANGELOG.md)，安装与升级见对应发布公告；维护者流程见[发版说明](docs/ops/releasing.md)。
 
 后续工作见[下一阶段规划](docs/plans/2026-10-25-next-stage.md)：真实环境验收、连续 7 天只读观察、正式发布门禁与 `v0.1.0` 收口。
-当前进展：**7 天只读观察进行中**（2026-10-28 16:57 起于 `obsServer`，见[部署记录](docs/validation/2026-10-28-observation-deploy.md)）。
+当前进展：**R2 连续 7 天只读观察进行中**（2026-11-07 09:38 起于 `obsServer`，预期 11-14 09:38 满 168 小时，见[重启记录](docs/validation/2026-11-07-w8-observation-restart.md)）。
+R1（10-28 → 11-04，56/56 成功）因「排期网格锚定」属运行行为重大修复，按规则归档为历史轮次，不用于当前发布门禁；其记录与证据原样保留。
 
 ## Agent 形态（opsagent）
 
