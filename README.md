@@ -4,10 +4,11 @@
 自带 agent loop 与 LLM 接入**独立运行**，同一组受控能力同时以 MCP server 暴露给任意 MCP 客户端，
 也可以 A2A 协议与其它 agent 互联（见 [A2A 协议形态](#a2a-协议形态)，可选依赖）。
 
-> 📣 **最新发布**：[v0.1.0-rc.3 发布公告](docs/releases/release-v0.1.0-rc.3.md)（通知新增 SMTP 邮箱渠道：465 隐式 TLS / STARTTLS，凭据与脱敏同级，语义与 webhook 一致） · [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.3)
+> 📣 **最新发布**：[v0.1.0-rc.4 发布公告](docs/releases/release-v0.1.0-rc.4.md)（授权绑定、远程恢复、SMTP 部分送达与日志采集的审查修复） · [GitHub Release](https://github.com/mengbin92/ops-agent/releases/tag/v0.1.0-rc.4)
 
 ## 发布与升级
 
+- [v0.1.0-rc.4](docs/releases/release-v0.1.0-rc.4.md)：候选版；修复 R01–R09、F01–F05 与 V01，补齐授权、敏感预览、远程文件字节保真、通知受众和心跳恢复链路；本地通过不替代实机恢复与新版本七天验收。
 - [v0.1.0-rc.3](docs/releases/release-v0.1.0-rc.3.md)：候选版；通知新增 SMTP 邮箱渠道（与 webhook 二选一，去重/恢复/静默/失败重试语义不变）+ W8 7 天验收结论回填；真实渠道投递与 W8 通知全链路已于 2026-11-06 验收通过（见发布公告补记）。
 - [v0.1.0-rc.2](docs/releases/release-v0.1.0-rc.2.md)：候选版；全项目 codex review 的 20 项根因修复（敏感文件绕快照封堵、exec_change 骨架统一、排期网格锚定、场景占位符 load 校验等）+ 41 项新回归；A2A `--read-only` 服务模式；CI 独立 A2A job。
 - [v0.1.0-rc.1](docs/releases/release-v0.1.0-rc.1.md)：首个候选版，含独立 Agent、巡检通知、受控变更、离线恢复与 52 项审查回归；真实环境和连续 7 天验收待完成。
@@ -17,6 +18,8 @@
 后续工作见[下一阶段规划](docs/plans/2026-10-25-next-stage.md)：真实环境验收、连续 7 天只读观察、正式发布门禁与 `v0.1.0` 收口。
 当前进展：**R2 连续 7 天只读观察进行中**（2026-11-07 09:38 起于 `obsServer`，预期 11-14 09:38 满 168 小时，见[重启记录](docs/validation/2026-11-07-w8-observation-restart.md)）。
 R1（10-28 → 11-04，56/56 成功）因「排期网格锚定」属运行行为重大修复，按规则归档为历史轮次，不用于当前发布门禁；其记录与证据原样保留。
+
+本次 rc.4 发布不升级观察环境：R2 仍运行 rc.3，其证据不能直接证明 rc.4 已通过。实际部署 rc.4 后，须按运行行为重大修复规则重新计满七天观察。
 
 ## Agent 形态（opsagent）
 
