@@ -183,10 +183,12 @@ def _run_local(argv: list[str], timeout: int = 60) -> list[str]:
 
 
 def _run_remote(target: str, argv: list[str]) -> list[str]:
+    import core
     import remote  # 延迟导入：remote 依赖 core，模块级导入会成环
     code, out = remote.run(target, shlex.join(argv), timeout=60)
-    if code != 0 and not out.strip():
-        raise ScanSourceError(f"目标 {target} 上 {argv[0]} 采集失败（exit={code}）")
+    if code != 0:
+        raise ScanSourceError(f"目标 {target} 上 {argv[0]} 采集失败（exit={code}）: "
+                              f"{core.redact(out.strip())[:200]}")
     return out.splitlines()
 
 

@@ -544,6 +544,26 @@ class LocalLogCollectionTests(unittest.TestCase):
         self.assertIn("退出码 1", str(ctx.exception))
 
 
+class RemoteLogCollectionTests(unittest.TestCase):
+    def test_nonzero_exit_with_output_is_a_collection_error(self):
+        output = "[stderr]\nError response: unavailable\npassword=review-fixture-secret"
+        for collect, name in ((logscan.from_docker, "missing"),
+                              (logscan.from_journal, "app")):
+            with self.subTest(source=collect.__name__), \
+                    patch.object(remote, "run", return_value=(1, output)):
+                with self.assertRaises(logscan.ScanSourceError) as ctx:
+                    collect(name, target="fixture")
+                self.assertIn("exit=1", str(ctx.exception))
+                self.assertIn("unavailable", str(ctx.exception))
+                self.assertNotIn("review-fixture-secret", str(ctx.exception))
+
+    def test_successful_remote_output_is_preserved(self):
+        output = "started\nERROR worker failed\n"
+        with patch.object(remote, "run", return_value=(0, output)):
+            _, lines = logscan.from_docker("fixture", target="fixture")
+        self.assertEqual(lines, output.splitlines())
+
+
 # ------------------------------------------------ 复审 F01（完整执行环境）
 
 class FullEnvironmentBindingTests(_LoopMixin, _StateMixin, unittest.TestCase):
