@@ -133,54 +133,70 @@ class _ExecutorLoopMixin:
 class SingleUseApprovalTests(_ExecutorLoopMixin, unittest.TestCase):
     """单次使用不变量：一次存储答复只批准**一个**变更。
 
-    续跑轮里模型重新提交 ops_approve 时，ask_user 第一次返回存储答复；
+    续跑轮里模型重新提交 ops_approve 时，confirm 第一次返回存储答复；
     同一轮的第二个写操作必须重新中断（NeedUserInput → INPUT_REQUIRED），
     不能被同一个答复顺带批准。
     """
 
-    def _run_turn(self, read_only, resuming, answer, simulate):
-        """真执行器 + 假 run_turn：simulate 扮演模型对 ctx.ask_user 的调用序列。"""
+    KEY = ("ops_approve", "systemctl restart alpha")
+
+    def _run_turn(self, read_only, resuming, answer, simulate, pending_key=None):
+        """真执行器 + 假 run_turn：simulate 扮演模型对确认通道的调用序列。"""
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(core, "STATE_DIR", Path(tmp)), \
                  mock.patch.object(a2a_executor, "sdk", _stub_sdk), \
                  mock.patch.object(a2a_executor.loop, "run_turn", simulate):
                 ex = a2a_executor.build_executor(read_only=read_only)
                 sess = ex._session("inv1")
+                if pending_key is not None:
+                    # 上一轮中断时留下的变更单：续跑只有精确匹配才能消费答复
+                    ex._remember_pending(sess.id, pending_key)
                 return ex._run(sess, "[A2A 人工确认] ...", resuming, answer)
 
     def test_second_write_in_same_resumed_turn_reinterrupts(self):
         """同轮第二个 ops_approve 必须重新中断。
 
-        若有人把 ask_user 改成「每次都返回存储答复」，第二个变更会拿到
+        若有人把 confirm 改成「每次都返回存储答复」，第二个变更会拿到
         旧答复而非 NeedUserInput，simulate 走错分支，本测试失败。
         """
         def simulate(prompt, sess, ctx, model=None, on_event=None):
-            first = ctx.ask_user("批准变更 A？")   # 重新提交的第一个 ops_approve
+            first = ctx.confirm("批准变更 A？", self.KEY)   # 重新提交的第一个 ops_approve
             assert first == "确认执行", f"首次确认应返回存储答复，得到 {first!r}"
             try:
-                second = ctx.ask_user("批准变更 B？")   # 同轮第二个变更
+                second = ctx.confirm("批准变更 B？", ("ops_approve", "systemctl restart beta"))
             except a2a_executor.NeedUserInput:
                 return "re-interrupted"
             return f"auto-approved-second-with:{second!r}"
 
         out = self._run_turn(read_only=False, resuming=True, answer="确认执行",
-                             simulate=simulate)
+                             simulate=simulate, pending_key=self.KEY)
+        self.assertEqual(out, "re-interrupted")
+
+    def test_changed_request_key_reinterrupts(self):
+        """答复只批准展示过的那一单：命令变了必须重新确认。"""
+        def simulate(prompt, sess, ctx, model=None, on_event=None):
+            with self.assertRaises(a2a_executor.NeedUserInput):
+                ctx.confirm("批准变更 B？", ("ops_approve", "systemctl restart beta"))
+            return "re-interrupted"
+
+        out = self._run_turn(read_only=False, resuming=True, answer="确认执行",
+                             simulate=simulate, pending_key=self.KEY)
         self.assertEqual(out, "re-interrupted")
 
     def test_new_turn_gets_no_stale_answer(self):
         """新任务轮（非续跑）第一次确认就必须中断：答复不能跨轮残留。"""
         def simulate(prompt, sess, ctx, model=None, on_event=None):
             with self.assertRaises(a2a_executor.NeedUserInput):
-                ctx.ask_user("批准此变更？")
+                ctx.confirm("批准此变更？", self.KEY)
             return "interrupted"
 
         out = self._run_turn(read_only=False, resuming=False, answer="",
-                             simulate=simulate)
+                             simulate=simulate, pending_key=self.KEY)
         self.assertEqual(out, "interrupted")
 
 
 class ReadOnlyModeTests(_ExecutorLoopMixin, unittest.TestCase):
-    """--read-only 起服：不建人工确认通道，写操作降级为明确拒绝（不是崩溃）。"""
+    """--read-only 起服：改用无人值守只读工具集，写操作 schema 与 dispatch 都不可达。"""
 
     def test_cli_threads_read_only_flag_to_serve(self):
         with mock.patch.object(a2a_server, "serve", return_value=0) as serve:
@@ -202,7 +218,7 @@ class ReadOnlyModeTests(_ExecutorLoopMixin, unittest.TestCase):
             self.assertEqual(a2a_server.serve(read_only=True), 2)
         self.assertIs(captured["read_only"], True)
 
-    def test_read_only_context_refuses_write_without_crash(self):
+    def test_read_only_context_uses_restricted_tool_set(self):
         captured = {}
 
         def simulate(prompt, sess, ctx, model=None, on_event=None):
@@ -218,11 +234,17 @@ class ReadOnlyModeTests(_ExecutorLoopMixin, unittest.TestCase):
                 # 续跑轮同样安全：模型重提 ops_approve 也只会拿到拒绝文案
                 self.assertEqual(ex._run(sess, "重启 nginx", True, "确认执行"), "done")
         self.assertIsNone(captured["ctx"].ask_user)
-        # 写尝试经真实 dispatch 落成「拒绝」字符串返回给模型，不抛异常
-        result = tools.dispatch("ops_approve", {"command": "systemctl restart nginx"},
-                                captured["ctx"])
-        self.assertIn("拒绝", result)
-        self.assertIn("不创建审批戳", result)
+        self.assertIsNone(captured["ctx"].confirm)
+        self.assertEqual(captured["ctx"].allowed, tools.SCHEDULED_TOOLS)
+        # 写操作经真实 dispatch 落成「拒绝」字符串返回给模型，不抛异常
+        for name, args in (("ops_approve", {"command": "systemctl restart nginx"}),
+                           ("ops_exec", {"command": "systemctl restart nginx"}),
+                           ("remember", {"note": "x"})):
+            result = tools.dispatch(name, args, captured["ctx"])
+            self.assertIn("拒绝", result)
+        # 只读工具仍可用
+        self.assertIn("ops_list", {s["function"]["name"]
+                                   for s in tools.tool_schemas(captured["ctx"])})
 
 
 class ClientHelperTests(unittest.TestCase):

@@ -76,6 +76,18 @@ def _check_llm_config() -> list[dict]:
                   f"provider={provider} model={model} base={base}；key {_masked(key)}")]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """探活请求不跟随重定向：与模型传输同一约束，别把 API key 送到 Location 指的端点。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open(req, timeout: int):
+    """网络出口（模块级接缝）：禁止重定向的 opener。"""
+    return urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout)
+
+
 def _probe_llm_api() -> list[dict]:
     key = os.environ.get("OPSAGENT_API_KEY", "")
     if not key:
@@ -93,7 +105,7 @@ def _probe_llm_api() -> list[dict]:
         headers = {"Authorization": f"Bearer {key}"}
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=API_PROBE_TIMEOUT) as resp:
+        with _open(req, timeout=API_PROBE_TIMEOUT) as resp:
             from agent.notify import redact_endpoint
             return [_item("llm-api", OK, f"GET {redact_endpoint(base)}… 返回 {resp.status}")]
     except urllib.error.HTTPError as e:

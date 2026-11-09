@@ -162,16 +162,23 @@ class ScanSourceError(Exception):
 
 
 def _run_local(argv: list[str], timeout: int = 60) -> list[str]:
+    """本机采集：两路输出合并。
+
+    不能分开捕获只取 stdout：`docker logs` 会把容器内的 stderr（应用错误日志本来
+    就写在这里）放到本进程的 stderr，成功退出时那些行会被静默丢弃。远程路径经
+    remote.run() 合并输出的，两处行为必须一致。
+    """
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except FileNotFoundError:
         raise ScanSourceError(f"本机没有 {argv[0]}，无法用该来源扫描")
     except subprocess.TimeoutExpired:
         raise ScanSourceError(f"{argv[0]} 采集超时（{timeout}s），未产出日志")
-    if r.returncode != 0 and not r.stdout:
+    if r.returncode != 0:
+        # 输出已合并：非零退出就是采集失败，不能把错误文本当成"正常的日志内容"扫描。
         raise ScanSourceError(f"{shlex.join(argv)} 退出码 {r.returncode}: "
-                              f"{r.stderr.strip()[:200]}")
+                              f"{r.stdout.strip()[:200]}")
     return r.stdout.splitlines()
 
 

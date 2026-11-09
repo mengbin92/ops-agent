@@ -32,8 +32,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--max-concurrent", type=int, default=2,
                    help="同时执行的 A2A 任务上限（默认 2）")
     s.add_argument("--read-only", action="store_true",
-                   help="只读模式：不提供人工确认通道，写操作一律拒绝；"
-                        "R0 只读命令与 AgentCard/skills 照常")
+                   help="只读模式：按无人值守只读工具集运行，写操作与状态修改工具"
+                        "不可见、不可用；R0 只读命令与 AgentCard/skills 照常")
 
     c = sub.add_parser("card", help="打印 AgentCard（JSON）")
     c.add_argument("--host", default="127.0.0.1")

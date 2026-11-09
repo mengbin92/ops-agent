@@ -163,7 +163,9 @@ def serve(host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, token: str | None 
           read_only: bool = False) -> int:
     """启动服务。返回进程退出码（0 正常，2 配置不安全/依赖缺失）。
 
-    read_only：不建人工确认通道，写操作一律拒绝（R0 只读与 AgentCard 照常）。
+    read_only：按无人值守只读工具集运行（tools.SCHEDULED_TOOLS），写操作与状态修改
+    工具在 schema 与 dispatch 两层都不可用——即使目标机上已有合法审批戳也不能执行。
+    R0 只读命令与 AgentCard 照常。
     """
     from .a2a_executor import build_executor
 
@@ -199,7 +201,7 @@ def serve(host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, token: str | None 
           file=sys.stderr)
     print(f"[a2a] 模型={model or os.environ.get('OPSAGENT_MODEL') or '默认'} "
           f"超时={timeout}s 并发={max_concurrent}"
-          f"{' 只读=开（写操作一律拒绝）' if read_only else ''}", file=sys.stderr)
+          f"{' 只读=开（无人值守只读工具集）' if read_only else ''}", file=sys.stderr)
     try:
         uvicorn.run(app, host=host, port=port, log_level="info")
     except OSError as e:

@@ -203,7 +203,7 @@ class ReliabilityReviewTests(unittest.TestCase):
 
     def test_doctor_rejects_unknown_provider_without_network(self):
         with mock.patch.dict(os.environ, {"OPSAGENT_PROVIDER": "wrong"}), \
-                mock.patch.object(doctor.urllib.request, "urlopen") as urlopen:
+                mock.patch.object(doctor, "_open") as urlopen:
             self.assertEqual(doctor._check_llm_config()[0]["status"], doctor.FAIL)
             self.assertEqual(doctor._probe_llm_api()[0]["status"], doctor.FAIL)
         urlopen.assert_not_called()

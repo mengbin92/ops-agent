@@ -1125,9 +1125,11 @@ def _heartbeat_synthetic(ok: bool, detail: str) -> dict:
 
 
 def alert_heartbeat_if_stale() -> None:
-    """启动调度时检查：上次心跳已过期说明调度中断过——通过通知状态机告警（自动去重）。
+    """按当前心跳状态喂给通知状态机：stale 告警、fresh 触发恢复（自动去重）。
 
-    告警在"心跳恢复"（下一条成功记录）时自动恢复，与 W4 的恢复通知同一套语义。
+    启动时调用一次用于发现"上次调度中断"；每次成功扫描后也调用——恢复意图
+    由状态机自己保存，不引入"已告警"旗标。旗标会在心跳写盘失败的容错路径上
+    过早清除，反而是"永远不再恢复"的来源。
     旁路失败（未配置通知/事件）不影响调度本身。
     """
     health = daemon_health()
@@ -1433,6 +1435,9 @@ def daemon(model: str | None = None, once: bool = False) -> int:
             except (ScheduleError, OSError) as e:
                 print(f"[schedule] 调度失败: {core.redact(str(e))}", file=sys.stderr)
                 return 1
+            # 扫描阶段会刷新心跳（写盘失败时仍是 stale，状态机就会保留告警，
+            # 下一轮再试）：每轮复查一次，恢复通知由状态机去重。
+            alert_heartbeat_if_stale()
             for rec in records:
                 _print_record(rec, "[schedule] ")
             if not records:
@@ -1454,6 +1459,10 @@ def daemon(model: str | None = None, once: bool = False) -> int:
                     print(f"[schedule] {core.redact(str(e))}", file=sys.stderr)
                     time.sleep(60)
                     continue
+                # 本轮扫描已刷新心跳：补偿「心跳中断」告警，否则常驻进程只会
+                # 在启动时告警、永不恢复。写盘失败导致心跳仍 stale 时保留意图，
+                # 下一轮继续尝试（状态机负责去重）。
+                alert_heartbeat_if_stale()
                 for rec in records:
                     _print_record(rec, f"[schedule {time.strftime('%H:%M:%S')}] ")
                 try:

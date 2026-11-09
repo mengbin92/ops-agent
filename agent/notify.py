@@ -34,6 +34,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from email.message import EmailMessage
+from hashlib import sha256
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -686,16 +687,39 @@ def _loopback_host(host: str) -> bool:
         return host.strip().lower() == "localhost"
 
 
+def _recipient_id(addr: str) -> str:
+    """收件人的稳定标识：发件箱里不留明文地址，也能判断谁已经投递成功。"""
+    return sha256(addr.encode("utf-8")).hexdigest()
+
+
 def _send_email(cfg: dict, notif: dict) -> tuple[int, str]:
-    """SMTP 投递：465 走隐式 TLS；其它端口必须 STARTTLS（本机回环除外，便于本地中继）。"""
+    """SMTP 投递：465 走隐式 TLS；其它端口必须 STARTTLS（本机回环除外，便于本地中继）。
+
+    `send_message()` 对部分收件人拒收不抛异常，而是返回拒收字典；忽略它会把
+    "一半值班人没收到"记成完全成功、且不再补发。这里按收件人粒度记账：
+    已接受者的散列存进通知记录，重试只投递尚未成功的人（不重复打扰已收到的）。
+    """
     host, port = cfg["smtp_host"], cfg["smtp_port"]
     context = ssl.create_default_context()
+    ids = {addr: _recipient_id(addr) for addr in cfg["mail_to"]}
+    # 恢复消息只发给真正收到过原异常的人（recipient_ids 由状态机带下来）；
+    # 普通异常/提醒没有该字段 = 全部收件人。
+    scope = notif.get("recipient_ids")
+    scope_ids = set(scope) if isinstance(scope, list) else None
+    targets = [addr for addr in cfg["mail_to"]
+               if scope_ids is None or ids[addr] in scope_ids]
     message = EmailMessage()
     message["Subject"] = notif.get("title") or "ops-agent 通知"
     message["From"] = cfg["mail_from"]
-    message["To"] = ", ".join(cfg["mail_to"])
+    message["To"] = ", ".join(targets)
     message.set_content(notif.get("text") or "")
     timeout = cfg.get("timeout_seconds", DEFAULT_TIMEOUT)
+    accepted = set(notif.get("smtp_accepted_recipient_ids") or [])
+    pending = [addr for addr in targets if ids[addr] not in accepted]
+    if not pending:
+        # 这个范围里所有人都已接受过：没有要补发的人，成功收尾。
+        notif["smtp_accepted_recipient_ids"] = sorted(accepted)
+        return 250, "smtp accepted"
     try:
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
@@ -711,12 +735,20 @@ def _send_email(cfg: dict, notif: dict) -> tuple[int, str]:
                     raise NotifyError("远程 SMTP 必须支持 STARTTLS（或使用 465 端口）")
             if cfg.get("smtp_username"):
                 server.login(cfg["smtp_username"], cfg["smtp_password"])
-            server.send_message(message)
+            refused = server.send_message(message, to_addrs=pending) or {}
     except NotifyError:
         raise
     except (smtplib.SMTPException, OSError) as e:  # ssl.SSLError 也是 OSError
         # 对方错误里可能回显收件人/认证信息，统一由 _safe_error 兜底再落盘
         raise NotifyError(f"SMTP 发送失败: {type(e).__name__}: {e}") from e
+    # 已接受集合始终留在通知记录里：部分送达也是"有人真的收到了"，恢复消息
+    # 要按这个集合定向发送；发送失败的是谁也要能据此只补发未成功者。
+    accepted.update(ids[addr] for addr in pending if addr not in refused)
+    notif["smtp_accepted_recipient_ids"] = sorted(accepted)
+    if refused:
+        raise NotifyError(
+            f"SMTP 有 {len(refused)} 个收件人拒收（{len(pending) - len(refused)} 个已接受）："
+            "已标记失败，下次只补发未成功者")
     return 250, "smtp accepted"
 
 
@@ -840,11 +872,19 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
             _deliver(cfg, notif)
             _write_notification(notif)
             ok = notif["status"] == "sent"
-            if ok:
-                _mark_notified(state, fps, now, notif["id"], delivered=True)
-                recovered = [r["fingerprint"] for r in notif.get("recoveries") or []]
-                _mark_recovered(state, recovered, now)
+            accepted_ids = notif.get("smtp_accepted_recipient_ids") or []
+            # 携带异常项的通知：部分成功也要把新增受众同步给状态机，否则
+            # "重试又送达了一部分"只留在发件箱，随后的恢复仍按旧集合漏发。
+            # 纯恢复通知不同步：它只会缩小"原异常受众"，把还没收到恢复的人排除掉。
+            anomaly_items = bool(notif.get("items"))
+            if ok or (accepted_ids and anomaly_items):
+                _mark_notified(state, fps, now, notif["id"], delivered=ok,
+                               recipient_ids=accepted_ids if anomaly_items else [])
+                if ok:
+                    recovered = [r["fingerprint"] for r in notif.get("recoveries") or []]
+                    _mark_recovered(state, recovered, now)
                 _save_state(state)
+            if ok:
                 for item in notif.get("recoveries") or []:
                     events.append("anomaly-recovered", fingerprint=item["fingerprint"],
                                   title=item.get("title"), task=notif.get("task_id"),
@@ -1058,6 +1098,7 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
                       "kind": item.get("kind")})
         if reopened:
             entry["delivered_at"] = None
+            entry.pop("delivered_recipient_ids", None)
             entry.pop("notified_at", None)
             entry.pop("muted_at", None)
         entry.pop("recovered_at", None)
@@ -1099,8 +1140,10 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
                     counts["suppressed"] += 1
                     continue
         counts["recovered"] += 1
-        if _finite(entry.get("delivered_at", entry.get("notified_at")), None) is None:
-            # 从没真正告诉过用户（未配置/停用/静默期间发现的）：静默清状态，
+        audience = entry.get("delivered_recipient_ids")
+        if _finite(entry.get("delivered_at", entry.get("notified_at")), None) is None \
+                and not audience:
+            # 从没真正告诉过任何人（未配置/停用/静默/全部拒收）：静默清状态，
             # 不发"恢复"——否则会推一条"X 已恢复"，而对方根本不知道 X 曾经坏过。
             entry["severity"] = None
             entry["recovered_at"] = now
@@ -1115,7 +1158,7 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
         items[fp] = entry
         recoveries.append({"fingerprint": fp, "title": entry.get("title") or fp,
                            "first_seen": _finite(entry.get("first_seen"), now) or now,
-                           "severity": "info"})
+                           "severity": "info", "recipient_ids": audience})
     return to_send, recoveries, counts
 
 
@@ -1204,13 +1247,21 @@ def _compose(items: list, recoveries: list, rec: dict, now: float) -> dict:
             size += len(line) + 1
         text = "\n".join(kept) + f"\n…（正文已截断，共 {total} 项）\n" \
             + core.redact(tail_text)
+    # 纯恢复消息带上"原异常实际送达给谁"；有新异常时必须发给全部收件人。
+    recipient_ids = None
+    if recoveries and not items:
+        scopes = [r.get("recipient_ids") for r in recoveries]
+        if all(isinstance(scope, list) for scope in scopes):
+            recipient_ids = sorted({rid for scope in scopes for rid in scope})
     return {"severity": severity, "title": title, "text": text,
+            "recipient_ids": recipient_ids,
             "items": [{"fingerprint": i.get("fingerprint"), "severity": i["severity"],
                        "title": i.get("title"), "line": i.get("line"),
                        "command": i.get("command"), "output": i.get("output"),
                        "transient": bool(i.get("transient"))} for i in items],
             "recoveries": [{"fingerprint": r["fingerprint"], "title": r["title"],
-                            "first_seen": r.get("first_seen")}
+                            "first_seen": r.get("first_seen"),
+                            "recipient_ids": r.get("recipient_ids")}
                            for r in recoveries]}
 
 
@@ -1294,7 +1345,8 @@ def _mark_muted(state: dict, fingerprints: list, now: float, touch: bool = True)
 
 
 def _mark_notified(state: dict, fingerprints: list, now: float,
-                   notification_id: str, delivered: bool) -> None:
+                   notification_id: str, delivered: bool,
+                   recipient_ids: list | None = None) -> None:
     items = state.get("items") or {}
     for fp in fingerprints:
         entry = items.get(fp)
@@ -1304,6 +1356,12 @@ def _mark_notified(state: dict, fingerprints: list, now: float,
             entry.setdefault("delivered_at", None)
             if delivered:
                 entry["delivered_at"] = now
+            if recipient_ids:
+                # 部分送达也是"有人真的收到了"：恢复消息按这个集合定向发送，
+                # 不能因为有人被拒收就当作没人收到，也不能扩大到没收到的人。
+                entry["delivered_at"] = entry["delivered_at"] or now
+                entry["delivered_recipient_ids"] = sorted(
+                    set(entry.get("delivered_recipient_ids") or []) | set(recipient_ids))
             entry["notified_severity"] = entry.get("severity")
             entry["needs_notify"] = False
             entry["event_severity"] = entry.get("severity")
@@ -1318,6 +1376,7 @@ def _mark_recovered(state: dict, fingerprints: list, now: float) -> None:
             entry["recovered_at"] = now
             entry["pending_recovery"] = None
             entry["needs_notify"] = False
+            entry.pop("delivered_recipient_ids", None)
             entry.pop("event_severity", None)  # 复发时要能再记一条 anomaly-new
             items[fp] = entry
 
@@ -1363,6 +1422,7 @@ def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
         "session_id": rec.get("session_id"), "report_path": rec.get("report_path"),
         "report_paths": rec.get("report_paths") or [],
         "fingerprints": fingerprints,
+        "recipient_ids": composed.get("recipient_ids"),
         "endpoint": describe_target(cfg) if cfg else None,
         "status": "failed", "attempts": 0, "last_error": None,
         "next_attempt_ts": 0, "http_status": None,
@@ -1378,8 +1438,12 @@ def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
                           title=composed["title"], attempts=notif["attempts"],
                           error=notif.get("last_error"), endpoint=notif["endpoint"],
                           task=rec.get("task_id"), run=rec.get("run_id"))
+            # 只有携带异常项的通知才用已接受集合更新"原异常受众"：纯恢复消息
+            # 部分失败时若也并进去，会把它自己的受众反向缩小成"已收到恢复的人"。
+            accepted_ids = notif.get("smtp_accepted_recipient_ids") or []
             _mark_notified(state, fingerprints, now, notif["id"],
-                           delivered=notif["status"] == "sent")
+                           delivered=notif["status"] == "sent",
+                           recipient_ids=accepted_ids if notif.get("items") else [])
             dirty = True
             delivered = notif["status"] == "sent"
         else:

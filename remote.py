@@ -313,13 +313,19 @@ def _pull_file(name: str, path_str: str, d: Path, items: list,
             "确需变更凭据文件请在目标机人工备份。")
     dest = _dest(d, path_str)
     resolved = _target_resolved_path(name, path_str)
-    try:
-        r = _ssh(name, f"cat -- {shlex.quote(resolved)}", timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        raise RemoteError(f"远程取快照超时: {path_str}") from e
-    if r.returncode != 0:
-        raise RemoteError(f"远程取快照失败({r.returncode}): {path_str}: {_text(r)[:300]}")
-    dest.write_bytes(r.stdout)
+    # 输入路径合法不代表落到的文件合法：普通名字可能是指向私钥/凭据的软链接，
+    # 必须在读取内容之前按**解析后**的真实路径再判一次，否则门禁可被绕过。
+    hit = core.sensitive_snapshot_path(resolved)
+    if hit:
+        raise RemoteError(
+            f"远程快照真实路径是敏感路径，拒绝拉取: {hit}（{path_str} -> {resolved}）。"
+            "密钥/私钥/Secret 文件不进快照；确需变更凭据文件请在目标机人工备份。")
+    # 走统一的字节协议（_remote_read）：登录 banner 之类的前置噪声不会混进快照，
+    # 内容按本次随机标记定界，不会因文件正文像标记而被截断。
+    exists, data = _remote_read(name, resolved, timeout=timeout)
+    if not exists:
+        raise RemoteError(f"远程快照源不存在: {path_str}")
+    dest.write_bytes(data)
     item = {"type": "file", "remote": name, "src": path_str,
             "dest": str(dest.relative_to(d)), "resolved_path": resolved}
     mode, owner = _target_stat(name, resolved)
@@ -461,45 +467,70 @@ def _run_remote_change(name: str, cmd: str, timeout: int) -> tuple[int, str, str
             None if r.returncode == 0 else f"命令退出码 {r.returncode}")
 
 
-def _remote_read(name: str, path_str: str) -> tuple[bool, bytes]:
-    """读取目标机当前文件内容（回滚预览/回滚前副本用）。返回 (是否存在, 内容)。
+def _remote_read(name: str, path_str: str, timeout: int = IO_TIMEOUT) -> tuple[bool, bytes]:
+    """读取目标机当前文件内容（回滚预览/回滚前副本/快照源）。返回 (是否存在, 内容)。
 
-    协议与 _target_resolved_path 同一思路：标记从尾部解析。rc/MOTD 噪声出现在
-    输出前部不再致命——Ubuntu 非交互 ssh 会 source .bashrc，登录脚本往 stdout
-    打印任何内容都会让"标记必须在行首"的旧协议永远失败，回滚在那种主机上不可用。
-    结束标记前恒定补一个 \\n（printf '\\nOPSX-EXISTS-END\\n'），因此截取内容后
-    去掉恰好一个末尾换行即可无损还原文件字节。
+    协议：每次调用生成一个随机标记，begin/end/missing 都由本次标记导出。
+    - 登录脚本（rc/MOTD）往 stdout 打印的噪声出现在开头，不影响解析；
+    - 文件正文即使包含 "OPSX-EXISTS" 这类旧标记也不会被误当成结束标记；
+    - `cat` 失败立即 `exit`，不会让后面的 printf 把退出码洗成 0（读失败必须中止）。
+    结束标记前恒定补一个 \\n，因此截取内容后去掉恰好一个末尾换行即可无损还原字节。
     """
+    marker = "OPSX-EXISTS-" + os.urandom(8).hex()
     q = shlex.quote(path_str)
-    remote_cmd = (f"if [ -e {q} ]; then printf 'OPSX-EXISTS\\n'; cat -- {q}; "
-                  "printf '\\nOPSX-EXISTS-END\\n'; else printf 'OPSX-MISSING\\n'; fi")
+    remote_cmd = (f"if [ -e {q} ]; then printf '{marker}\\n'; "
+                  f"cat -- {q} || exit $?; "
+                  f"printf '\\n{marker}-END\\n'; "
+                  f"else printf '{marker}-MISSING\\n'; fi")
     try:
-        r = _ssh(name, remote_cmd, timeout=IO_TIMEOUT)
+        r = _ssh(name, remote_cmd, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise RemoteError(f"读取远程文件超时: {path_str}") from e
     if r.returncode != 0:
         raise RemoteError(f"读取远程文件失败({r.returncode}): {path_str}: {_text(r)[:300]}")
-    end = r.stdout.rfind(b"\nOPSX-EXISTS-END\n")
+    raw_marker = marker.encode()
+    start_marker = raw_marker + b"\n"
+    end_marker = b"\n" + raw_marker + b"-END\n"
+    missing_marker = raw_marker + b"-MISSING\n"
+    end = r.stdout.rfind(end_marker)
     if end >= 0:
-        start = r.stdout.rfind(b"OPSX-EXISTS\n", 0, end)
+        start = r.stdout.rfind(start_marker, 0, end)
         if start >= 0:
-            content = r.stdout[start + len(b"OPSX-EXISTS\n"):end + 1]
+            content = r.stdout[start + len(start_marker):end + 1]
             return True, content[:-1]  # 去掉结束标记前恒定补的那个 \n
-    missing = r.stdout.rfind(b"OPSX-MISSING\n")
-    if missing >= 0 and not r.stdout[missing + len(b"OPSX-MISSING\n"):].strip():
+    missing = r.stdout.rfind(missing_marker)
+    if missing >= 0 and not r.stdout[missing + len(missing_marker):].strip():
         return False, b""
     raise RemoteError(f"远程文件状态无法判定: {path_str}")
 
 
 def rollback_plan(snapshot_id: str) -> dict:
-    """远程快照的回滚预览：经 SSH 读取目标机当前内容再比对。"""
+    """远程快照的回滚预览：经 SSH 读取目标机当前内容再比对。
+
+    预览发生在人确认之前，所以校验必须前置：先固定目标配置，再解析真实路径、
+    拒绝改向、按真实路径复查敏感路径，最后才读取内容。等到真正回滚时才拒绝，
+    秘密早就已经进了 diff 和工具输出——那是撤销不了的。
+    """
     d, meta = core.load_snapshot(snapshot_id)
     target = meta.get("target")
     if not target:
         return core.rollback_plan(snapshot_id)
-    _snapshot_target_env(meta)  # 目标被改指向时不能拿旧快照覆盖新机器
-    return core.rollback_plan(
-        snapshot_id, read_state=lambda src: _remote_read(target, src))
+    expected = {item["src"]: item.get("resolved_path")
+                for item in meta["items"] if item["type"] == "file"}
+
+    def read_state(src: str) -> tuple[bool, bytes]:
+        resolved = _target_resolved_path(target, src)
+        if expected.get(src) and expected[src] != resolved:
+            raise RemoteError(f"远程文件真实路径已改变: {src}，拒绝预览")
+        hit = core.sensitive_snapshot_path(resolved)
+        if hit:
+            raise RemoteError(f"远程文件真实路径是敏感路径，拒绝预览: {hit}")
+        return _remote_read(target, resolved)
+
+    # _fixed_target 冻结注册表：环境校验、路径解析与读取用同一份目标配置。
+    with _fixed_target(target):
+        _snapshot_target_env(meta)  # 目标被改指向时不能拿旧快照覆盖新机器
+        return core.rollback_plan(snapshot_id, read_state=read_state)
 
 
 # 原子恢复脚本：同目录临时文件 → chmod → rename。

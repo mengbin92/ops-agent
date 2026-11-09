@@ -5,6 +5,7 @@ No real SSH, no service writes: all remote interaction goes through patched _ssh
 """
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -79,54 +80,68 @@ class SensitiveSnapshotGateTests(unittest.TestCase):
 
 
 class RemoteReadBannerTolerantTests(unittest.TestCase):
-    """_remote_read 的标记从尾部解析：rc/MOTD 噪声不再让远程回滚变砖。"""
+    """_remote_read 的标记从尾部解析：rc/MOTD 噪声不再让远程回滚变砖。
+
+    标记每次调用随机生成（避免文件正文伪装成结束标记截断内容），所以桩必须
+    从**本次下发脚本**里取出标记再拼输出，不能写死字符串。
+    """
 
     @staticmethod
-    def ssh_with_banner(stdout, returncode=0):
-        result = subprocess.CompletedProcess([], returncode, stdout, b"")
-        return lambda *args, **kwargs: result
+    def marker_of(cmd):
+        match = re.search(r"OPSX-EXISTS-[0-9a-f]{16}", cmd)
+        assert match, f"脚本里没有随机标记: {cmd}"
+        return match.group(0).encode()
+
+    @classmethod
+    def stdout_for(cls, cmd, payload, banner=b"", missing=False):
+        marker = cls.marker_of(cmd)
+        if missing:
+            return banner + marker + b"-MISSING\n"
+        return banner + marker + b"\n" + payload + b"\n" + marker + b"-END\n"
+
+    def assert_read(self, payload, expected, banner=b""):
+        def fake_ssh(name, cmd, stdin=None, timeout=120):
+            return subprocess.CompletedProcess([], 0, self.stdout_for(cmd, payload, banner), b"")
+
+        with patch.object(remote, "_ssh", fake_ssh):
+            exists, content = remote._remote_read("web1", "/etc/app.conf")
+        self.assertTrue(exists)
+        self.assertEqual(content, expected)
 
     def test_banner_before_exists_marker(self):
-        payload = b"line1\nline2"
-        out = (b"Welcome to Ubuntu 22.04\nlast login: ...\n"
-               + b"OPSX-EXISTS\n" + payload + b"\nOPSX-EXISTS-END\n")
-        with patch.object(remote, "_ssh", self.ssh_with_banner(out)):
-            exists, content = remote._remote_read("web1", "/etc/app.conf")
-        self.assertTrue(exists)
-        self.assertEqual(content, payload)
+        self.assert_read(b"line1\nline2", b"line1\nline2",
+                         banner=b"Welcome to Ubuntu 22.04\nlast login: ...\n")
 
     def test_payload_without_trailing_newline_roundtrips(self):
-        payload = b"no-newline"
-        out = b"OPSX-EXISTS\n" + payload + b"\nOPSX-EXISTS-END\n"
-        with patch.object(remote, "_ssh", self.ssh_with_banner(out)):
-            exists, content = remote._remote_read("web1", "/etc/app.conf")
-        self.assertTrue(exists)
-        self.assertEqual(content, payload)
+        self.assert_read(b"no-newline", b"no-newline")
 
     def test_payload_with_trailing_newline_roundtrips(self):
-        payload = b"ends-with-newline\n"
-        out = b"OPSX-EXISTS\n" + payload + b"\nOPSX-EXISTS-END\n"
-        with patch.object(remote, "_ssh", self.ssh_with_banner(out)):
-            exists, content = remote._remote_read("web1", "/etc/app.conf")
-        self.assertTrue(exists)
-        self.assertEqual(content, payload)
+        self.assert_read(b"ends-with-newline\n", b"ends-with-newline\n")
 
     def test_empty_file(self):
-        out = b"banner\nOPSX-EXISTS\n\nOPSX-EXISTS-END\n"
-        with patch.object(remote, "_ssh", self.ssh_with_banner(out)):
-            exists, content = remote._remote_read("web1", "/etc/app.conf")
-        self.assertTrue(exists)
-        self.assertEqual(content, b"")
+        self.assert_read(b"", b"")
+
+    def test_payload_that_looks_like_an_old_marker_is_not_truncated(self):
+        payload = b"before\nOPSX-EXISTS\nafter\nOPSX-EXISTS-END\n"
+        self.assert_read(payload, payload)
+
+    def test_binary_payload_roundtrips(self):
+        payload = bytes(range(256)) + b"\r\n\x00\xff"
+        self.assert_read(payload, payload)
 
     def test_missing_with_banner(self):
-        out = b"banner noise\nOPSX-MISSING\n"
-        with patch.object(remote, "_ssh", self.ssh_with_banner(out)):
+        def fake_ssh(name, cmd, stdin=None, timeout=120):
+            return subprocess.CompletedProcess(
+                [], 0, self.stdout_for(cmd, b"", b"banner noise\n", missing=True), b"")
+
+        with patch.object(remote, "_ssh", fake_ssh):
             exists, content = remote._remote_read("web1", "/etc/app.conf")
         self.assertFalse(exists)
         self.assertEqual(content, b"")
 
     def test_undecidable_output_still_fails_closed(self):
-        with patch.object(remote, "_ssh", self.ssh_with_banner(b"garbage")):
+        with patch.object(remote, "_ssh",
+                          lambda *a, **k: subprocess.CompletedProcess([], 0, b"garbage", b"")):
             with self.assertRaises(remote.RemoteError):
                 remote._remote_read("web1", "/etc/app.conf")
 

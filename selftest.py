@@ -17,6 +17,19 @@ importlib.reload(core)  # 经 opsx 调用时 core 可能已导入，重载以应
 os.chdir(Path(__file__).resolve().parent)  # 审批绑定 cwd：自检固定在仓库目录运行
 
 
+def _remote_read_stdout(cmd, payload=b"remote-v1\n", banner=b"", missing=False):
+    """按**本次**脚本里的随机标记拼 _remote_read 的假输出。
+
+    标记每次调用都不同（防止文件正文伪装成结束标记），桩不能写死字符串。
+    """
+    match = re.search(r"OPSX-EXISTS-[0-9a-f]{16}", cmd)
+    assert match, f"远程读取脚本缺少随机标记: {cmd}"
+    marker = match.group(0).encode()
+    if missing:
+        return banner + marker + b"-MISSING\n"
+    return banner + marker + b"\n" + payload + b"\n" + marker + b"-END\n"
+
+
 def test_classify():
     assert core.classify("kubectl get pods -n default")[0] == "R0"
     assert core.classify("systemctl restart nginx")[0] == "R1"
@@ -817,9 +830,9 @@ def test_llm_sse_stream():
         def __exit__(self, *a):
             return False
 
-    import urllib.request
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = lambda req, timeout=300: FakeResp()
+    from agent import llm
+    orig = llm._open
+    llm._open = lambda req, timeout=300: FakeResp()
     try:
         deltas = []
         msg = llm.chat([{"role": "user", "content": "hi"}], on_delta=deltas.append)
@@ -829,7 +842,7 @@ def test_llm_sse_stream():
         assert tc["id"] == "c1" and tc["function"]["name"] == "bash"
         assert json.loads(tc["function"]["arguments"]) == {"command": "uname"}
     finally:
-        urllib.request.urlopen = orig
+        llm._open = orig
 
 
 def test_llm_stream_and_response_fail_closed():
@@ -862,7 +875,7 @@ def test_llm_stream_and_response_fail_closed():
     ]
     for provider, payload in cases:
         with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
-                patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+                patch.object(llm, "_open", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
             try:
                 llm.chat([{"role": "user", "content": "x"}], on_delta=lambda p: None)
                 raise AssertionError(f"应拒绝不完整或错误的 {provider} 流")
@@ -873,7 +886,7 @@ def test_llm_stream_and_response_fail_closed():
                '"content_block":{"type":"text","text":"开头"}}\n'
                'data: {"type":"message_stop"}\n')
     with patch.dict(os.environ, {"OPSAGENT_PROVIDER": "anthropic", "OPSAGENT_API_KEY": "test-dummy"}), \
-            patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+            patch.object(llm, "_open", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
         deltas = []
         assert llm.chat([{"role": "user", "content": "x"}], on_delta=deltas.append)["content"] == "开头"
         assert deltas == ["开头"]
@@ -884,7 +897,7 @@ def test_llm_stream_and_response_fail_closed():
 
     for provider in ("openai", "anthropic"):
         with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
-                patch("urllib.request.urlopen", side_effect=lambda *a, **kw: FailedRead()):
+                patch.object(llm, "_open", side_effect=lambda *a, **kw: FailedRead()):
             try:
                 llm.chat([{"role": "user", "content": "x"}])
                 raise AssertionError("读取失败应统一为 LLMError")
@@ -893,7 +906,7 @@ def test_llm_stream_and_response_fail_closed():
         for payload in ("null", "[]", '{"content":[{"type":"text","text":12}]}',
                         '{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":{}}}]}'):
             with patch.dict(os.environ, {"OPSAGENT_PROVIDER": provider, "OPSAGENT_API_KEY": "test-dummy"}), \
-                    patch("urllib.request.urlopen", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
+                    patch.object(llm, "_open", side_effect=lambda *a, **kw: io.BytesIO(payload.encode())):
                 try:
                     llm.chat([{"role": "user", "content": "x"}])
                     raise AssertionError("无效响应必须统一拒绝")
@@ -1239,10 +1252,10 @@ def test_remote_exec_snapshot_and_rollback():
         if resolved is not None:
             return resolved
         calls.append((name, cmd, stdin))
-        if "OPSX-EXISTS" in cmd:
-            # _remote_read 尾标记协议：内容 + 恒定补一个 \n + OPSX-EXISTS-END
+        if "OPSX-EXISTS-" in cmd:
+            # 随机标记协议：按本次下发的标记拼输出
             return subprocess.CompletedProcess(
-                [], 0, stdout=b"OPSX-EXISTS\nremote-v1\n\nOPSX-EXISTS-END\n", stderr=b"")
+                [], 0, stdout=_remote_read_stdout(cmd), stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"remote-v1\n", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -1372,8 +1385,10 @@ def test_opsx_cli_remote_end_to_end():
         f'echo "$@" >> "{log}"\n'
         'case "$*" in\n'
         '  *"OPSX-RESOLVED"*) printf \'OPSX-RESOLVED\\000/etc/nginx/nginx.conf\\000\' ;;\n'
-        '  *"OPSX-EXISTS"*) printf \'OPSX-EXISTS\\n\'; printf \'remote-v1\\n\'; '
-        'printf \'\\nOPSX-EXISTS-END\\n\' ;;\n'
+        '  *"OPSX-EXISTS-"*) '
+        'm=$(printf \'%s\' "$*" | grep -o \'OPSX-EXISTS-[0-9a-f]*\' | head -n 1); '
+        'printf \'%s\\n\' "$m"; printf \'remote-v1\\n\'; '
+        'printf \'\\n%s-END\\n\' "$m" ;;\n'
         "  *\"cat -- \"*) printf 'remote-v1\\n' ;;\n"
         '  *".opsx-restore."*) cat > "$OPSX_TEST_PUSHED" ; '
         'printf \'opsx-restored had=1 size=%s mode=600\\n\' "$(wc -c < "$OPSX_TEST_PUSHED" | tr -d \' \')" ;;\n'
@@ -1498,9 +1513,9 @@ def test_remote_rollback_failure_reported():
         resolved = _fake_resolved_response(cmd)
         if resolved is not None:
             return resolved
-        if "OPSX-EXISTS" in cmd:
+        if "OPSX-EXISTS-" in cmd:
             return subprocess.CompletedProcess(
-                [], 0, stdout=b"OPSX-EXISTS\nv1\nOPSX-EXISTS-END\n", stderr=b"")
+                [], 0, stdout=_remote_read_stdout(cmd, b"v1"), stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"v1", stderr=b"")
         if cmd.startswith("systemctl restart"):
@@ -1550,8 +1565,8 @@ def _fake_anthropic_response(content_blocks):
 
 
 def _with_urlopen(fake, fn):
-    """临时替换 urlopen，捕获请求；返回 (结果, 捕获的 {url, headers, body})。"""
-    import urllib.request
+    """临时替换 llm._open，捕获请求；返回 (结果, 捕获的 {url, headers, body})。"""
+    from agent import llm
     captured: dict = {}
 
     def wrapper(req, timeout=300):
@@ -1560,12 +1575,12 @@ def _with_urlopen(fake, fn):
         captured["body"] = json.loads(req.data.decode())
         return fake(req, timeout)
 
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = wrapper
+    orig = llm._open
+    llm._open = wrapper
     try:
         return fn(), captured
     finally:
-        urllib.request.urlopen = orig
+        llm._open = orig
 
 
 def test_anthropic_provider_request_and_response():
@@ -1690,9 +1705,9 @@ def test_anthropic_sse_stream():
         def __exit__(self, *a):
             return False
 
-    import urllib.request
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = lambda req, timeout=300: FakeResp()
+    from agent import llm
+    orig = llm._open
+    llm._open = lambda req, timeout=300: FakeResp()
     try:
         deltas: list[str] = []
         msg = llm.chat([{"role": "user", "content": "hi"}], on_delta=deltas.append)
@@ -1702,7 +1717,7 @@ def test_anthropic_sse_stream():
 
         err_sse = ('data: {"type":"error","error":{"type":"overloaded_error",'
                    '"message":"busy"}}\n')
-        urllib.request.urlopen = lambda req, timeout=300: type("R", (), {
+        llm._open = lambda req, timeout=300: type("R", (), {
             "__enter__": lambda self: io.BytesIO(err_sse.encode()),
             "__exit__": lambda self, *a: False})()
         try:
@@ -1711,7 +1726,7 @@ def test_anthropic_sse_stream():
         except llm.LLMError as e:
             assert "流式错误" in str(e)
     finally:
-        urllib.request.urlopen = orig
+        llm._open = orig
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -3328,9 +3343,9 @@ def test_remote_rollback_target_check_and_backup():
         resolved = _fake_resolved_response(cmd)
         if resolved is not None:
             return resolved
-        if "OPSX-EXISTS" in cmd:
+        if "OPSX-EXISTS-" in cmd:
             return subprocess.CompletedProcess(
-                [], 0, stdout=b"OPSX-EXISTS\ncurrent-v2\n\nOPSX-EXISTS-END\n", stderr=b"")
+                [], 0, stdout=_remote_read_stdout(cmd, b"current-v2\n"), stderr=b"")
         if cmd.startswith("cat --"):
             return subprocess.CompletedProcess([], 0, stdout=b"archived-v1\n", stderr=b"")
         if ".opsx-restore." in cmd:      # 原子恢复脚本（mktemp → chmod → mv）
@@ -7248,10 +7263,10 @@ def test_rollback_without_backcast_is_uncertain():
             return subprocess.CompletedProcess([], 0, b"restarted\n", b"")
         if ".opsx-restore." in cmd:
             return subprocess.CompletedProcess([], 0, b"", b"")   # 后验被吞掉
-        if "OPSX-EXISTS" in cmd:
-            # 目标机当前内容（回滚前副本要读它）；尾标记协议同上
+        if "OPSX-EXISTS-" in cmd:
+            # 目标机当前内容（回滚前副本要读它）；随机标记协议同上
             return subprocess.CompletedProcess(
-                [], 0, b"OPSX-EXISTS\nv2\n\nOPSX-EXISTS-END\n", b"")
+                [], 0, _remote_read_stdout(cmd, b"v2\n"), b"")
         return subprocess.CompletedProcess([], 0, b"ok\n", b"")
 
     orig = remote._ssh
@@ -7855,11 +7870,11 @@ def test_w5_review_remote_transport_stays_on_approved_target():
             hosts.append(host)
             if 'OPSX-RESOLVED' in cmd:
                 data = b'OPSX-RESOLVED\x00/etc/app.conf\x00'
-            elif cmd.startswith('cat --'):
+            elif 'OPSX-EXISTS-' in cmd:
                 targets = json.loads(registry.read_text())
                 targets[name]['host'] = '10.0.0.99'
                 registry.write_text(json.dumps(targets))
-                data = b'original'
+                data = _remote_read_stdout(cmd, b'original')
             elif cmd.startswith('stat '):
                 data = b'600 ops:ops\n'
             elif 'OPSX-HOST ' in cmd:
@@ -8658,18 +8673,18 @@ def test_doctor_clear_diagnoses():
     assert "## 需要处理" in report
     # 有 key 但探活 401：鉴权失败分支（含修复建议）。env 放进 finally：
     # 中途断言失败也不能把测试 key 留给后续用例。
-    saved_open = urllib.request.urlopen
+    saved_open = doctor._open
     had_key = os.environ.pop("OPSAGENT_API_KEY", None)
 
     def fake_urlopen(req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
 
-    urllib.request.urlopen = fake_urlopen
+    doctor._open = fake_urlopen
     os.environ["OPSAGENT_API_KEY"] = "sk-test-w7"
     try:
         items = doctor._probe_llm_api()
     finally:
-        urllib.request.urlopen = saved_open
+        doctor._open = saved_open
         os.environ.pop("OPSAGENT_API_KEY", None)
         if had_key is not None:
             os.environ["OPSAGENT_API_KEY"] = had_key

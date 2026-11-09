@@ -18,12 +18,19 @@
 安全边界（必须知道）：
 - 一次用户答复只批准**一个**待确认项：`ask_user` 第一次返回答复，之后再调用就重新中断。
   否则模型在续跑轮里发起第二个变更会被同一个「确认」顺带批准。
+- 普通问题会把之前那张变更单作废：`ask_user` 展示任何问题都清空待确认映射——
+  否则"继续只读诊断吗？"的 yes 会被下一次重提请的旧写变更当成批准。
+- 答复只批准**上一轮展示过的那一单**：写操作确认走 `ToolContext.confirm`，携带
+  「工具名 + 完整归一化参数 + 完整执行环境（kubeconfig / SSH 身份与选项等）」组成的
+  结构化身份。模型在续跑轮里改了命令、目标、快照路径或次数，或执行环境变了，
+  身份就对不上，必须重新进入 INPUT_REQUIRED。
 - 取消只标记状态，不保证工具停下：Python 线程无法中断，已发出的命令可能仍在目标机上执行。
   因此取消消息明确写「请核实执行记录」，与项目既有的 unknown 语义保持一致。
 - A2A 通道没有 REPL 那样的实时确认框，所以「无人值守语义」不适用于此形态：
   ask_user 永远可用（由调用方承担答复责任），这一点与 schedule/subagent 相反。
-  例外：`--read-only` 起服时不建确认通道（ask_user=None），写操作由 tools.py
-  既有的守门分支降级为明确拒绝（不建审批戳），R0 只读命令不受影响。
+  例外：`--read-only` 起服时改用无人值守只读工具集（`tools.SCHEDULED_TOOLS`），
+  schema 与 dispatch 同时受限——即使目标机上已有合法审批戳，`ops_exec` 等写操作
+  也不可见、不可用（只读承诺不能靠"没有确认通道"间接实现）。
 """
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ MAX_CONCURRENT_DEFAULT = 2
 MAX_INPUT_CHARS = 20_000     # 入口上限：超长消息直接拒绝，不把整本日志塞进上下文
 SEMAPHORE_WAIT = 30.0        # 等不到执行槽就明确报忙，而不是让调用方无限挂着
 MAX_SESSIONS = 200           # 常驻会话上限：Session 会缓存全部 messages，不设限就是内存泄漏
+MAX_PENDING = 256            # 待确认变更单上限：中断后一直没人续跑的 task 不能无限占内存
 
 # context_id 由调用方提供，会拼进会话文件名（Session 校验 [A-Za-z0-9_-]{1,128}）。
 # 这里先按更严格的上界拒掉异常输入，避免拿它当路径或超长文件名。
@@ -124,10 +132,12 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                      read_only: bool = False):
             self.model = model
             self.timeout = timeout
-            self.read_only = read_only  # 只读起服：不建确认通道，写工具走拒绝路径
+            self.read_only = read_only  # 只读起服：走无人值守只读工具集
             self._sem = asyncio.Semaphore(max_concurrent)
             self._sessions: "OrderedDict[str, sess_mod.Session]" = OrderedDict()
             self._locks: dict[str, threading.Lock] = {}
+            # task（或会话）→ 上一轮展示给调用方的变更单身份，用于续跑时精确比对
+            self._pending: "OrderedDict[str, tuple]" = OrderedDict()
             self._guard = threading.Lock()
 
         # ---- 会话 ----------------------------------------------------
@@ -167,20 +177,58 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                 else:
                     return
 
+        # ---- 待确认变更单 ---------------------------------------------
+        def _remember_pending(self, slot: str, request_key: tuple) -> None:
+            with self._guard:
+                self._pending[slot] = request_key
+                self._pending.move_to_end(slot)
+                while len(self._pending) > MAX_PENDING:
+                    self._pending.popitem(last=False)
+
+        def _get_pending(self, slot: str):
+            with self._guard:
+                return self._pending.get(slot)
+
+        def _forget_pending(self, slot: str) -> None:
+            with self._guard:
+                self._pending.pop(slot, None)
+
         # ---- 同步执行体（在线程里跑）----------------------------------
-        def _run(self, sess, prompt: str, resuming: bool, answer: str) -> str:
+        def _run(self, sess, prompt: str, resuming: bool, answer: str,
+                 task_id: str | None = None) -> str:
             answered = [False]
+            # task_id 是协议给出的身份；进程内直调（测试/嵌入）时退回会话 id。
+            slot = task_id or sess.id
 
             def ask_user(question: str) -> str:
+                # 普通澄清问题一旦展示，之前那张变更单就不再是"当前待确认项"：
+                # 否则人对普通问题回的 yes 会被下一次重提请的旧变更当成批准。
+                self._forget_pending(slot)
+                # 沿用「一次答复只回答一个问题」的语义。
                 if resuming and not answered[0]:
-                    answered[0] = True  # 一次答复只批准一个待确认项
+                    answered[0] = True
                     return answer
                 raise NeedUserInput(question)
 
+            def confirm(question: str, key: tuple) -> str:
+                """写操作确认：答复只批准上一轮展示过的那一单。
+
+                比对的是结构化身份，不是问题文本——模型续跑时重建请求，只要改了
+                命令/目标/快照路径/次数/执行环境，key 就不相等，必须重新确认。
+                """
+                if (resuming and not answered[0]
+                        and self._get_pending(slot) == key):
+                    answered[0] = True
+                    self._forget_pending(slot)
+                    return answer
+                self._remember_pending(slot, key)
+                raise NeedUserInput(question)
+
             ctx = tools.ToolContext(
-                # 只读模式不给确认通道：ops_approve 等写工具见 ask_user=None 会
-                # 返回明确的拒绝文案（不建审批戳），R0 只读命令照常执行。
+                # 只读模式不给确认通道；同时收紧工具白名单，写操作连 schema 都看不到。
                 ask_user=None if self.read_only else ask_user,
+                confirm=None if self.read_only else confirm,
+                allowed=tools.SCHEDULED_TOOLS if self.read_only else None,
                 model=self.model, session_id=sess.id,
                 deadline=time.monotonic() + self.timeout)
 
@@ -189,9 +237,18 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                     _log(f"session={sess.id} tool={payload.get('name')} "
                          f"phase={payload.get('phase')}")
 
-            return loop.run_turn(prompt, sess, ctx, model=self.model, on_event=on_event)
+            try:
+                out = loop.run_turn(prompt, sess, ctx, model=self.model, on_event=on_event)
+            except NeedUserInput:
+                raise  # 中断：保留待确认单，等同一 task 续跑时比对
+            except BaseException:
+                self._forget_pending(slot)
+                raise
+            self._forget_pending(slot)
+            return out
 
-        def _locked_run(self, sess, prompt, resuming, answer) -> str:
+        def _locked_run(self, sess, prompt, resuming, answer,
+                        task_id: str | None = None) -> str:
             """同一 context 串行：并发 task 共用一个 Session 会把消息交错写坏。
 
             会话修补（settle）必须也在锁内：中断后锁已释放，若在锁外补写，
@@ -210,7 +267,7 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                     if settled:
                         _log(f"session={sid} settled {settled} dangling tool_call(s)")
                 try:
-                    return self._run(sess, prompt, resuming, answer)
+                    return self._run(sess, prompt, resuming, answer, task_id)
                 except NeedUserInput:
                     # 中断点留下的悬空调用在锁内就地标记为「未执行」，再交还控制权。
                     _settle_pending(sess, SETTLE_NOTE)
@@ -302,7 +359,7 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
 
             try:
                 out = await asyncio.to_thread(
-                    self._locked_run, sess, prompt, resuming, text)
+                    self._locked_run, sess, prompt, resuming, text, task_id)
             except NeedUserInput as e:
                 question = core.redact(str(e.question or "需要人工确认"))
                 _log(f"task={task_id} -> INPUT_REQUIRED")
@@ -335,6 +392,9 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
             task_id = context.task_id or ""
             context_id = context.context_id or ""
             updater = s.TaskUpdater(event_queue, task_id, context_id)
+            # 取消后这张变更单作废：即使调用方随后又带着答复回来，也不能沿用旧确认。
+            if task_id:
+                self._forget_pending(task_id)
             _log(f"task={task_id} cancel requested")
             await updater.update_status(
                 pb.TASK_STATE_CANCELED,

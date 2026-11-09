@@ -100,12 +100,31 @@ def _api_key() -> str:
     return key
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """认证请求不跟随重定向：urllib 的默认处理会把 302 改成 GET 继续发，
+    并把自定义 Authorization / x-api-key 原样带到新地址——一条错误的 Location
+    就能把模型密钥送到别的端点。3xx 直接落到 HTTPError 分支，按失败处理。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open(req, timeout: int):
+    """网络出口（模块级接缝，测试替换这里即可）。
+
+    每次按当前 handler 构造 opener：既拿到禁止重定向的行为，也保留测试替换
+    urllib 传输（HTTPSHandler 桩）的能力。
+    """
+    return urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout)
+
+
 def _request(url: str, body: dict, headers: dict, timeout: int):
     """POST JSON 并返回响应对象；网络/HTTP 错误统一转 LLMError。"""
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                      headers=headers, method="POST")
-        return urllib.request.urlopen(req, timeout=timeout)
+        return _open(req, timeout)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
         raise LLMError(f"LLM API HTTP {e.code}: {detail}") from e

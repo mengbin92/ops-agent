@@ -773,9 +773,19 @@ def resolve_env(cmd: str, target: str | None = None) -> dict:
 
 
 def format_env(env: dict) -> str:
+    """执行环境的人读描述。
+
+    除了主机/目录/context，也要带上 kubeconfig、SSH 身份与选项：同名 context
+    可以指向不同集群，SSH 身份/选项会改变实际执行主体——确认框里看不到这些，
+    人就没法核对"批准的是哪个环境"。授权比对另用 env_identity()。
+    """
     if env.get("scope") == "remote":
         user = f"{env['user']}@" if env.get("user") else ""
         line = f"目标 {env.get('target')}（{user}{env.get('host')}:{env.get('port')}）"
+        if env.get("identity"):
+            line += f"，身份文件 {env['identity']}"
+        if env.get("options"):
+            line += f"，ssh 选项 {' '.join(str(o) for o in env['options'])}"
     else:
         line = f"本机 {env.get('host')}，工作目录 {env.get('cwd')}"
     k8s = env.get("k8s") or {}
@@ -783,7 +793,18 @@ def format_env(env: dict) -> str:
         line += f"，k8s context={k8s['context']}"
         if k8s.get("namespace"):
             line += f" namespace={k8s['namespace']}"
+    if env.get("kubeconfig"):
+        line += f"，kubeconfig={env['kubeconfig']}"
     return line
+
+
+def env_identity(env: dict) -> str:
+    """执行环境的稳定序列化（授权比对用）。
+
+    比 format_env 严格：所有影响实际执行目标的字段都参与，展示文案的措辞变化
+    不会影响历史答复的匹配。
+    """
+    return json.dumps(env, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def cmd_hash(cmd: str, target: str | None = None) -> str:

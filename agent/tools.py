@@ -43,6 +43,10 @@ class ToolContext:
     """前端注入的人机回路与运行参数。
 
     ask_user(question) -> str；不可用返回 None。
+    confirm(question, key) -> str；可选的写操作确认通道。key 是这次变更请求的
+    结构化身份（工具名 + 完整归一化参数 + 解析后的执行环境）。前端若支持，就
+    只在 key 与上一轮展示的那一单完全一致时才消费答复——A2A 靠它防止"批准了 A，
+    模型改成 B 却被同一个 yes 放行"。不提供时退回 ask_user(question)。
     allowed：工具白名单（子代理只读），None = 全部。
     model：父代理使用的模型，子代理沿用（--model 覆盖时保持一致）。
     session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
@@ -53,14 +57,33 @@ class ToolContext:
 
     def __init__(self, ask_user=None, allowed: set[str] | None = None,
                  model: str | None = None, session_id: str | None = None,
-                 goal_continuation: bool = False, deadline: float | None = None):
+                 goal_continuation: bool = False, deadline: float | None = None,
+                 confirm=None):
         self.ask_user = ask_user
+        self.confirm = confirm
         self.allowed = allowed
         self.model = model
         self.session_id = session_id
         self.goal_continuation = goal_continuation
         self.deadline = deadline
         self.evidence_errors: list[str] = []
+
+
+def _can_confirm(ctx: ToolContext) -> bool:
+    return ctx.confirm is not None or ctx.ask_user is not None
+
+
+def _confirm(ctx: ToolContext, question: str, key: tuple) -> str | None:
+    """写操作确认：优先走能绑定请求身份的通道。
+
+    key 必须覆盖这次请求的全部可执行内容；只放命令字符串不够（快照路径、次数、
+    目标、k8s context 变了同样是另一单）。
+    """
+    if ctx.confirm is not None:
+        return ctx.confirm(question, key)
+    if ctx.ask_user is not None:
+        return ctx.ask_user(question)
+    return None
 
 
 def _schema(name, description, properties, required):
@@ -257,7 +280,7 @@ def _normalize_snapshot_args(args: dict) -> tuple[list[str], list[tuple[str, str
 
 
 def _ops_approve(args: dict, ctx: ToolContext) -> str:
-    if ctx.ask_user is None:  # 没有确认通道时不能自建审批戳（否则可绕过人类授权）
+    if not _can_confirm(ctx):  # 没有确认通道时不能自建审批戳（否则可绕过人类授权）
         return ("[opsx 拒绝] 当前形态没有可确认的用户通道，不创建审批戳。"
                 "请由人执行 opsx approve（或改用 REPL / MCP 弹窗）后重试。")
     target = args.get("target") or None
@@ -278,6 +301,12 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
         snap_files, snap_cmds = _normalize_snapshot_args(args)
         warning = "\n不可逆，无回滚方案。" if level == "R3" else ""
         uses = args.get("uses", 1)
+        # 确认身份必须覆盖整张变更单，而不是命令字符串：快照路径、次数、目标、
+        # 执行环境任一变化都是另一单（显示文案里快照只写数量，同数量不同路径不可辨）。
+        request_key = ("ops_approve", args["command"], target, level,
+                       core.env_identity(env), uses, impact,
+                       tuple(snap_files), tuple(snap_cmds),
+                       bool(args.get("force", False)), args.get("ttl_seconds", 900))
         # 次数必须出现在确认框里：否则模型用 uses=100 换来的授权，人看起来和 1 次一样
         times = "1 次（执行后即失效，再执行需重新批准）" if uses == 1 \
             else f"{uses} 次（同一授权可重复执行 {uses} 次）"
@@ -289,13 +318,25 @@ def _ops_approve(args: dict, ctx: ToolContext) -> str:
         else:
             rollback = ("⚠ 本次未声明任何快照：执行后无自动回滚点，"
                         "回滚只能按命令语义人工进行")
-        answer = ctx.ask_user(f"批准此变更？\n执行环境：{core.format_env(env)}\n"
-                              f"风险级别：{level}{warning}\n"
-                              f"可用次数：{times}\n"
-                              f"影响面（would-be 变更）:\n{core.redact(impact)}\n"
-                              f"{rollback}\n"
-                              f"完整命令：\n{args['command']}\n"
-                              "输入“确认执行”或 yes 批准，其他回答均拒绝。")
+        question = (f"批准此变更？\n执行环境：{core.format_env(env)}\n"
+                    f"风险级别：{level}{warning}\n"
+                    f"可用次数：{times}\n"
+                    f"影响面（would-be 变更）:\n{core.redact(impact)}\n"
+                    f"{rollback}\n"
+                    f"完整命令：\n{args['command']}\n"
+                    "输入“确认执行”或 yes 批准，其他回答均拒绝。")
+        if snap_files or snap_cmds:
+            # 快照路径是授权的一部分，必须逐条展示：只报数量时两份不同的
+            # 变更单看起来一模一样，人也无法核对批准的是哪一份。
+            preview = []
+            if snap_files:
+                preview.append("快照文件:")
+                preview += [f"  {f}" for f in snap_files]
+            if snap_cmds:
+                preview.append("快照命令:")
+                preview += [f"  {c}" for c, _ in snap_cmds]
+            question += "\n" + "\n".join(preview)
+        answer = _confirm(ctx, question, request_key)
         if not isinstance(answer, str) or answer.strip().casefold() not in {"确认执行", "确认", "yes", "y"}:
             core.revoke(args["command"], target)
             core.audit("approve-deny", cmd=args["command"], level=level, target=target)
@@ -367,10 +408,12 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
         target = plan.get("target")
         if plan["files"]:
             preview = core.format_rollback_plan(plan)
-            if ctx.ask_user is None:
+            if not _can_confirm(ctx):
                 return ("[opsx 拒绝] 回滚是写操作，当前形态没有可确认的用户通道，未改动任何文件。\n"
                         + preview)
-            answer = ctx.ask_user(preview + "\n\n输入“确认回滚”或 yes 执行，其他回答均拒绝。")
+            answer = _confirm(ctx,
+                              preview + "\n\n输入“确认回滚”或 yes 执行，其他回答均拒绝。",
+                              ("ops_rollback", sid, preview))
             if not isinstance(answer, str) or answer.strip().casefold() not in {
                     "确认回滚", "确认", "yes", "y"}:
                 core.audit("rollback-deny", snapshot_id=sid)
@@ -449,7 +492,7 @@ def _scenario_run(args: dict, ctx: ToolContext) -> str:
     preview.append(f"风险级别: {level}｜执行环境: {core.format_env(env)}")
     preview_text = "\n".join(preview)
 
-    if ctx.ask_user is None:
+    if not _can_confirm(ctx):
         return ("[opsx 拒绝] 变更场景需要人工确认，当前形态没有确认通道，"
                 "未执行任何变更。\n" + preview_text)
     if level == "R3":
@@ -459,7 +502,10 @@ def _scenario_run(args: dict, ctx: ToolContext) -> str:
     else:
         prompt = preview_text + "\n\n输入“确认执行”或 yes 批准，其他回答均拒绝。"
         valid = {"确认执行", "确认", "yes", "y"}
-    answer = ctx.ask_user(prompt)
+    # 绑定展示过的整张单：名字、参数、以及完整执行环境（preview_text 只含
+    # format_env 的展示文本，kubeconfig/SSH 身份这类字段必须一并参与比对）。
+    answer = _confirm(ctx, prompt,
+                      ("scenario_run", name, preview_text, core.env_identity(env)))
     if not isinstance(answer, str) or answer.strip().casefold() not in valid:
         core.audit("scenario-deny", scenario=name, cmd=exec_cmd, target=tgt)
         return "[opsx 拒绝] 用户未批准，未执行任何变更。"
