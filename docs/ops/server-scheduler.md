@@ -68,10 +68,16 @@ ssh obsServer 'systemctl --user disable --now opsagent-schedule.service'
 
 ## 回退到 R1 状态
 
+> **2026-11-15 补记**：R2 收口后 `sch-35e3e0` 已按维护者要求移除，
+> `~/.ops-agent-trial-r2/schedules.json` 现为 0 个任务，`schedule pause sch-35e3e0` 不再适用。
+> 配置备份在 `~/.ops-agent-archive/remove-r2-task-20261115-145444/`，证据全部保留。
+> 用户级调度服务 `opsagent-schedule.service` 已于 2026-11-15 15:04 以 `disable --now` 停用
+> （inactive / disabled、无残留 daemon）；需要重新托管时执行
+> `systemctl --user enable --now opsagent-schedule.service`。
+
 仅在需要中止 R2 时执行（不删除任何证据）：
 
 ```bash
-ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial-r2" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule pause sch-35e3e0'
 ssh obsServer 'cp -p "$HOME/.config/systemd/user/opsagent-schedule.service.bak-20261107-r2" "$HOME/.config/systemd/user/opsagent-schedule.service" && systemctl --user daemon-reload && systemctl --user restart opsagent-schedule.service'
 ```
 

@@ -41,7 +41,7 @@
 | 逐日 | 7 个日次各 8/8 全成功 |
 | 证据体量 | runs 56、sessions 56、signals 56、reports 62（含启动前手动检查） |
 | 通知 / 事件 | 56 次 `notify_status=none`；发件箱 1 条（11-09 `notify test`）；events 2 行 |
-| 守护进程 | `opsagent-schedule.service` active，`NRestarts=0` |
+| 守护进程 | 观察期内 `opsagent-schedule.service` active、`NRestarts=0`；收口后已于 11-15 停用 |
 
 首次抽样显示 `session 存在=False` 系按 `.json` 后缀匹配所致，实际会话文件为 `.jsonl`；
 按真实格式复核 56/56 齐全，该误判与纠正已如实记录，不作为证据缺口。
@@ -63,8 +63,14 @@
    （7 场景通过、收件端确认 5 封实收）不构成本观察期内的送达证据。
 3. **S3 三项未执行**：真实 SSH 恢复、断线 `unknown` 防重放、服务后验 `verify_failed`。
 4. **S4 发布门禁代码化未完成**：`release.yml` 尚无外部验收证据阻断。
-5. **观察期外运行**：任务 `sch-35e3e0` 仍启用，截至 11-15 14:51 已额外产生 9 次只读 run
-   （runs 65 / reports 71），不计入 56 个验收槽位；是否暂停由维护者决定。
+5. **观察期外运行与任务移除**：任务 `sch-35e3e0` 在观察期外额外产生 9 次只读 run
+   （runs 65 / reports 71，不计入 56 个验收槽位），已于 2026-11-15 14:54 按维护者要求移除。
+   `schedules.json` 与 `notify-state.json` 备份于服务器私有目录
+   `~/.ops-agent-archive/remove-r2-task-20261115-145444/`，证据全部保留，本收口结论不受影响。
+   移除后 `~/.ops-agent-trial-r2/schedules.json` 为 0 个任务；用户级调度服务
+   `opsagent-schedule.service` 已于 2026-11-15 15:04 以 `disable --now` 停用
+   （inactive / disabled、无残留 daemon 进程），可随时 `enable --now` 恢复。
+   停用不影响任何已归档证据，也不改变本收口结论。
 6. 本记录不改变 W8 整体与正式版发布判定。
 
 ## 6. 证据路径

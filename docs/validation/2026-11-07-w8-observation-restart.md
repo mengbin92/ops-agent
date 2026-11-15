@@ -134,15 +134,18 @@ python3 "$CLI" events --tail 30
 
 ## 8. 停止与回退
 
-```bash
-# 暂停 R2（保留全部证据）
-ssh obsServer 'OPSX_STATE_DIR="$HOME/.ops-agent-trial-r2" python3 "$HOME/.local/share/ops-agent/current/opsagent" schedule pause sch-35e3e0'
+> **2026-11-15 补记**：R2 收口后已按维护者要求**移除** `sch-35e3e0`（逻辑删除，仅移除
+> `schedules.json` 条目）；`schedules.json` / `notify-state.json` 备份于服务器私有目录
+> `~/.ops-agent-archive/remove-r2-task-20261115-145444/`，证据全部保留。
+> 原「暂停 R2」命令在任务移除后不再适用；如需恢复观察任务，把备份复制回状态目录后重启服务。
 
+```bash
 # 需要完全回到 R1 托管时：恢复 unit 备份并重启服务（不删除任何目录）
 ssh obsServer 'cp -p "$HOME/.config/systemd/user/opsagent-schedule.service.bak-20261107-r2" "$HOME/.config/systemd/user/opsagent-schedule.service" && systemctl --user daemon-reload && systemctl --user restart opsagent-schedule.service'
 ```
 
-回退不会删除 R2 证据；R1 的两个旧任务保持暂停，避免双调度。观察期间不要在 R1 目录
+回退不会删除 R2 证据；R1 的两条旧任务已于 11-09 从 R1 状态目录移除（当时先暂停），
+`~/.ops-agent-trial-r2/schedules.json` 现为 0 个任务。观察期间不要在 R1 目录
 `add` / `resume` 任务。
 
 ## 9. 声明
