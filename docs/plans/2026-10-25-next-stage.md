@@ -2,16 +2,31 @@
 
 评估日期：2026年10月25日（北京时间）。基线：`d897d2c` / `v0.1.0-rc.1`。
 工作分支：`develop`，跟踪已有的 `origin/develop`；创建时与 `main` 同指上述提交。
-当前状态（2026-11-07）：**R2 连续 7 天只读观察已启动**（2026-11-07 09:38 起，预期 11-14 09:38 满 168h，
-`sch-35e3e0`，运行版本 `v0.1.0-rc.3`，见[R2 重启记录](../validation/2026-11-07-w8-observation-restart.md)）。
-**首轮 12:38 尚未执行，R2 逐日数据全部空白**。
-R1（2026-10-28 16:57 – 11-04 17:37，56/56 成功、0 漏跑）因排期网格锚定属运行行为重大修复，按 §2 规则
-归档为历史轮次，**不再作为当前发布门禁的 7 天证据**；其记录与证据原样保留，见[验收记录](../validation/2026-11-05-w8-acceptance.md)。
-真实模型调用、实际通知渠道（含异常/去重/升级/恢复/失败补发全链路）均已通过，见
-[2026-11-06 渠道验收](../validation/2026-11-06-w8-notify-channel.md)。S3 变更/恢复演练仍未授权。
-R1 的两条旧任务已于 11-07 从 R1 状态目录移除（证据保留），当前唯一运行任务是 R2 `sch-35e3e0`。
-测试基线：服务器与本机普通终端 `./opsx selftest` 均 322/322、`unittest` 319 OK（skipped=14）。
-实际证据见[试运行准备记录](../validation/2026-10-26-readonly-trial.md)。
+当前状态（2026-11-14 10:31，北京时间）：**R2 连续 7 天只读观察已跑满 168h，56 / 56 槽位全部命中**
+（起点 2026-11-07 09:38:18，终点 2026-11-14 09:38:18；`sch-35e3e0`，3h / 56 槽位，
+运行版本 `v0.1.0-rc.3`，见[R2 重启记录](../validation/2026-11-07-w8-observation-restart.md)）。
+56 次全部 `succeeded` /「正常」，0 漏跑、0 failed / timeout / interrupted / missed，
+**最大漂移 0.00 min**，7 个日次各 8/8；56/56 的 run→session→report 证据链完整、报告 62 份未轮转。
+`notify_status` 全为 `none`（R2 期内零异常）。按 [§10](../validation/2026-11-07-w8-observation-restart.md)
+判定标准逐项核对 6 项全部满足，**R2 七天连续运行门禁判定通过（仅对 `v0.1.0-rc.3`）**；
+逐日表 7 行已按实测回填、[收口验收记录](../validation/2026-11-14-w8-r2-acceptance.md) 已新增并随收口提交落地；
+正式版发布判定仍待 S3 / S4 与维护者确认。
+
+> **2026-11-11 维护者裁决：走「让 rc.3 的 R2 收口」路线** —— 观察跑满 168h 后按
+> [R2 重启记录 §10](../validation/2026-11-07-w8-observation-restart.md) 的判定标准收口，
+> **不部署 `v0.1.0-rc.4`、不重计 7 天**。本次只固化决策与收口清单；观察未结束前不宣布通过、不预先打勾。
+
+版本口径：`v0.1.0-rc.4` 已于 2026-11-09 21:32 发布（含 `notify.py` / `schedule.py` / `logscan.py`
+等运行行为重大修复），其[发布说明](../releases/release-v0.1.0-rc.4.md)明确「本次发布不修改生产托管、
+当前版本指向或 R2 观察环境」「实际部署后应固定新候选基线并重新计满七天观察」。
+因此 **R2 结论只对 `v0.1.0-rc.3` 有效**；若将来改为给 rc.4 发正式版，须先部署 rc.4 并第三次重计 7 天。
+
+R1（2026-10-28 16:57 – 11-04 17:37，56/56 成功、0 漏跑）已归档为历史轮次，不作当前门禁证据。
+真实模型调用、实际通知渠道全链路已通过（[11-06 渠道验收](../validation/2026-11-06-w8-notify-channel.md)）；
+[11-09 隔离目录演练](../validation/2026-11-09-notify-drill.md)通过且收件端确认 5 封实收，
+但**不构成 R2 观察期内的送达证据**。S3 变更/恢复演练仍未授权，S4 发布门禁代码化未完成。
+测试基线（rc.4）：`./opsx selftest` 322/322、`python3 -m unittest discover -s tests` 364 项
+（350 通过、14 skipped）。逐日表 7 行仍全空，收口时按服务器原始记录统一回填。
 
 ## 1. 规划时判断与证据（2026-10-25）
 
@@ -23,7 +38,7 @@ W1–W8 的代码主闭环已经交付，不重复排期实现审批、通知、
 | ✅ 已交付 | 独立 Agent、CLI/MCP/RPC、确定性巡检、调度通知、受控变更、场景后验、离线状态恢复 | [候选版发布说明](../releases/release-v0.1.0-rc.1.md)；代码交付不代表实机验收通过 |
 | ✅ 历史验证 | 内置自检 309/309、独立回归 223/223、本地恢复演练 10/10 | [最近项目复审](../reviews/2026-10-24-project-review.md)；这是归档结果，本次没有重跑测试 |
 | ✅ 本次核对 | 归档本地演练的 24 项代码/策略摘要均与当前文件一致 | [本地证据](../validation/2026-10-24-w8-local-evidence.json)；仍为 `local_status=passed`、`overall_status=blocked` |
-| ✅ 当前基线（11-07） | 实机与本机普通终端 `./opsx selftest` 322/322、`python3 -m unittest discover -s tests` 319 OK（skipped=14） | [R2 重启记录](../validation/2026-11-07-w8-observation-restart.md) §5；此前 WorkBuddy 沙箱内 320/322 + 13 errors 为 shim 对临时目录 `mkdir(exist_ok=True)` 的误判，非代码回归 |
+| ✅ 当前基线（rc.4） | `./opsx selftest` 322/322、`python3 -m unittest discover -s tests` 364 项（350 通过、14 skipped） | [rc.4 发布说明](../releases/release-v0.1.0-rc.4.md)；此前 WorkBuddy 沙箱内 320/322 + 13 errors 为 shim 对临时目录 `mkdir(exist_ok=True)` 的误判，非代码回归 |
 | ⚠️ P1 / 高 | 真实 SSH 恢复、断线 unknown、服务后验仍缺通过证据；通知渠道已通过，7 天观察在修复版本上重计（R2 进行中） | R1 56/56 已归档为历史轮次；真实 LLM 与通知全链路证据见[11-06 渠道验收](../validation/2026-11-06-w8-notify-channel.md)；R2 起点 2026-11-07 09:38、预期 11-14 09:38，见[R2 重启记录](../validation/2026-11-07-w8-observation-restart.md)；[实机验收清单](../ops/w8-real-environment.md)第 4–8 步待执行 |
 | ⚠️ P1 / 高 | 正式版外部验收尚无发布流水线强制校验 | [发版规则](../ops/releasing.md)要求通过外部验收；[release.yml](../../.github/workflows/release.yml)仅按 tag 判断候选/正式，并复用只跑本地演练的 [selftest.yml](../../.github/workflows/selftest.yml) |
 
