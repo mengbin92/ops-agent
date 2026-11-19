@@ -39,10 +39,12 @@ class WorkflowError(Exception):
 
 def _load_json(path: Path) -> dict:
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
             raise WorkflowError(f"workflow 文件过大: {path}（上限 {MAX_FILE_BYTES} 字节）")
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         raise WorkflowError(f"workflow 文件损坏: {path}（{e}）") from e
     if not isinstance(data, dict):
         raise WorkflowError(f"workflow 文件格式异常: {path}")
@@ -76,19 +78,41 @@ def _normalize_checks(name: str, raw) -> dict | None:
 
 def catalog() -> list[dict]:
     """按名字排序的 workflow 目录；用户目录同名覆盖仓库。"""
-    found: dict[str, dict] = {}
+    paths: dict[str, Path] = {}
     for d in DIRS:
         if not d.is_dir():
             continue
-        for p in sorted(d.glob("*.json")):
-            if not _NAME_RE.fullmatch(p.stem):
-                continue
-            try:
-                data = _load_json(p)
-            except WorkflowError:
-                continue
-            found[p.stem] = {"name": p.stem, "description": data.get("description") or ""}
-    return [found[name] for name in sorted(found)]
+        for p in d.glob("*.json"):
+            if p.is_file() and _NAME_RE.fullmatch(p.stem):
+                paths[p.stem] = p
+    entries = []
+    for name, path in sorted(paths.items()):
+        try:
+            definition = _load_definition(path)
+        except WorkflowError:
+            continue
+        entries.append({"name": name, "description": definition["description"]})
+    return entries
+
+
+def _load_definition(path: Path) -> dict:
+    name = path.stem
+    data = _load_json(path)
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise WorkflowError(f"workflow {name} 没有 steps")
+    if len(steps) > MAX_STEPS:
+        raise WorkflowError(f"workflow {name} 步骤过多（上限 {MAX_STEPS}）")
+    normalized = []
+    for i, step in enumerate(steps, 1):
+        prompt = step.get("prompt") if isinstance(step, dict) else None
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkflowError(f"workflow {name} 第 {i} 步缺少 prompt")
+        normalized.append({"name": str(step.get("name") or f"步骤 {i}"),
+                           "prompt": prompt.strip()})
+    return {"name": name, "description": data.get("description") or "",
+            "checks": _normalize_checks(name, data.get("checks")),
+            "steps": normalized}
 
 
 def load(name: str) -> dict:
@@ -98,23 +122,7 @@ def load(name: str) -> dict:
         raise WorkflowError(f"非法 workflow 名: {name!r}（只允许字母数字与 ._-）")
     for d in reversed(DIRS):  # 用户目录优先
         p = d / f"{name}.json"
-        if not p.is_file():
-            continue
-        data = _load_json(p)
-        steps = data.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise WorkflowError(f"workflow {name} 没有 steps")
-        if len(steps) > MAX_STEPS:
-            raise WorkflowError(f"workflow {name} 步骤过多（上限 {MAX_STEPS}）")
-        normalized = []
-        for i, step in enumerate(steps, 1):
-            prompt = step.get("prompt") if isinstance(step, dict) else None
-            if not isinstance(prompt, str) or not prompt.strip():
-                raise WorkflowError(f"workflow {name} 第 {i} 步缺少 prompt")
-            normalized.append({"name": str(step.get("name") or f"步骤 {i}"),
-                               "prompt": prompt.strip()})
-        return {"name": name, "description": data.get("description") or "",
-                "checks": _normalize_checks(name, data.get("checks")),
-                "steps": normalized}
+        if p.is_file():
+            return _load_definition(p)
     names = ", ".join(m["name"] for m in catalog()) or "（无）"
     raise WorkflowError(f"未找到 workflow: {name}（可用: {names}）")

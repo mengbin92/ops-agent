@@ -33,6 +33,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
+from email.errors import HeaderParseError
+from email.headerregistry import Address
 from email.message import EmailMessage
 from hashlib import sha256
 from pathlib import Path
@@ -204,11 +206,12 @@ def _validate_mail_addr(value, field: str) -> str:
     if len(value) > 320 or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f
                                for ch in value):
         raise NotifyError(f"{field} 不能包含空白或控制字符")
-    if value.count("@") != 1:
-        raise NotifyError(f"{field} 不是有效邮箱地址: {value}")
-    local, _, domain = value.partition("@")
-    if not local or not domain:
-        raise NotifyError(f"{field} 不是有效邮箱地址: {value}")
+    try:
+        addr = Address(addr_spec=value)
+    except (ValueError, HeaderParseError) as e:
+        raise NotifyError(f"{field} 不是有效邮箱地址") from e
+    if not addr.username or not addr.domain or addr.addr_spec != value:
+        raise NotifyError(f"{field} 不是有效邮箱地址")
     return value
 
 
@@ -530,6 +533,13 @@ def _read_notification(path: Path) -> dict | None:
     return data
 
 
+def get_notification(notification_id: str | None) -> dict | None:
+    if not isinstance(notification_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",
+                                                                notification_id):
+        return None
+    return _read_notification(_outbox_dir() / f"{notification_id}.json")
+
+
 def list_notifications(status: str | None = None, tail: int = 20) -> list[dict]:
     directory = _outbox_dir()
     if not directory.is_dir():
@@ -708,18 +718,24 @@ def _send_email(cfg: dict, notif: dict) -> tuple[int, str]:
     scope_ids = set(scope) if isinstance(scope, list) else None
     targets = [addr for addr in cfg["mail_to"]
                if scope_ids is None or ids[addr] in scope_ids]
-    message = EmailMessage()
-    message["Subject"] = notif.get("title") or "ops-agent 通知"
-    message["From"] = cfg["mail_from"]
-    message["To"] = ", ".join(targets)
-    message.set_content(notif.get("text") or "")
     timeout = cfg.get("timeout_seconds", DEFAULT_TIMEOUT)
     accepted = set(notif.get("smtp_accepted_recipient_ids") or [])
-    pending = [addr for addr in targets if ids[addr] not in accepted]
-    if not pending:
+    items, recoveries = notif.get("items") or [], notif.get("recoveries") or []
+    groups: dict[tuple[int, ...], list[str]] = {}
+    for addr in targets:
+        if ids[addr] in accepted:
+            continue
+        visible = tuple(i for i, recovery in enumerate(recoveries)
+                        if recovery.get("recipient_ids") is None
+                        or ids[addr] in recovery["recipient_ids"])
+        if items or visible or not recoveries:
+            groups.setdefault(visible, []).append(addr)
+    if not groups:
         # 这个范围里所有人都已接受过：没有要补发的人，成功收尾。
         notif["smtp_accepted_recipient_ids"] = sorted(accepted)
         return 250, "smtp accepted"
+    refused_count = 0
+    accepted_count = 0
     try:
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
@@ -735,19 +751,32 @@ def _send_email(cfg: dict, notif: dict) -> tuple[int, str]:
                     raise NotifyError("远程 SMTP 必须支持 STARTTLS（或使用 465 端口）")
             if cfg.get("smtp_username"):
                 server.login(cfg["smtp_username"], cfg["smtp_password"])
-            refused = server.send_message(message, to_addrs=pending) or {}
+            for visible, pending in groups.items():
+                content = notif if len(visible) == len(recoveries) else _compose(
+                    items, [recoveries[i] for i in visible], notif,
+                    _finite(notif.get("created"), time.time()))
+                message = EmailMessage()
+                message["Subject"] = content.get("title") or "ops-agent 通知"
+                message["From"] = cfg["mail_from"]
+                message["To"] = ", ".join(pending)
+                message.set_content(content.get("text") or "")
+                try:
+                    refused = server.send_message(message, to_addrs=pending) or {}
+                except smtplib.SMTPRecipientsRefused as e:
+                    refused = e.recipients
+                delivered = [ids[addr] for addr in pending if addr not in refused]
+                accepted.update(delivered)
+                notif["smtp_accepted_recipient_ids"] = sorted(accepted)
+                refused_count += len(refused)
+                accepted_count += len(delivered)
     except NotifyError:
         raise
     except (smtplib.SMTPException, OSError) as e:  # ssl.SSLError 也是 OSError
         # 对方错误里可能回显收件人/认证信息，统一由 _safe_error 兜底再落盘
         raise NotifyError(f"SMTP 发送失败: {type(e).__name__}: {e}") from e
-    # 已接受集合始终留在通知记录里：部分送达也是"有人真的收到了"，恢复消息
-    # 要按这个集合定向发送；发送失败的是谁也要能据此只补发未成功者。
-    accepted.update(ids[addr] for addr in pending if addr not in refused)
-    notif["smtp_accepted_recipient_ids"] = sorted(accepted)
-    if refused:
+    if refused_count:
         raise NotifyError(
-            f"SMTP 有 {len(refused)} 个收件人拒收（{len(pending) - len(refused)} 个已接受）："
+            f"SMTP 有 {refused_count} 个收件人拒收（{accepted_count} 个已接受）："
             "已标记失败，下次只补发未成功者")
     return 250, "smtp accepted"
 
@@ -878,8 +907,7 @@ def retry_pending(limit: int = 5, notif_id: str | None = None) -> list[dict]:
             # 纯恢复通知不同步：它只会缩小"原异常受众"，把还没收到恢复的人排除掉。
             anomaly_items = bool(notif.get("items"))
             if ok or (accepted_ids and anomaly_items):
-                _mark_notified(state, fps, now, notif["id"], delivered=ok,
-                               recipient_ids=accepted_ids if anomaly_items else [])
+                _mark_delivery(state, notif, now, accepted_ids, delivered=ok)
                 if ok:
                     recovered = [r["fingerprint"] for r in notif.get("recoveries") or []]
                     _mark_recovered(state, recovered, now)
@@ -1004,12 +1032,15 @@ def _recoverable(fp: str, signal: dict | None, rec: dict) -> bool:
         group = parts[1] if len(parts) > 1 else ""
         if target not in (signal.get("targets") or []):
             return False  # 本次根本没查这个目标（inspect --target web1 证明不了 db1）
+        groups = (signal.get("target_groups") or {}).get(target, signal.get("groups") or [])
+        if group and groups and group not in groups:
+            return False
+        status = (signal.get("check_statuses") or {}).get(fp[len("check:"):])
+        if status is not None:
+            return status == checks.OK
         target_complete = (signal.get("target_complete") or {}).get(target)
         if target_complete is not None:
             return target_complete is True
-        groups = signal.get("groups") or []
-        if group and groups and group not in groups:
-            return False  # 只跑了部分分组：没跑的组不能判恢复
         # 按目标判定：别的目标不可达不该拖住本目标的恢复
         verdict = (signal.get("target_verdicts") or {}).get(target)
         if verdict is not None:
@@ -1130,15 +1161,12 @@ def _plan(state: dict, current: dict, signal: dict | None, rec: dict,
         if (entry.get("pending_recovery") and not entry.get("needs_notify")
                 and cfg and _suppression_reason(cfg, "info", now) is None):
             notification_id = entry.get("notification_id")
-            if isinstance(notification_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}",
-                                                                 notification_id):
-                pending = _read_notification(_outbox_dir() / f"{notification_id}.json")
-                if pending and pending.get("status") == "failed" and any(
-                        item.get("fingerprint") == fp for item in pending.get("recoveries") or []):
-                    # 已进入持久发件箱：交给 retry_pending 的退避/次数上限，
-                    # 不能每轮健康检查另建通知把 attempts 重新清零。
-                    counts["suppressed"] += 1
-                    continue
+            pending = get_notification(notification_id)
+            if pending and pending.get("status") == "failed" and any(
+                    item.get("fingerprint") == fp for item in pending.get("recoveries") or []):
+                # 已进入持久发件箱：交给 retry_pending 的退避/次数上限。
+                counts["suppressed"] += 1
+                continue
         counts["recovered"] += 1
         audience = entry.get("delivered_recipient_ids")
         if _finite(entry.get("delivered_at", entry.get("notified_at")), None) is None \
@@ -1225,7 +1253,7 @@ def _compose(items: list, recoveries: list, rec: dict, now: float) -> dict:
             if listed >= ANOMALY_LIMIT:
                 truncated = True
                 break
-            lasted = _human_duration(now - (rec_item.get("first_seen") or now))
+            lasted = _human_duration(now - _finite(rec_item.get("first_seen"), now))
             line = (f"{listed + 1}. {rec_item['title']} 已恢复正常"
                     f"（此前持续约 {lasted}）")
             if used + len(line) > budget:
@@ -1367,6 +1395,15 @@ def _mark_notified(state: dict, fingerprints: list, now: float,
             entry["event_severity"] = entry.get("severity")
 
 
+def _mark_delivery(state: dict, notif: dict, now: float, accepted_ids: list,
+                   delivered: bool) -> None:
+    # 恢复项的受众来自原异常，混合消息本轮的新异常受众不能写回恢复项。
+    eligible = {item["fingerprint"] for item in notif.get("items") or []}
+    for fp in notif.get("fingerprints") or []:
+        _mark_notified(state, [fp], now, notif["id"], delivered,
+                       accepted_ids if fp in eligible else None)
+
+
 def _mark_recovered(state: dict, fingerprints: list, now: float) -> None:
     items = state.get("items") or {}
     for fp in fingerprints:
@@ -1408,7 +1445,8 @@ def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
     dirty = False
     fingerprints = [item["fingerprint"] for item in to_send] + \
                    [item["fingerprint"] for item in recoveries]
-    if not fingerprints:
+    if not fingerprints or (not cfg and result.get("error")):
+        # 配置故障是可恢复的，保留补发意图，等待配置修复和本次运行补处理。
         return dirty
     composed = _compose(to_send, recoveries, rec, now)
     reason = _suppression_reason(cfg, composed["severity"], now) if cfg else "unconfigured"
@@ -1441,9 +1479,7 @@ def _apply_delivery(state: dict, cfg: dict, to_send: list, recoveries: list,
             # 只有携带异常项的通知才用已接受集合更新"原异常受众"：纯恢复消息
             # 部分失败时若也并进去，会把它自己的受众反向缩小成"已收到恢复的人"。
             accepted_ids = notif.get("smtp_accepted_recipient_ids") or []
-            _mark_notified(state, fingerprints, now, notif["id"],
-                           delivered=notif["status"] == "sent",
-                           recipient_ids=accepted_ids if notif.get("items") else [])
+            _mark_delivery(state, notif, now, accepted_ids, delivered=notif["status"] == "sent")
             dirty = True
             delivered = notif["status"] == "sent"
         else:

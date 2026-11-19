@@ -4534,7 +4534,7 @@ def test_schedule_queue_survives_kill_and_failed_record_persists():
             it["next_run"] = time.time() - 1
         schedule._save(items)
         orig_exec = schedule._execute_run
-        schedule._execute_run = lambda entry, model: (_ for _ in ()).throw(RuntimeError("boom"))
+        schedule._execute_run = lambda entry, model, rec: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
             records = schedule.run_due()
         finally:

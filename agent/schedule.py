@@ -115,9 +115,13 @@ def _safe_save(items: list[dict], meta: dict | None = None) -> bool:
 def _meta_ts(meta: dict, key: str) -> float:
     """meta 里的时间戳：非数值一律按"没有心跳"处理，不让手工改坏的字段停摆巡检。"""
     value = meta.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if type(value) not in (int, float):
         return 0.0
-    return float(value)
+    try:
+        time.localtime(value)
+        return float(value)
+    except (OverflowError, ValueError, OSError):
+        return 0.0
 
 
 def _load_state() -> tuple[list[dict], dict]:
@@ -261,13 +265,13 @@ def _run_time(entry: dict) -> float:
     return value
 
 
-def _validate_schedule(entry: dict) -> None:
+def _validate_schedule(entry: dict, now: float) -> None:
     """时间配置可解析性检查（不改状态）。损坏条目由 run_due 停用。"""
     every, daily = entry.get("every_seconds"), entry.get("daily")
     if (every is not None) == (daily is not None):
         raise ScheduleError("every_seconds 与 daily 必须二选一")
     if every is not None:
-        _interval(every)
+        _next_run(entry, now)
     elif not isinstance(daily, str) or not DAILY_RE.fullmatch(daily):
         raise ScheduleError(f"daily 时间格式错误: {daily!r}")
 
@@ -535,8 +539,12 @@ def _read_run(path: Path) -> dict | None:
         return None
     for key in ("started_ts", "finished_ts"):
         value = rec.get(key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
-                                  or not math.isfinite(value)):
+        if value is not None and type(value) not in (int, float):
+            return None
+        try:
+            if value is not None and not math.isfinite(value):
+                return None
+        except OverflowError:
             return None
     return rec
 
@@ -602,7 +610,8 @@ def _update_entry_state(task_id: str, run_id: str, status: str,
                                 it["next_run"] = _next_run(it, now)
                             except ScheduleError:
                                 pass  # 损坏的时间留给 run_due 停用
-            meta["last_scan"] = now
+            if status != "interrupted":
+                meta["last_scan"] = now
             _safe_save(items, meta)
     except (ScheduleError, OSError):
         pass  # 注册表坏了/写不进去：运行记录仍在 runs/ 里，不影响本次结论
@@ -676,9 +685,14 @@ def format_runs(task_id: str | None = None, tail: int = 20,
         for path in dict.fromkeys(paths):
             line += f"\n    报告: {path}"
         if rec.get("notify_status"):
-            line += f"\n    通知: {rec.get('notification_id') or '-'} {rec['notify_status']}"
-            if rec.get("notify_error"):
+            nid = rec.get("notification_id")
+            notification = notify.get_notification(nid)
+            status = notification["status"] if notification else rec["notify_status"]
+            line += f"\n    通知: {nid or '-'} {status}"
+            if status == "failed":
                 line += "（opsagent notify retry 可重试）"
+            elif status == "error" and rec.get("notify_error"):
+                line += f"（{rec['notify_error']}）"
         lines.append(line)
     return "\n".join(lines)
 
@@ -852,7 +866,7 @@ def _begin_run(entry: dict, session_id: str | None) -> dict:
 
 def _finish_run(rec: dict, entry: dict, status: str, verdict=None, error=None,
                 attempts: int = 0, attempt_errors=None, result_text: str = "",
-                signal: dict | None = None) -> dict:
+                signal: dict | None = None, *, reanchor: bool = True) -> dict:
     rec["status"] = status
     rec["verdict"] = verdict
     # 先脱敏再截断：异常信息与模型复述都可能带凭据，落盘与内存里的记录都不留明文
@@ -891,7 +905,7 @@ def _finish_run(rec: dict, entry: dict, status: str, verdict=None, error=None,
                    status=status)
     if status == "missed":
         return rec  # 错过的执行不是任务的"上次运行"，不动 last_* / 不重排
-    _update_entry_state(entry["id"], rec["run_id"], status, verdict, reanchor=True)
+    _update_entry_state(entry["id"], rec["run_id"], status, verdict, reanchor=reanchor)
     return rec
 
 
@@ -952,14 +966,15 @@ def _load_run_signal(sessions: list[str]) -> tuple[dict | None, str | None]:
     return combined, latest
 
 
-def _execute_run(entry: dict, model: str | None) -> dict:
+def _execute_run(entry: dict, model: str | None, rec: dict | None = None) -> dict:
     """执行一次任务并写运行记录：开始记 running，结束落终态。
 
     每条尝试用独立会话；会话 id 在建好时就写进记录，这样即使 LLM 调用失败，
     也能按会话找回此前已跑完的规则检查摘要（通知不依赖模型是否活着）。
     """
     deadline = time.monotonic() + _task_timeout(entry)
-    rec = _begin_run(entry, None)
+    if rec is None:
+        rec = _begin_run(entry, None)
     try:
         return _execute_started_run(entry, model, rec, deadline)
     except Exception as e:  # noqa: BLE001 —— 准备/收尾也必须结束已经创建的 running 记录
@@ -1147,12 +1162,13 @@ def alert_heartbeat_if_stale() -> None:
         pass
 
 
-def _claim_due(task_id: str, now: float) -> dict | None:
+def _claim_due(task_id: str, now: float) -> tuple[dict, dict] | None:
     """执行前取任务：短锁内复核"仍在且启用、仍到期"，然后才推进 next_run。
 
     推进放在每个任务真正开始前，而不是扫描时一次性推进——否则中途被 kill 时，
     后面排队的任务 next_run 已被推到未来，既不会补跑也没有任何记录（静默漏检）。
     """
+    rec = None
     try:
         with _locked("schedules.mutex"):
             items, meta = _load_state()
@@ -1164,8 +1180,15 @@ def _claim_due(task_id: str, now: float) -> dict | None:
             target["next_run"] = _next_claimed_run(target, now)
             target["last_run"] = now
             meta["last_scan"] = now
+            # 先落运行记录。排期推进后进程若立即退出，下一轮仍能对此次执行对账。
+            rec = _begin_run(target, None)
             _save(items, meta)
-            return dict(target)
+            return target, rec
+    except OSError as e:
+        if rec is None:
+            raise
+        return target, _finish_run(rec, target, "failed",
+                                   error=f"无法推进任务排期：{e}", reanchor=False)
     except (TypeError, ValueError) as e:
         raise ScheduleError(f"任务 {task_id} 的排期损坏") from e
 
@@ -1302,7 +1325,7 @@ def run_due(model: str | None = None) -> list[dict]:
                 continue
             try:
                 anchor = _run_time(it)
-                _validate_schedule(it)  # 时间配置损坏的条目要停用，不能留着每轮跳过
+                _validate_schedule(it, now)  # 时间配置损坏的条目要停用，不能留着每轮跳过
                 if now < anchor:
                     continue
                 missed = _missed_count(it, anchor, since, now)
@@ -1323,15 +1346,20 @@ def run_due(model: str | None = None) -> list[dict]:
 
     for task_id, missed in planned:
         try:
-            entry = _claim_due(task_id, time.time())
+            claim = _claim_due(task_id, time.time())
         except (OSError, ScheduleError) as e:
             entry = next(it for it in items if it["id"] == task_id)
             rec = _record_synthetic_failed(entry, e)
             _notify_run(rec)
             records.append(rec)
             continue
-        if entry is None:  # 扫描后被暂停、删除或改期
+        if claim is None:  # 扫描后被暂停、删除或改期
             _safe_audit("schedule-skip", id=task_id, reason="扫描后不再到期或已暂停")
+            continue
+        entry, rec = claim
+        if rec["status"] == "failed":
+            _notify_run(rec)
+            records.append(rec)
             continue
         if missed:
             try:
@@ -1344,13 +1372,13 @@ def run_due(model: str | None = None) -> list[dict]:
                 _notify_run(missed_rec)
                 records.append(missed_rec)
         try:
-            rec = _execute_run(entry, model)
+            rec = _execute_run(entry, model, rec)
         except (OSError, ScheduleError) as e:
             _safe_audit("schedule-run-error", id=task_id, error=str(e))
-            rec = _record_synthetic_failed(entry, e)
+            rec = _finish_run(rec, entry, "failed", error=f"{type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001 —— 单任务异常不拖垮整轮巡检
             _safe_audit("schedule-run-crash", id=task_id, error=str(e))
-            rec = _record_synthetic_failed(entry, e)
+            rec = _finish_run(rec, entry, "failed", error=f"{type(e).__name__}: {e}")
         _safe_audit("schedule-run", id=task_id, run_id=rec.get("run_id"),
                     status=rec["status"], verdict=rec.get("verdict"),
                     attempts=rec.get("attempts"), error=rec.get("error"),
