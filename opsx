@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -46,7 +47,8 @@ def _print_execution(cmd: str, target: str | None = None,
     此时不该把上一条成功记录当成"本次结果"打出来。
     """
     import execution
-    record = execution.find_latest(cmd, target, since=since, pid=os.getpid(), kind="exec")
+    record = execution.find_latest(cmd, target, since=since, pid=os.getpid(), kind="exec",
+                                   thread_id=threading.get_ident())
     if record is None:
         return
     print(f"[opsx] execution_id: {record['id']}（{record['status']}；"
@@ -57,7 +59,7 @@ def _print_rollback_execution(snapshot_id: str, target: str | None = None,
                               since: float | None = None) -> None:
     import execution
     record = execution.find_latest(f"rollback {snapshot_id}", target, since=since,
-                                   pid=os.getpid(), kind="rollback")
+                                   pid=os.getpid(), kind="rollback", thread_id=threading.get_ident())
     if record is not None:
         print(f"[opsx] execution_id: {record['id']}（{record['status']}；"
               f"查看: opsx executions show {record['id']}）")
@@ -191,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
                 if _guarded_cli(command):
                     core.audit("hook", cmd=command, result="allow-guarded-cli")
                     return 0
+                if core.is_kubectl_diff(command) and "KUBECTL_EXTERNAL_DIFF" in os.environ:
+                    print("[opsx] 请通过 opsx exec 运行 kubectl diff，由执行入口清理差异命令环境。",
+                          file=sys.stderr)
+                    return 2
                 code, msg = core.check(command)
                 if code == 0 and core.classify(command)[0] != "R0":
                     # hook 无法持锁到外部 Bash 结束，也不能在预检时消耗审批。
@@ -400,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             try:
                 # 崩溃或中断可能留下半个 UTF-8 字符，仍须能查看此前的审计证据。
-                lines = f.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                lines = f.read_text(encoding="utf-8", errors="replace").strip().split("\n")
             except OSError as exc:
                 raise core.OpsxError(f"无法读取审计日志: {exc}") from exc
             for line in lines[-args.tail:] if args.tail else []:

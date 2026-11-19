@@ -95,7 +95,7 @@ def _fixed_target(name: str):
 def target_env(name: str) -> dict:
     """目标的实际主机指纹（审批绑定用）：host/user/port/identity/options 任一改动旧戳即失效。"""
     t = get_target(name)
-    ssh_argv(name)  # 复用字段校验：非法主机/端口/选项在发戳时就拒绝，而不是执行时
+    _target_ssh_argv(name, t)  # 非法主机/端口/选项在发戳时就拒绝
     return {"scope": "remote", "target": name, "host": str(t.get("host") or ""),
             "user": str(t.get("user") or ""), "port": t.get("port") or 22,
             "identity": str(t.get("identity") or ""),
@@ -140,7 +140,13 @@ def _str_field(t: dict, key: str) -> str:
 
 def ssh_argv(name: str, remote_cmd: str | None = None) -> list[str]:
     """目标名 → ssh 命令行。主机只能来自注册表，模型无法自行指定主机。"""
-    t = get_target(name)
+    argv = _target_ssh_argv(name, get_target(name))
+    if remote_cmd is not None:
+        argv.append(remote_cmd)
+    return argv
+
+
+def _target_ssh_argv(name: str, t: dict) -> list[str]:
     host = _str_field(t, "host")
     if not host:
         raise RemoteError(f"目标 {name} 缺 host 字段")
@@ -173,16 +179,18 @@ def ssh_argv(name: str, remote_cmd: str | None = None) -> list[str]:
         raise RemoteError(f"目标 {name} 的 options 各项须以 - 开头（或作为 -o 的参数）: {bare!r}")
     argv += opts
     argv.append(host)
-    if remote_cmd is not None:
-        argv.append(remote_cmd)
     return argv
 
 
 def _ssh(name: str, remote_cmd: str, stdin: bytes | None = None,
-         timeout: int = IO_TIMEOUT) -> subprocess.CompletedProcess:
+         timeout: int = IO_TIMEOUT, *, max_output_bytes: int | None = None) -> subprocess.CompletedProcess:
+    if core.is_kubectl_diff(remote_cmd):
+        remote_cmd = "unset KUBECTL_EXTERNAL_DIFF || exit $?\n" + remote_cmd
     argv = ssh_argv(name, remote_cmd)
     kw = {"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}
     try:
+        if max_output_bytes is not None:
+            return core.capture_read_output(argv, timeout, max_output_bytes, merge_stderr=False)
         return subprocess.run(argv, capture_output=True, timeout=timeout, **kw)
     except FileNotFoundError as e:
         raise RemoteError(f"找不到 ssh 客户端: {e}") from e
@@ -198,10 +206,10 @@ def _text(r: subprocess.CompletedProcess) -> str:
     return out + (("\n[stderr]\n" + err) if err.strip() else "")
 
 
-def run(name: str, cmd: str, timeout: int = IO_TIMEOUT) -> tuple[int, str]:
+def run(name: str, cmd: str, timeout: float = IO_TIMEOUT) -> tuple[int, str]:
     """执行远程命令，返回 (exit_code, 合并输出)。不做守门判断——调用方负责。"""
     try:
-        r = _ssh(name, cmd, timeout=timeout)
+        r = _ssh(name, cmd, timeout=timeout, max_output_bytes=core.READ_OUTPUT_LIMIT)
     except subprocess.TimeoutExpired:
         return 4, f"[opsx] 超时：远程命令超过 {timeout}s 未结束，SSH 已终止，远端状态需确认"
     return r.returncode, _text(r)
@@ -342,9 +350,11 @@ def _capture_cmd(name: str, cmd: str, label: str, d: Path, items: list,
     if code != 0:
         raise RemoteError(msg)
     try:
-        r = _ssh(name, cmd, timeout=timeout)
+        r = _ssh(name, cmd, timeout=timeout, max_output_bytes=core.READ_OUTPUT_LIMIT)
     except subprocess.TimeoutExpired as e:
         raise RemoteError(f"远程抓取状态超时: {cmd}") from e
+    except core.OpsxError as e:
+        raise RemoteError(str(e)) from e
     if r.returncode != 0:
         raise RemoteError(f"远程抓取状态失败({r.returncode}): {cmd}: {_text(r)[:300]}")
     fname = core._snapshot_output_name(label, items)
@@ -478,7 +488,8 @@ def _remote_read(name: str, path_str: str, timeout: int = IO_TIMEOUT) -> tuple[b
     """
     marker = "OPSX-EXISTS-" + os.urandom(8).hex()
     q = shlex.quote(path_str)
-    remote_cmd = (f"if [ -e {q} ]; then printf '{marker}\\n'; "
+    remote_cmd = (f"if [ -e {q} ] || [ -L {q} ]; then "
+                  f"[ -f {q} ] && [ ! -L {q} ] || exit 3; printf '{marker}\\n'; "
                   f"cat -- {q} || exit $?; "
                   f"printf '\\n{marker}-END\\n'; "
                   f"else printf '{marker}-MISSING\\n'; fi")
@@ -504,6 +515,16 @@ def _remote_read(name: str, path_str: str, timeout: int = IO_TIMEOUT) -> tuple[b
     raise RemoteError(f"远程文件状态无法判定: {path_str}")
 
 
+def _rollback_resolved_path(target: str, src: str, expected: str | None) -> str:
+    resolved = _target_resolved_path(target, src)
+    if expected and expected != resolved:
+        raise RemoteError(f"远程文件真实路径已改变: {src}，拒绝回滚")
+    hit = core.sensitive_snapshot_path(src) or core.sensitive_snapshot_path(resolved)
+    if hit:
+        raise RemoteError(f"远程回滚路径涉及敏感路径: {hit}")
+    return resolved
+
+
 def rollback_plan(snapshot_id: str) -> dict:
     """远程快照的回滚预览：经 SSH 读取目标机当前内容再比对。
 
@@ -511,7 +532,7 @@ def rollback_plan(snapshot_id: str) -> dict:
     拒绝改向、按真实路径复查敏感路径，最后才读取内容。等到真正回滚时才拒绝，
     秘密早就已经进了 diff 和工具输出——那是撤销不了的。
     """
-    d, meta = core.load_snapshot(snapshot_id)
+    _, meta = core.load_snapshot(snapshot_id)
     target = meta.get("target")
     if not target:
         return core.rollback_plan(snapshot_id)
@@ -519,12 +540,7 @@ def rollback_plan(snapshot_id: str) -> dict:
                 for item in meta["items"] if item["type"] == "file"}
 
     def read_state(src: str) -> tuple[bool, bytes]:
-        resolved = _target_resolved_path(target, src)
-        if expected.get(src) and expected[src] != resolved:
-            raise RemoteError(f"远程文件真实路径已改变: {src}，拒绝预览")
-        hit = core.sensitive_snapshot_path(resolved)
-        if hit:
-            raise RemoteError(f"远程文件真实路径是敏感路径，拒绝预览: {hit}")
+        resolved = _rollback_resolved_path(target, src, expected.get(src))
         return _remote_read(target, resolved)
 
     # _fixed_target 冻结注册表：环境校验、路径解析与读取用同一份目标配置。
@@ -691,11 +707,8 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
                 if code:
                     raise core.OpsxError(message)
             if file_items:
-                resolved_paths = {item["src"]: _target_resolved_path(target, item["src"])
-                                  for item in file_items}
-                for item in file_items:
-                    if item.get("resolved_path") and item["resolved_path"] != resolved_paths[item["src"]]:
-                        raise RemoteError(f"远程文件真实路径已改变: {item['src']}，拒绝回滚")
+                resolved_paths = {item["src"]: _rollback_resolved_path(
+                    target, item["src"], item.get("resolved_path")) for item in file_items}
                 backup_sid = core._rollback_backup(
                     snapshot_id, target, file_items,
                     lambda src: _remote_read(target, resolved_paths[src]),
@@ -711,7 +724,7 @@ def rollback(snapshot_id: str, confirm: bool = False) -> str:
                     continue
                 payload = (d / item["dest"]).read_bytes()
                 mode_arg, mode_note = _restore_mode(item)
-                script = _render_restore(item["src"], mode_arg, len(payload), item.get("resolved_path"))
+                script = _render_restore(item["src"], mode_arg, len(payload), resolved_paths[item["src"]])
                 try:
                     dispatched = True
                     r = _ssh(target, script, stdin=payload, timeout=IO_TIMEOUT)

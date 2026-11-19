@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -26,7 +27,7 @@ def _err(msg_id, code, message):
 
 
 def _send(resp):
-    sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+    sys.stdout.write(json.dumps(resp) + "\n")
     sys.stdout.flush()
 
 
@@ -92,7 +93,7 @@ TOOLS = [
             "uses": {"type": "integer", "default": 1,
                      "description": "该授权允许执行几次；默认 1 = 一次批准只生效一次"},
         },
-        "required": ["command"],
+        "required": ["command", "impact"],
     }),
     _tool("ops_revoke", "撤销审批戳（用户取消变更）", {
         "type": "object",
@@ -206,7 +207,7 @@ def call_tool(name, args):
         )
         import execution
         record = execution.find_latest(_require(args, "command"), since=started,
-                                       pid=os.getpid(), kind="exec")
+                                       pid=os.getpid(), kind="exec", thread_id=threading.get_ident())
         payload = {"exit_code": code, "snapshot_id": sid, "output": output[:4000]}
         if record is not None:
             payload["execution_id"] = record["id"]
@@ -244,7 +245,8 @@ def call_tool(name, args):
         except (core.OpsxError, remote.RemoteError) as e:
             error = e
         record = execution.find_latest(f"rollback {sid}", plan.get("target"),
-                                       since=started, pid=os.getpid(), kind="rollback")
+                                       since=started, pid=os.getpid(), kind="rollback",
+                                       thread_id=threading.get_ident())
         if error is not None:
             reference = (f"\nexecution_id={record['id']}（状态 {record['status']}；"
                          f"查看：opsx executions show {record['id']}）") if record else ""
@@ -264,7 +266,7 @@ def call_tool(name, args):
         if tail and path.exists():
             # 断行/半行容忍：崩溃瞬间的半条记录不能让审计查询本身变砖——
             # 与 opsx audit / usage.recent 同一策略（跳过坏行，证据尽量可读）。
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = path.read_text(encoding="utf-8", errors="replace").rstrip("\n").split("\n")
             for line in lines[-tail:]:
                 line = line.strip()
                 if not line:
@@ -315,8 +317,6 @@ def handle_message(msg):
             print(core.redact(traceback.format_exc()), file=sys.stderr)
             return _err(msg_id, -32603, core.redact(f"工具内部错误: {e}"))
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
-    if method is None:
-        return _err(msg_id, -32600, "缺少 method 字段")
     return _err(msg_id, -32601, f"未知方法: {method}")
 
 
@@ -327,7 +327,7 @@ def serve():
             continue
         try:
             msg = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             _send(_err(None, -32700, "Parse error"))
             continue
         try:

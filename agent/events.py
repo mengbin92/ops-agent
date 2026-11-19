@@ -101,14 +101,7 @@ def append(kind: str, **fields) -> bool:
             if fcntl is not None:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             _rotate_if_needed()
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a+", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                # 崩溃可能留下半行；补分隔符以免下一条事件与半行粘连后一起丢失。
-                size = os.fstat(handle.fileno()).st_size
-                if size and os.pread(handle.fileno(), 1, size - 1) != b"\n":
-                    handle.write("\n")
-                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            core._append_jsonl(path, core.redact_obj(rec))
         return True
     except OSError:
         return False
@@ -126,7 +119,7 @@ def tail(n: int = TAIL_DEFAULT, kind: str | None = None) -> list[dict]:
         # 轮转后的旧文件在前：tail 要能跨轮转继续往回看，否则历史会突然断档
         try:
             if candidate.is_file():
-                lines += candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines += candidate.read_text(encoding="utf-8", errors="replace").split("\n")
         except OSError:
             continue
     out = []

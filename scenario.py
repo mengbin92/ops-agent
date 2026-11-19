@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -76,11 +77,9 @@ def dirs() -> list[Path]:
 
 
 _PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
-# 替换后残留的单大括号占位符（{{...}} 模板大括号不会命中，见 substitute）
+# 单大括号占位符；{{...}} 模板大括号不会命中。
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([a-z][a-z0-9_]{0,30})\}(?!\})")
-# Go 模板控制 token（docker --format 是重灾区）：{{end}}/{{else}} 里内嵌字面
-# "{end}"/"{else}"，同名参数的逐 token 替换会把合法格式串改坏（substitute 按
-# "{key}" 子串替换，不认模板语义）。load() 直接拒绝这类参数名。
+# 历史场景契约保留的 Go 模板控制 token。
 RESERVED_PARAM_NAMES = frozenset({"if", "else", "end"})
 _DEFAULT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$"
 _PATH_PATTERN = r"^/[A-Za-z0-9._@+/-]{1,200}$"
@@ -152,9 +151,7 @@ def load(name: str) -> dict:
             raise ScenarioError(f"场景 {name} 的参数名非法: {key!r}")
         if key in RESERVED_PARAM_NAMES:
             raise ScenarioError(
-                "场景 %s 的参数名 %r 是保留名：Go 模板 {{%s}} 内嵌字面 {%s}，"
-                "参数替换会改坏 docker --format 这类命令，请改名（如 %s_1）"
-                % (name, key, key, key, key))
+                f"场景 {name} 的参数名 {key!r} 是 Go 模板保留名，请改名（如 {key}_1）")
         spec = spec or {}
         if not isinstance(spec, dict):
             raise ScenarioError(f"场景 {name} 的参数 {key} 的定义须为对象")
@@ -281,21 +278,12 @@ def _norm_checks(name: str, raw, what: str) -> list[dict]:
 
 
 def substitute(text: str, params: dict) -> str:
-    """单遍替换 {param} 占位符。
-
-    不用 str.format：docker 模板里合法地有大括号（{{.State.Status}}），format 会把
-    它们当占位符炸掉；逐 token 替换只认参数名。替换后若还剩 {xxx} 形态的 token，
-    说明场景里写了未定义的占位符——当配置错误报出来，而不是让带 "{typo}" 的命令
-    去撞守门。
-    """
-    out = text
-    for key in sorted(params, key=len, reverse=True):
-        out = out.replace("{" + key + "}", str(params[key]))
-    leftover = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(out)})
-    if leftover:
+    """仅替换原模板中的单大括号占位符，保留参数值和 Go 模板的大括号。"""
+    missing = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(text)} - params.keys())
+    if missing:
         raise ScenarioError("存在未定义的占位符: "
-                            + ", ".join("{" + t + "}" for t in leftover))
-    return out
+                            + ", ".join("{" + key + "}" for key in missing))
+    return _PLACEHOLDER_RE.sub(lambda match: str(params[match.group(1)]), text)
 
 
 def resolve_params(scen: dict, overrides: dict) -> dict:
@@ -346,26 +334,23 @@ def _evaluate(check: dict, output: str) -> tuple[bool, str]:
 def _probe(target: str | None, cmd: str, timeout: int = PROBE_TIMEOUT) -> tuple[int, str]:
     """跑一条只读探针。先过守门且必须 R0：探针命令借参数升级成写操作时，
     这里明确报"场景错误"而不是放行。"""
-    level, _ = core.classify(cmd)
-    if level != "R0":
-        return 126, f"[场景错误] 预检/后验命令不是只读（{level}）: {core.redact(cmd)}"
-    code, msg = core.check(cmd, target)
+    code, msg = core.check(cmd, target, read_only=True)
     if code != 0:
         return 126, f"[守门拒绝] {core.redact(str(msg))}"
     if target:
         try:
-            r = remote._ssh(target, cmd, timeout=timeout)
-        except (subprocess.TimeoutExpired, remote.RemoteError) as e:
+            r = remote._ssh(target, cmd, timeout=timeout, max_output_bytes=core.READ_OUTPUT_LIMIT)
+        except (subprocess.TimeoutExpired, core.OpsxError, remote.RemoteError) as e:
             return 124, core.redact(f"[探针失败] {type(e).__name__}: {e}")
         output = r.stdout.decode("utf-8", "replace")
         if r.stderr.strip():
             output += "\n[stderr]\n" + r.stderr.decode("utf-8", "replace")
         return r.returncode, output
     try:
-        r = core.run_shell(cmd, timeout=timeout)
+        r = core.run_shell(cmd, timeout=timeout, max_output_bytes=core.READ_OUTPUT_LIMIT)
     except subprocess.TimeoutExpired:
         return 124, f"[探针超时] {timeout}s 未结束"
-    except OSError as e:
+    except (OSError, core.OpsxError) as e:
         return 1, core.redact(f"[探针失败] {e}")
     output = r.stdout or ""
     if (r.stderr or "").strip():
@@ -525,7 +510,7 @@ def _run_scenario(scen: dict, resolved: dict, tgt: str | None,
 
     import execution
     record = execution.find_latest(exec_cmd, tgt, since=exec_started,
-                                   pid=os.getpid(), kind="exec")
+                                   pid=os.getpid(), thread_id=threading.get_ident(), kind="exec")
     exec_id = record["id"] if record is not None else None
     result["execution_id"] = exec_id
     if exec_id is not None:
@@ -707,6 +692,7 @@ def _rollback_scenario(record: dict, scen: dict | None, confirm: bool) -> dict:
         result_text = str(e)
     rollback_record = execution.find_latest(f"rollback {sid}", target,
                                             since=rb_started, pid=os.getpid(),
+                                            thread_id=threading.get_ident(),
                                             kind="rollback")
     result = {
         "scenario": record.get("scenario"), "execution_id": execution_id,
@@ -734,17 +720,14 @@ def _rollback_scenario(record: dict, scen: dict | None, confirm: bool) -> dict:
         else:
             try:
                 resolved = resolve_params(scen, raw_params)  # {} 合法：场景可以没有参数
+                _, result["verify"] = _run_checks(scen["postcheck"], resolved, target)
             except ScenarioError:
-                resolved = None
-            if resolved is None:
                 result["verify_note"] = ("（场景参数与当前定义不匹配，无法重跑后验，"
                                          "请按回滚输出人工确认）")
             else:
-                _, result["verify"] = _run_checks(scen["postcheck"], resolved, target)
                 result["verify_note"] = ("（重跑的是变更后验，仅作回滚后状态的证据，不判定；"
                                          "失败可能正是回滚生效的表现）")
-                if rollback_record is not None:
-                    _attach(rollback_record["id"], postcheck="evidence")
+                _attach(rollback_record["id"], postcheck="evidence")
 
     events.append("scenario-rolled-back", scenario=record.get("scenario"),
                   execution_id=execution_id,

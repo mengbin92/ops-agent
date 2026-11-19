@@ -1342,7 +1342,7 @@ def test_bash_tool_remote_readonly():
     from agent import tools as agent_tools
     _write_targets()
 
-    def fake_ssh(name, cmd, stdin=None, timeout=120):
+    def fake_ssh(name, cmd, stdin=None, timeout=120, **kwargs):
         return subprocess.CompletedProcess([], 0, stdout=b"load 0.10 0.20", stderr=b"")
 
     orig = remote._ssh
@@ -1490,7 +1490,7 @@ def test_remote_timeout_paths():
     _write_targets()
     core.approve("systemctl restart nginx", ttl_seconds=60, target="web1")
 
-    def timeout_ssh(name, cmd, stdin=None, timeout=120):
+    def timeout_ssh(name, cmd, stdin=None, timeout=120, **kwargs):
         raise subprocess.TimeoutExpired(cmd, timeout)
 
     orig = remote._ssh

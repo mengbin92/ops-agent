@@ -50,8 +50,9 @@ class AgentFixTests(unittest.TestCase):
         self.secrets = {
             "OPSAGENT_API_KEY": "opsagent-test-key-9f8e7d6c5b4a",
             "OPSAGENT_A2A_TOKEN": "A2A-tok-plain-value-112233445566",
+            "OPSAGENT_SMTP_PASSWORD": "fixture-smtp-value-112233445566",
         }
-        # 两个值都不匹配 core.redact 的正则（原样通过），测试因此只依赖
+        # 值均不匹配 core.redact 的正则（原样通过），测试因此只依赖
         # 环境剔除（1a）与逐值抹除（1b），不会被正则脱敏偶然救场
         for value in self.secrets.values():
             self.assertIn(value, core.redact(value))
@@ -74,7 +75,8 @@ class AgentFixTests(unittest.TestCase):
     def test_bash_child_env_drops_secrets_and_diff_var(self):
         captured = {}
 
-        def fake_shell(cmd, timeout, env=None):
+        def fake_shell(cmd, timeout, env=None, *, max_output_bytes=None):
+            self.assertEqual(max_output_bytes, core.READ_OUTPUT_LIMIT)
             captured[cmd] = env
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -84,12 +86,11 @@ class AgentFixTests(unittest.TestCase):
             tools.dispatch("bash", {"command": "kubectl diff -f /tmp/x.yaml"},
                            tools.ToolContext())
         for cmd, env in captured.items():
-            # 三个键对所有命令一律剔除：diff 外部执行器只可能被 kubectl diff
-            # 消费，无条件剔除更稳（识别漏一段就是任意命令执行）
-            self.assertNotIn("OPSAGENT_API_KEY", env, cmd)
-            self.assertNotIn("OPSAGENT_A2A_TOKEN", env, cmd)
+            for secret_name in self.secrets:
+                self.assertNotIn(secret_name, env, cmd)
             self.assertNotIn("KUBECTL_EXTERNAL_DIFF", env, cmd)
         self.assertIn("PATH", captured["env"])  # 其余环境原样传递
+        self.assertIn("kubectl diff -f /tmp/x.yaml", captured)
 
     # ---- fix 1b：dispatch 出口按已知配置值精确抹除 ----
 

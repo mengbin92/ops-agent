@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -194,7 +195,8 @@ def begin(kind: str, cmd: str, target: str | None = None, env: dict | None = Non
         "command_hash": core.cmd_hash(cmd),
         "target": target, "host": (env or {}).get("host"),
         "env": env or {}, "snapshot_id": snapshot_id,
-        "pid": os.getpid(), "started": core_iso(now), "started_ts": now,
+        "pid": os.getpid(), "thread_id": threading.get_ident(),
+        "started": core_iso(now), "started_ts": now,
         "finished": None, "finished_ts": None, "duration_s": None,
         "exit_code": None, "error": None, "output_preview": "",
         "resolved": None,
@@ -221,10 +223,12 @@ def get(execution_id: str, view: bool = True) -> dict | None:
 
 
 def update(execution_id: str, **fields) -> dict | None:
-    """就地更新字段（不改状态以外的语义）。记录不存在返回 None。"""
+    """就地更新字段；进入下一执行阶段须有可更新的 running 记录。"""
     with _locked():
         path = _path(execution_id)
         rec = _read(path) if path.is_file() else None
+        if "phase" in fields and (rec is None or rec["status"] != "running"):
+            raise core.OpsxError(f"无法更新执行记录 {execution_id} 的阶段：记录不可用或已结束")
         if rec is None:
             return None
         allowed = {"phase", "snapshot_id", "host", "env",
@@ -356,16 +360,18 @@ def list_records(tail: int = 20, target: str | None = None,
 
 
 def find_latest(cmd: str, target: str | None = None, *, since: float | None = None,
-                pid: int | None = None, kind: str | None = None) -> dict | None:
+                pid: int | None = None, kind: str | None = None,
+                thread_id: int | None = None) -> dict | None:
     """按「命令 + 目标」找最近一条执行记录（CLI 展示 execution_id 用）。
 
-    按调用进程与起点过滤：另一进程拿锁失败也会写更新的 aborted，不能串成它的 id。
+    按调用进程、线程与起点过滤：并发调用可能同时为同一条命令写记录。
     """
     digest = core.cmd_hash(cmd, target)
     for rec in list_records(tail=-1, target=target):
         if (rec.get("target") == target and rec.get("cmd_hash") == digest
                 and (since is None or rec["started_ts"] >= since)
                 and (pid is None or rec.get("pid") == pid)
+                and (thread_id is None or rec.get("thread_id") == thread_id)
                 and (kind is None or rec.get("kind") == kind)):
             return rec
     return None
@@ -451,18 +457,19 @@ def prune(keep: int = KEEP) -> None:
     d = _dir()
     if not d.is_dir():
         return
-    records = list_records(tail=-1)
-    if len(records) <= keep:
-        return
-    for rec in records[keep:]:
-        if rec.get("status") == "running":
-            continue  # 正在跑的记录被删掉，收尾时就找不到它，结果永久丢失
-        if rec.get("status") in OPEN_STATUSES and not rec.get("resolved"):
-            continue
-        try:
-            _path(rec["id"]).unlink()
-        except OSError:
-            pass
+    try:
+        with _locked():
+            records = [rec for entry in d.glob("*.json") if (rec := _read(entry)) is not None]
+            records.sort(key=lambda rec: rec["started_ts"], reverse=True)
+            for rec in records[keep:]:
+                if rec["status"] == "running" or (rec["status"] in OPEN_STATUSES and not rec["resolved"]):
+                    continue
+                try:
+                    _path(rec["id"]).unlink(missing_ok=True)
+                except OSError as e:
+                    core._safe_audit("execution-prune-failed", execution_id=rec["id"], error=str(e))
+    except OSError as e:
+        core._safe_audit("execution-prune-failed", error=str(e))
 
 
 def format_record(rec: dict) -> str:

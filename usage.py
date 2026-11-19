@@ -227,17 +227,13 @@ def record(model: str, prompt_tokens=None, completion_tokens=None,
                 for old_day in sorted(state["days"])[:-31]:
                     state["days"].pop(old_day, None)
             _save_state(state)
-            # 轮转必须在同一把锁内：daemon 与 CLI 同时"查大小→改名"会让第二个
-            # replace 提前覆盖 .jsonl.1，把上一代账单顶掉（数据丢失且无告警）。
-            # 追加留在锁外——O_APPEND 单条 write 原子即可。
+            # 轮转、检查行尾和追加在同一把锁内，跨进程也不会丢失记录。
             if path.exists() and path.stat().st_size > USAGE_ROTATE_BYTES:
                 try:
                     path.replace(path.with_suffix(".jsonl.1"))
                 except OSError:
                     pass
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            core._append_jsonl(path, rec)
     except Exception:  # noqa: BLE001 —— 记账旁路失败静默（审计无意义，重试浪费）
         pass
 
@@ -362,15 +358,17 @@ def recent(tail: int = 20) -> list[dict]:
         try:
             if candidate.exists():
                 lines += candidate.read_text(encoding="utf-8",
-                                             errors="replace").splitlines()
+                                             errors="replace").split("\n")
         except OSError:
             continue
     out = []
-    for line in lines[-tail:]:
+    for line in reversed(lines):
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(rec, dict):
             out.append(rec)
-    return out
+            if len(out) == tail:
+                break
+    return list(reversed(out))

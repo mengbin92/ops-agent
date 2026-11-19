@@ -366,13 +366,13 @@ def _exec(target, cmd: str, timeout: int) -> tuple:
     if target:
         try:
             return remote.run(target, cmd, timeout=timeout)
-        except remote.RemoteError as e:
+        except (core.OpsxError, remote.RemoteError) as e:
             return 125, f"[远程执行失败] {e}"
     try:
-        r = core.run_shell(cmd, timeout=timeout)
+        r = core.run_shell(cmd, timeout=timeout, max_output_bytes=core.READ_OUTPUT_LIMIT)
     except subprocess.TimeoutExpired:
         return 124, f"[超时] 命令超过 {timeout}s 未结束，已终止"
-    except OSError as e:
+    except (OSError, core.OpsxError) as e:
         return 125, f"[执行失败] {e}"
     out = r.stdout + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
     return r.returncode, out
@@ -404,7 +404,7 @@ def _probe(target, cmd: str, timeout: int, budget: dict | None = None) -> tuple:
             return 127, reason
         budget["left"] -= 1
     try:
-        code, msg = core.check(cmd, target=target)
+        code, msg = core.check(cmd, target=target, read_only=True)
     except (core.OpsxError, OSError) as e:  # OSError：审计/状态目录写不进去
         return 126, f"[守门失败] {e}"
     if code != 0:

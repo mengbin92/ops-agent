@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -36,7 +37,7 @@ SPILL_DIR = core.STATE_DIR / "outputs"
 SPILL_KEEP = 200        # 落盘输出保留份数，超出按时间删最旧
 READ_LIMIT = 2000       # read 默认返回行数
 # agent 自身的凭据环境变量：不进入任何子进程环境（R0 的 env/echo 会原样回显）
-SECRET_ENV_KEYS = ("OPSAGENT_API_KEY", "OPSAGENT_A2A_TOKEN")
+SECRET_ENV_KEYS = core.SECRET_ENV_KEYS
 
 
 class ToolContext:
@@ -138,16 +139,7 @@ def _cap(text: str, label: str) -> str:
 def _bash(args: dict, ctx: ToolContext) -> str:
     cmd = args["command"]
     target = args.get("target") or None
-    level, matched = core.classify(cmd)
-    if level != "R0":
-        # bash 只执行只读命令：写操作必须走 ops_exec（快照+审批戳+审计一体化），
-        # 防止带戳写命令绕过快照直接执行。
-        core.audit("bash-deny", cmd=cmd, level=level, target=target)
-        hit = f"（命中分段：{matched}）" if matched else ""
-        return (f"[opsx 拒绝] 该命令判定为 {level}{hit}，bash 仅执行只读命令。\n"
-                "写操作流程：向用户提交变更单（风险说明+回滚计划+目标）→ "
-                "ops_approve 询问确认并建戳 → ops_exec（可带快照参数）执行。")
-    code, msg = core.check(cmd, target=target)  # R0 直接放行（check 内会写审计）
+    code, msg = core.check(cmd, target=target, read_only=True)
     if code != 0:
         return f"[opsx 拒绝] {msg}"
     timeout = BASH_TIMEOUT
@@ -165,7 +157,8 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         # 无条件剔除更稳（diff 段的识别漏一条就是任意命令执行）。
         drop = set(SECRET_ENV_KEYS) | {"KUBECTL_EXTERNAL_DIFF"}
         child_env = {k: v for k, v in os.environ.items() if k not in drop}
-        r = core.run_shell(cmd, timeout=timeout, env=child_env)
+        r = core.run_shell(cmd, timeout=timeout, env=child_env,
+                           max_output_bytes=core.READ_OUTPUT_LIMIT)
     except subprocess.TimeoutExpired:
         return f"[超时] 命令超过 {timeout:g}s 未结束，已终止"
     out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))
@@ -375,7 +368,8 @@ def _ops_exec(args: dict, ctx: ToolContext) -> str:
     sid_text = f"snapshot_id={sid}（回滚：ops_rollback）" if sid else "无快照"
     where = f"目标 {target} " if target else "本机"
     import execution
-    record = execution.find_latest(cmd, target, since=started, pid=os.getpid(), kind="exec")
+    record = execution.find_latest(cmd, target, since=started, pid=os.getpid(),
+                                   thread_id=threading.get_ident(), kind="exec")
     exec_text = ""
     if record is not None:
         exec_text = f"；execution_id={record['id']}（状态 {record['status']}）"
@@ -425,7 +419,8 @@ def _ops_rollback(args: dict, ctx: ToolContext) -> str:
     if started is not None:
         import execution
         record = execution.find_latest(f"rollback {sid}", target, since=started,
-                                       pid=os.getpid(), kind="rollback")
+                                       pid=os.getpid(), thread_id=threading.get_ident(),
+                                       kind="rollback")
         if record is not None:
             result += (f"\nexecution_id={record['id']}（状态 {record['status']}；"
                        f"查看：opsx executions show {record['id']}）")
@@ -473,23 +468,29 @@ def _scenario_run(args: dict, ctx: ToolContext) -> str:
         exec_cmd = scenario.substitute(scen["exec"]["cmd"], resolved)
         tgt = scenario._exec_target(scen, target)
         env = core.resolve_env(exec_cmd, tgt)
+        level, _ = core.classify(exec_cmd)
+        snapshot_files = [scenario.substitute(path, resolved)
+                          for path in scen["exec"]["snapshot_files"]]
+        snapshot_cmds = [(scenario.substitute(spec["command"], resolved), spec["name"])
+                         for spec in scen["exec"]["snapshot_cmds"]]
+
+        def preview_check(stage, index, check):
+            cmd = scenario.substitute(check["cmd"], resolved)
+            expect = {key: check[key] for key in scenario.EXPECT_KEYS if key in check}
+            return f"{stage} {index}: {cmd}" + (
+                f"｜判定条件 {json.dumps(expect, ensure_ascii=False)}" if expect else "")
+
+        preview = [f"变更场景 {name}：{scen['description']}",
+                   f"目标: {tgt or '本机'}｜参数: {resolved or '无'}"]
+        preview += [preview_check("预检", i, c) for i, c in enumerate(scen["precheck"], 1)]
+        preview.append(f"执行: {exec_cmd}")
+        preview += [f"快照文件: {path}" for path in snapshot_files]
+        preview += [f"快照命令 {i}: {cmd}" + (f"（{label}）" if label else "")
+                    for i, (cmd, label) in enumerate(snapshot_cmds, 1)]
+        preview += [preview_check("后验", i, c) for i, c in enumerate(scen["postcheck"], 1)]
+        preview.append(f"风险级别: {level}｜执行环境: {core.format_env(env)}")
     except (scenario.ScenarioError, core.OpsxError, remote.RemoteError) as e:
         return f"[场景错误] {core.redact(str(e))}"
-    level, _ = core.classify(exec_cmd)
-
-    # 确认框必须给出完整命令与全部探针：人批准的是整条链路，不是"跑个场景"
-    preview = [f"变更场景 {name}：{scen['description']}",
-               f"目标: {tgt or '本机'}｜参数: {resolved or '无'}"]
-    preview += [f"预检 {i}: {scenario.substitute(c['cmd'], resolved)}"
-                for i, c in enumerate(scen["precheck"], 1)]
-    preview.append(f"执行: {exec_cmd}")
-    preview += [f"快照文件: {scenario.substitute(pp, resolved)}"
-                for pp in scen["exec"]["snapshot_files"]]
-    preview += [f"快照命令 {i}: {scenario.substitute(c['command'], resolved)}"
-                for i, c in enumerate(scen["exec"]["snapshot_cmds"], 1)]
-    preview += [f"后验 {i}: {scenario.substitute(c['cmd'], resolved)}"
-                for i, c in enumerate(scen["postcheck"], 1)]
-    preview.append(f"风险级别: {level}｜执行环境: {core.format_env(env)}")
     preview_text = "\n".join(preview)
 
     if not _can_confirm(ctx):
@@ -509,14 +510,16 @@ def _scenario_run(args: dict, ctx: ToolContext) -> str:
     if not isinstance(answer, str) or answer.strip().casefold() not in valid:
         core.audit("scenario-deny", scenario=name, cmd=exec_cmd, target=tgt)
         return "[opsx 拒绝] 用户未批准，未执行任何变更。"
-    if level != "R0":   # 只读执行命令没有也不需要审批戳
-        try:
-            core.approve(exec_cmd, target=tgt, env=env, force=(level == "R3"))
-        except core.OpsxError as e:
-            return f"[opsx 错误] 建审批戳失败（未执行任何变更）: {core.redact(str(e))}"
     try:
-        result = scenario.run(name, params, target=target, actor="agent")
-    except scenario.ScenarioError as e:
+        with remote._fixed_target(tgt) if tgt else nullcontext():
+            if core.env_identity(core.resolve_env(exec_cmd, tgt)) != core.env_identity(env):
+                return "[opsx 拒绝] 执行环境已变化，请重新核对并确认场景。"
+            if level != "R0":
+                core.approve(exec_cmd, target=tgt, env=env, force=(level == "R3"),
+                             snapshot_files=snapshot_files, snapshot_cmds=snapshot_cmds)
+            # 执行已经展示过的场景定义，避免确认期间磁盘上的定义发生变化。
+            result = scenario._run_scenario(scen, resolved, tgt, "agent", None)
+    except (core.OpsxError, remote.RemoteError) as e:
         return f"[场景错误] {core.redact(str(e))}"
     return scenario.format_result(result, with_suggestion=True)
 
@@ -1157,14 +1160,7 @@ def tool_schemas(ctx: ToolContext | None = None) -> list[dict]:
 
 def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     """工具出口统一脱敏：模型收到的工具结果与会话记录都不含明文密钥。"""
-    out = _dispatch(name, args, ctx)
-    # 正则脱敏之外，已知配置值按原文精确替换（同 llm.LLMError 的做法）：
-    # env/echo 的输出不呈密钥格式，逐值抹除才兜得住。
-    for key in SECRET_ENV_KEYS:
-        value = os.environ.get(key, "")
-        if len(value) > 4:
-            out = out.replace(value, core.REDACTED)
-    return core.redact(out)
+    return core.redact(_dispatch(name, args, ctx))
 
 
 def _dispatch(name: str, args: dict, ctx: ToolContext) -> str:

@@ -43,10 +43,10 @@ class ScenarioChecksReviewTests(unittest.TestCase):
             "postcheck": [{"cmd": "echo probe", "expect_not_contains": "unhealthy"}]})
         original = core.run_shell
 
-        def shell(cmd, timeout):
+        def shell(cmd, timeout, **kwargs):
             if cmd == "echo probe":
                 return subprocess.CompletedProcess(cmd, 0, output, "")
-            return original(cmd, timeout)
+            return original(cmd, timeout, **kwargs)
 
         with patch.object(core, "run_shell", side_effect=shell):
             result = scenario.run("long-probe")

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -44,6 +45,8 @@ class TargetBusy(OpsxError):
 # 只是降低外泄概率的启发式：不宣称能识别所有秘密（加密内容、二进制、自定义格式会漏）。
 
 REDACTED = "[已脱敏]"
+SECRET_ENV_KEYS = ("OPSAGENT_API_KEY", "OPSAGENT_A2A_TOKEN", "OPSAGENT_SMTP_PASSWORD")
+READ_OUTPUT_LIMIT = 32 * 1024 * 1024
 _PEM_KEY = re.compile(r"-----BEGIN[ A-Z0-9]*PRIVATE KEY-----.*?-----END[ A-Z0-9]*PRIVATE KEY-----",
                       re.S)
 _AUTH_HEADER = re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+")
@@ -111,6 +114,10 @@ def redact(text: str) -> str:
     """把常见凭据/私钥换成占位符；幂等，可重复用于同一段文本。"""
     if not isinstance(text, str) or not text:
         return text
+    for key in SECRET_ENV_KEYS:
+        secret = os.environ.get(key, "")
+        if len(secret) > 4:
+            text = text.replace(secret, REDACTED)
     text = _PEM_KEY.sub(REDACTED + " 私钥", text)
     text = _AUTH_HEADER.sub(r"\1" + REDACTED, text)
     text = _SECRET_KV.sub(
@@ -348,8 +355,8 @@ def _classify_ssh(cmd: str) -> str | None:
     if _has_shell_expansion(cmd):
         return "R2"  # 外层双引号先由本地 shell 展开，内层单引号不能保护它。
     inner = m[2]
-    if re.search(r"(?:^|[;&|\n])\s*env\b", inner):
-        return "R2"  # 远程环境可能带生产密钥，不进入只读白名单
+    if re.search(r"(?:^|[;&|\n])\s*env\b", inner) or is_kubectl_diff(inner):
+        return "R2"  # 裸 SSH 无法清理远程环境
     return classify(inner)[0]
 
 
@@ -513,7 +520,7 @@ def _has_write_marker(seg: str) -> bool:
     tee、find -exec/-delete、命令替换（`$(...)`/反引号，可在只读命令里藏任意写操作）。
     """
     try:
-        words = shlex.split(seg, comments=True)
+        words = shlex.split(_strip_comment(seg))
     except ValueError:
         return True  # 不能可靠解析的 shell 片段不作为只读放行。
     if words and words[0].startswith("KUBECONFIG="):
@@ -522,6 +529,9 @@ def _has_write_marker(seg: str) -> bool:
     if _has_option_expansion(seg, words):
         return True
     command = words[0] if words else ""
+    if (command == "kubectl" and len(words) > 1 and words[1] in _KUBECTL_DRY_RUN_VERBS
+            and not _kubectl_preview_dry_run(words[2:])):
+        return True
     syntax = _shell_syntax(seg)
     if command == "find" and re.search(
             r"-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)\b", parsed):
@@ -600,18 +610,29 @@ def _ensure_state_dir() -> None:
     os.chmod(STATE_DIR, 0o700)
 
 
+def _append_jsonl(path: Path, record: dict) -> None:
+    """Append under the log's writer lock, preserving entries after a torn write."""
+    line = json.dumps(record, ensure_ascii=False).encode("utf-8", "backslashreplace") + b"\n"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "ab") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        size = os.fstat(handle.fileno()).st_size
+        if size and os.pread(handle.fileno(), 1, size - 1) != b"\n":
+            handle.write(b"\n")
+        handle.write(line)
+
+
 def audit(event: str, **fields) -> None:
     _ensure_state_dir()
     path = STATE_DIR / "audit.jsonl"
     # 常规记录同样脱敏：审计留证据，不长期保存明文密钥/私钥。
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
-           **{k: redact_obj(v) for k, v in fields.items()}}
+           **redact_obj(fields)}
     with open(STATE_DIR / "audit.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if path.exists() and path.stat().st_size > AUDIT_ROTATE_BYTES:
             os.replace(path, STATE_DIR / "audit.jsonl.1")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _append_jsonl(path, rec)
 
 
 def _safe_audit(event: str, **fields) -> None:
@@ -671,6 +692,40 @@ _KUBECTL_FLAGS_WITH_VALUE = frozenset({
 })
 _KUBECTL_READ_VERBS = frozenset({"get", "describe", "logs", "top", "api-resources",
                                  "explain", "version", "cluster-info", "diff"})
+_KUBECTL_DRY_RUN_VERBS = frozenset({"apply", "create", "replace", "patch", "set",
+                                   "scale", "annotate", "label"})
+_KUBECTL_PREVIEW_BOOL_FLAGS = frozenset({"--allow-missing-template-keys", "--all",
+                                        "--force", "--force-conflicts", "--local",
+                                        "--overwrite", "--prune", "--record", "--recursive",
+                                        "--save-config", "--server-side", "-R"})
+
+
+def _kubectl_preview_dry_run(args: list[str]) -> bool:
+    dry_run = None
+    previous_unknown = False
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word == "--":
+            break
+        flag, sep, value = word.partition("=")
+        if flag == "--dry-run":
+            if previous_unknown or dry_run is not None:
+                return False
+            if not sep:
+                i += 1
+                value = args[i] if i < len(args) else ""
+            dry_run = value
+        elif word in _KUBECTL_FLAGS_WITH_VALUE:
+            i += 1
+        # An unfamiliar option may consume the following token as its value.
+        previous_unknown = (word.startswith("-") and not sep and flag != "--dry-run"
+                            and word not in _KUBECTL_FLAGS_WITH_VALUE
+                            and word not in _KUBECTL_PREVIEW_BOOL_FLAGS
+                            and not (not word.startswith("--") and len(word) > 2
+                                     and word[:2] in _KUBECTL_FLAGS_WITH_VALUE))
+        i += 1
+    return dry_run in {"server", "client", "true"}
 
 
 def _kubectl_read_only(seg: str) -> bool:
@@ -743,10 +798,7 @@ def k8s_scope(cmd: str) -> dict:
 
 
 def is_kubectl_diff(cmd: str) -> bool:
-    """命令是否含 kubectl diff 段。diff 被列进 R0 预演白名单，但它尊重
-    KUBECTL_EXTERNAL_DIFF 环境变量（可借此执行任意命令）：调用方须在执行前
-    剔除该变量，否则"只读预演"名不副实。命令行里的 `KUBECTL_EXTERNAL_DIFF=...`
-    赋值由锚定白名单（^kubectl）自然挡在 R0 之外。"""
+    """识别预演白名单的 kubectl diff 段，供执行入口清理 KUBECTL_EXTERNAL_DIFF。"""
     for seg in _segments(cmd or ""):
         s = _strip_comment(seg)
         s = re.sub(r"^KUBECONFIG=[^\s]+[ \t]+", "", s)
@@ -1119,7 +1171,8 @@ def check_stamp(cmd: str, target: str | None = None, env: dict | None = None) ->
 
 
 def consume_stamp(cmd: str, target: str | None = None,
-                  env: dict | None = None) -> int | None:
+                  env: dict | None = None, *, snapshot_files=None,
+                  snapshot_cmds=None) -> int | None:
     """原子地消耗一次审批，返回剩余次数；戳无效/已用完返回 None。
 
     必须由真正执行变更的路径调用（exec_change / remote.exec_change），且要在
@@ -1147,7 +1200,8 @@ def consume_stamp(cmd: str, target: str | None = None,
             if env is not None and env != current_env:
                 return None
             env = current_env
-            if not _stamp_valid(stamp, cmd, target, env):
+            if (not _stamp_valid(stamp, cmd, target, env)
+                    or _snapshot_declaration_error(stamp, snapshot_files, snapshot_cmds)):
                 return None
             uses, used = _stamp_uses(stamp)
             stamp["used"] = used + 1
@@ -1241,8 +1295,11 @@ def check_snapshot_declaration(cmd: str, target: str | None,
     执行侧少带/多带快照都意味着实际执行内容与批准内容不符。旧戳与 CLI 直批
     （戳里没有声明键）不做强校验。返回错误消息或 None。
     """
-    stamp = get_stamp(cmd, target)
-    if not stamp or "snapshot_files" not in stamp:
+    return _snapshot_declaration_error(get_stamp(cmd, target), snapshot_files, snapshot_cmds)
+
+
+def _snapshot_declaration_error(stamp, snapshot_files, snapshot_cmds) -> str | None:
+    if not stamp or not ("snapshot_files" in stamp or "snapshot_cmds" in stamp):
         return None
     want_files = sorted(str(f) for f in stamp.get("snapshot_files") or [])
     want_cmds = _norm_snap_cmds(stamp.get("snapshot_cmds"))
@@ -1312,7 +1369,8 @@ def stamp_env_mismatch(cmd: str, target: str | None = None,
         return False
 
 
-def check(cmd: str, target: str | None = None, env: dict | None = None) -> tuple[int, str]:
+def check(cmd: str, target: str | None = None, env: dict | None = None, *,
+          read_only: bool = False) -> tuple[int, str]:
     level, matched = classify(cmd)
     hit = sensitive_command(cmd, strict=bool(target))
     if hit:
@@ -1323,6 +1381,10 @@ def check(cmd: str, target: str | None = None, env: dict | None = None) -> tuple
     if level == "R0":
         audit("check", cmd=cmd, level=level, result="allow", target=target)
         return 0, "只读命令，放行"
+    if read_only:
+        audit("check", cmd=cmd, level=level, result="deny-nonread", target=target)
+        return 2, (f"此入口仅允许 R0 只读命令（判定为 {level}）。"
+                   "请先提交变更单，经确认后使用 ops_exec 或 opsx exec。")
     if check_stamp(cmd, target, env):
         audit("check", cmd=cmd, level=level, result="allow-stamp", target=target)
         return 0, "有效审批戳，放行"
@@ -1343,10 +1405,7 @@ def check(cmd: str, target: str | None = None, env: dict | None = None) -> tuple
 
 
 def check_snapshot_cmd(cmd: str, target: str | None = None) -> tuple[int, str]:
-    if classify(cmd)[0] != "R0":
-        _safe_audit("snapshot-deny", cmd=cmd, target=target, reason="抓取命令不是只读")
-        return 2, "[opsx] 快照抓取仅允许 R0 只读命令；变更请使用 opsx exec（审批、写锁与执行记录）。"
-    return check(cmd, target)
+    return check(cmd, target, read_only=True)
 
 
 def _new_snapshot_id() -> str:
@@ -1402,11 +1461,20 @@ def _snapshot_file_into(d: Path, path_str: str, items: list) -> None:
     })
 
 
-def run_shell(cmd: str, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
+def run_shell(cmd: str, timeout: float, env: dict | None = None, *,
+              max_output_bytes: int | None = None) -> subprocess.CompletedProcess:
     """超时终止整个进程组，避免 shell 退出后子进程继续变更。
 
-    env 缺省继承当前进程环境；仅用于剔除 R0 预演命令的危险变量
-    （如 kubectl diff 的 KUBECTL_EXTERNAL_DIFF），不改变命令语义。"""
+    env 缺省继承当前进程环境。kubectl diff 只使用内置差异命令。"""
+    if is_kubectl_diff(cmd):
+        env = dict(os.environ if env is None else env)
+        env.pop("KUBECTL_EXTERNAL_DIFF", None)
+    if max_output_bytes is not None:
+        result = capture_read_output(["/bin/sh", "-c", cmd], timeout, max_output_bytes,
+                                     env=env, merge_stderr=False)
+        return subprocess.CompletedProcess(cmd, result.returncode,
+                                           result.stdout.decode("utf-8", "replace"),
+                                           result.stderr.decode("utf-8", "replace"))
     with subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, encoding="utf-8", errors="replace", env=env,
                           start_new_session=True) as process:
@@ -1422,6 +1490,45 @@ def run_shell(cmd: str, timeout: int, env: dict | None = None) -> subprocess.Com
         return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
+def capture_read_output(argv: list[str], timeout: float, max_bytes: int, *,
+                        env: dict | None = None, merge_stderr: bool = True) -> subprocess.CompletedProcess:
+    """Collect stdout and stderr under a shared byte limit."""
+    deadline = time.monotonic() + timeout
+    stdout, stderr = bytearray(), bytearray()
+    size = 0
+    env = {key: value for key, value in (os.environ if env is None else env).items()
+           if key not in SECRET_ENV_KEYS}
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                          env=env, start_new_session=True) as process:
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, stdout)
+                if process.stderr is not None:
+                    selector.register(process.stderr, selectors.EVENT_READ, stderr)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not (ready := selector.select(remaining)):
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in ready:
+                        chunk = os.read(key.fd, min(65536, max_bytes + 1 - size))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise OpsxError(f"采集输出超过 {max_bytes} 字节上限；请缩小范围")
+                        key.data.extend(chunk)
+            code = process.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+    return subprocess.CompletedProcess(argv, code, bytes(stdout), bytes(stderr))
+
+
 def _snapshot_output_name(name: str, items: list) -> str:
     base = f"cmd-{(name or 'output').replace('/', '_')}"
     fname, number = base + ".txt", 2
@@ -1435,7 +1542,7 @@ def _snapshot_cmd_into(d: Path, cmd: str, name: str, items: list) -> None:
     code, msg = check_snapshot_cmd(cmd)
     if code != 0:
         raise OpsxError(msg)
-    r = run_shell(cmd, timeout=60)
+    r = run_shell(cmd, timeout=60, max_output_bytes=READ_OUTPUT_LIMIT)
     if r.returncode != 0:
         raise OpsxError(f"状态抓取命令失败({r.returncode}): {cmd}\n{r.stderr[:500]}")
     fname = _snapshot_output_name(name, items)
@@ -1514,7 +1621,8 @@ def load_snapshot(snapshot_id: str) -> tuple[Path, dict]:
                 raise ValueError("快照文件不存在或路径非法")
             (d / archived).resolve().relative_to(d.resolve())
             if item["type"] == "file":
-                if not isinstance(item["src"], str) or not item["src"].startswith("/") or "\x00" in item["src"]:
+                if (not isinstance(item["src"], str) or not item["src"].startswith("/")
+                        or "\x00" in item["src"] or ".." in Path(item["src"]).parts):
                     raise ValueError("源文件路径须为绝对路径")
                 if item.get("mode") is not None and (type(item["mode"]) is not int
                                                      or not 0 <= item["mode"] <= 0o7777):
@@ -1546,14 +1654,21 @@ def _local_restore_path(src: str) -> Path:
         raise OpsxError(f"无法确认本机文件父目录真实路径: {src}") from e
     if parent != path.parent:
         raise OpsxError(f"本机文件父目录真实路径已改变: {src}，拒绝回滚")
+    hit = sensitive_snapshot_path(src)
+    if hit:
+        raise OpsxError(f"本机回滚路径涉及敏感路径: {hit}")
     return path
 
 
 def _local_read_state(src: str) -> tuple[bool, bytes]:
     try:
         p = _local_restore_path(src)
-        if not p.is_file():
+        try:
+            info = p.stat()
+        except FileNotFoundError:
             return False, b""
+        if not stat.S_ISREG(info.st_mode):
+            raise OpsxError(f"本机回滚路径不是普通文件: {src}")
         return True, p.read_bytes()
     except OSError as e:
         raise OpsxError(f"回滚前读取当前文件失败 {src}: {e}") from e
@@ -1785,13 +1900,22 @@ def prune_snapshots(keep: int = 200) -> None:
         if rec["status"] == "running" or (rec["status"] == "unknown" and not rec.get("resolved")):
             if isinstance(rec.get("snapshot_id"), str):
                 protected.add(rec["snapshot_id"])
-    ids = sorted(p for p in d.iterdir() if p.is_dir() and not p.is_symlink())
+    try:
+        dirs = sorted(p for p in d.iterdir() if p.is_dir() and not p.is_symlink())
+    except OSError as e:
+        _safe_audit("snapshot-prune-failed", error=str(e))
+        return
+    ids = []
     backups = {}
-    for path in ids:
+    for path in dirs:
         try:
             meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            # 自动清理只处理已发布快照，缺少元数据的目录可能仍在写入。
+            if keep == 0:
+                ids.append(path)
             continue
+        ids.append(path)
         if isinstance(meta, dict) and isinstance(meta.get("rollback_of"), str):
             backups[path.name] = meta["rollback_of"]
     while True:
@@ -1802,8 +1926,14 @@ def prune_snapshots(keep: int = 200) -> None:
     for p in ids[:-keep] if keep else ids:
         if p.name in protected:
             continue
-        shutil.rmtree(p)
-        audit("prune", snapshot_id=p.name)
+        try:
+            shutil.rmtree(p)
+        except FileNotFoundError:
+            continue  # 可能已被另一个进程清理。
+        except OSError as e:
+            _safe_audit("snapshot-prune-failed", snapshot_id=p.name, error=str(e))
+            continue
+        _safe_audit("prune", snapshot_id=p.name)
 
 
 EXEC_TIMEOUT = 3600          # 变更命令默认最长 1 小时
@@ -1834,16 +1964,17 @@ def _check_pending_unknown(cmd: str, target: str | None = None,
         f"  opsx executions resolve {blocked['id']} --observed-ok|--observed-failed")
 
 
-def _prepare_exec(cmd: str, target: str | None = None) -> tuple[int, str]:
+def _prepare_exec(cmd: str, target: str | None = None,
+                  env: dict | None = None) -> tuple[int, str]:
     """执行前的统一门禁：守门 + 同目标同命令是否有未核实的 unknown。
 
     "不自动重放"落在这里：只要上一条执行还是 unknown（可能改了一半），就不放行
     同一条命令再跑一次。核实由人做（opsx executions resolve），不提供自动动作。
     """
-    code, msg = check(cmd, target)
+    code, msg = check(cmd, target, env)
     if code != 0:
         return code, msg
-    return _check_pending_unknown(cmd, target)
+    return _check_pending_unknown(cmd, target, env)
 
 
 def exec_change(
@@ -1870,8 +2001,8 @@ def exec_change(
     """
     import execution
     import remote  # 快照异常里要认 RemoteError；与 resolve_env 一样延迟导入避免成环
-    snapshot_files = snapshot_files or []
-    snapshot_cmds = snapshot_cmds or []
+    snapshot_files = list(snapshot_files or [])
+    snapshot_cmds = [(c, name) for c, name in (snapshot_cmds or [])]
     snap_file_into = transport.snap_file_into if transport else _snapshot_file_into
     snap_cmd_into = transport.snap_cmd_into if transport else _snapshot_cmd_into
     write_meta = transport.write_meta if transport else _write_meta
@@ -1901,20 +2032,20 @@ def exec_change(
         with target_lock(target, wait=lock_wait, actor=actor, execution_id=rec["id"]):
             env = resolve_env(cmd, target)
             execution.update(rec["id"], env=env, host=env.get("host"))
-            code, msg = check(cmd, target, env)  # 锁内重验：等锁期间审批可能过期/被撤销
+            code, msg = _prepare_exec(cmd, target, env)
             if code != 0:
-                _safe_audit("exec-abort", cmd=cmd, target=target, reason="等锁后审批失效")
+                _safe_audit("exec-abort", cmd=cmd, target=target, reason=msg)
                 execution.finish(rec["id"], "aborted", error=msg, phase="lock")
                 return code, None, msg
-            code, msg = _prepare_exec(cmd, target)  # 锁内再查一次 unknown：等锁期间可能新增
-            if code != 0:
-                execution.finish(rec["id"], "aborted", error=msg, phase="lock")
-                return code, None, msg
+            declared = check_snapshot_declaration(cmd, target, snapshot_files, snapshot_cmds)
+            if declared:
+                execution.finish(rec["id"], "aborted", error=declared, phase="lock")
+                return 2, None, declared
             if snapshot_files or snapshot_cmds:
-                execution.update(rec["id"], phase="snapshot")
                 sid, d = begin_snapshot()
                 items: list = []
                 try:
+                    execution.update(rec["id"], snapshot_id=sid, phase="snapshot")
                     for f in snapshot_files:
                         snap_file_into(d, f, items)
                     for c, name in snapshot_cmds:
@@ -1923,17 +2054,20 @@ def exec_change(
                 except (OpsxError, remote.RemoteError,
                         subprocess.SubprocessError, OSError) as e:
                     shutil.rmtree(d, ignore_errors=True)
+                    execution.update(rec["id"], snapshot_id=None)
                     output = redact(f"[opsx] {where}快照失败，已中止执行: {e}")
                     _safe_audit("exec-abort", cmd=cmd, target=target, reason=str(e))
                     execution.finish(rec["id"], "aborted", error=output, phase="snapshot")
                     return 3, None, output
-                execution.update(rec["id"], snapshot_id=sid, phase="authorize")
+            execution.update(rec["id"], phase="authorize")
             if classify(cmd)[0] != "R0":
                 # 只有需要审批的变更才消耗次数：R0 只读命令没有戳，也不该被要求有。
                 # 剩余次数只对审批路径有意义，consume_stamp 的审计里已留痕。
-                if consume_stamp(cmd, target, env) is None:
+                if consume_stamp(cmd, target, env, snapshot_files=snapshot_files,
+                                 snapshot_cmds=snapshot_cmds) is None:
                     # 审批在"确定要执行"的这一刻才消耗；已经失效就不该再跑
-                    output = redact("[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
+                    output = (check_snapshot_declaration(cmd, target, snapshot_files, snapshot_cmds)
+                              or "[opsx] 审批戳已失效或已用尽，已中止执行（未做任何变更）")
                     _safe_audit("exec-abort", cmd=cmd, target=target, snapshot_id=sid,
                                 reason="审批戳已失效")
                     execution.finish(rec["id"], "aborted", error=output, phase="exec")
