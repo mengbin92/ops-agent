@@ -45,9 +45,9 @@ export OPSAGENT_API_KEY=sk-...
 ./opsagent schedule list                  # 定时巡检任务（M5，详见下文）
 ```
 
-REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown 终端渲染**
-（标题/表格/代码块/列表上色对齐，纯 stdlib ANSI）；**语义配色**——确认框
-黄色醒目（R3/不可逆升级红色警示）、工具结果按内容定色（拒绝/错误红、
+REPL 通过 SSE 接收模型响应，每条助手消息完成校验和脱敏后做 **Markdown 终端渲染**
+（标题/表格/代码块/列表上色对齐，纯 stdlib ANSI）。工具执行与确认提示随流程显示。
+确认框黄色醒目（R3/不可逆升级红色警示），工具结果按内容定色（拒绝/错误红、
 成功绿、降级黄、常规暗），非 TTY 或设 `NO_COLOR` 自动禁色（macOS libedit
 下 `input()` 提示符自动无色，避免历史重绘残影；GNU readline 保留彩色）；
 `/resume` 恢复历史会话；
@@ -58,10 +58,12 @@ REPL 特性：**SSE 流式输出**，回复逐字到达并实时做 **Markdown �
 会话文件保留完整记录）。命令输出（`bash` / `ops_exec`）超过 3 万字符时完整内容
 落盘到 `~/.ops-agent/outputs/`（0600，保留 200 份），回复里给预览 + 文件路径，
 `read` 工具带 `offset`/`limit` 分段读取（大文件同理）。
+只读命令、快照命令、巡检探针和日志采集的输出上限为 32 MiB（stdout 与 stderr 合计）。
+超限会报告采集失败，可缩小日志时段或查询范围后重试。
 
 RPC 形态（stdio JSON-RPC，一行一条）：`prompt {text, stream?}` / `reset` / `ping`。
 `stream=true` 时边跑边推通知 `{"method":"event","params":{"kind":"delta","payload":"..."}}`
-（`delta` 文本增量、`tool` 工具调用/结果、`stream_end` 文本段收尾），最终结果不再重复
+（`delta` 为校验和脱敏后的助手消息、`tool` 为工具调用/结果、`stream_end` 为文本段收尾），最终结果不再重复
 `events`；不传 `stream` 则维持一次性返回 `{"text","events","session_id"}`。
 `ask_user` 用 `{"method":"ask_user","id":"srv-..."}` 反向请求，客户端把回答作为响应回传。
 
@@ -236,8 +238,8 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   任务结束后刷新），所以**任务自己跑得久或排队不会**被误记为停机错过。
 - **退出码**（`run --once`）：`0` 全部正常；`1` 有任务运行失败/超时，或启动时对账出中断；
   `2` 检查发现警告/异常；`3` 不完整/未判定/有错过，或本次因已有调度进程而未执行。
-- 执行前会在短锁内复核"仍在且启用、仍到期"再推进 `next_run`：暂停能取消已排队的执行；
-  中途被 kill 时，排队中的任务仍是到期状态，下一轮会补上（不会被静默跳过）。
+- 执行前在短锁内复核任务仍启用且已到期，先持久化运行记录，再推进 `next_run`。
+  暂停能取消排队中的执行。进程中断后，已领取的执行可对账，未领取的任务仍按到期时间处理。
 - 单条任务的记录/执行异常不会中断整轮：兜底失败记录同样落盘可查。
 - 已删除任务的 run 记录仍在，`schedule runs --id <前缀>` 可按前缀查到。
 - 工具触发的规则采集、摘要或完整报告保存失败时，程序将结论降为「不完整」（退出 3）；
@@ -258,8 +260,7 @@ pause / resume / remove）。每次执行写审计（`schedule-run`，含状态�
   最大超时 + 300s 计算；通知渠道显示脱敏后的 endpoint 与失败待发数。
 - **provider 临时错误退避**：429/408/5xx/网络瞬断在 `llm.chat` 内重试 2 次
   （指数退避 3s/6s + 抖动，封顶 30s），401/400 等永久错误绝不重试；
-  退避与单次超时都裁剪到任务 deadline 内，累计等待不突破任务预算；流式已输出内容后不重试
-  （防止重复推送文本）。
+  退避与单次超时按任务剩余预算设置。已接收到流式正文的请求断线后停止重试。
 - **usage/调用预算**：每次请求尝试先在锁内占用调用次数，失败和重试也计入，完成后记账
   （usage.jsonl + 按日聚合）；超限立即拒绝新的 LLM 调用
   （`BudgetExhausted`，跨天自动恢复），**确定性规则检查（inspect/场景/通知）不受影响**；
@@ -420,8 +421,8 @@ running ──exit=0────────────────────
 | `mail_from` / `mail_to` | 无 | 发件人与收件人（最多 20 个；邮箱地址不接受显示名/控制字符） |
 | `smtp_username` / `smtp_password` | 空 | SMTP 认证；密码也可用 `OPSAGENT_SMTP_PASSWORD` 提供 |
 
-- **恢复通知**只在"本次确实检查过该目标、且采集完整"时才发：只查 `web1` 的报告不会把
-  `db1` 的旧告警清成已恢复；采集不完整就保持沉默，不猜。
+- **恢复通知**依据同一目标和检查项的健康证据。分组巡检显式确认该项健康时也可发恢复。
+  缺少该项状态时，只有目标级采集证据完整才会确认恢复。邮件按各告警实际送达的收件人发送恢复信息。
 - 同一任务分批检查、失败重试会合并已采样的目标和分组，运行记录列出全部报告路径。
   规则异常或采集不完整不会被模型的"正常"结论覆盖；迟到的旧记录不会覆盖较新的观测。
 - **失败可查可重试**：发送失败落 `~/.ops-agent/notifications/<id>.json`（失败原因、HTTP/SMTP 状态、
@@ -654,13 +655,14 @@ agent/编排器调用，也能反向调用别人的 A2A agent。服务端基于�
 REPL / 单发 / RPC / MCP / 巡检 / 调度 / 通知仍保持零第三方依赖。
 
 ```bash
-python3 -m pip install -r requirements-a2a.txt   # 要求 Python >= 3.10
+python3 -m pip install -r requirements-a2a.txt   # 要求 Python >= 3.11
 ./opsagent a2a doctor                            # 依赖与环境自检
 
 # 服务端（只绑本机；非回环必须配 token，否则拒绝启动）
 export OPSAGENT_A2A_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
 ./opsagent a2a serve                                   # 127.0.0.1:8080
-./opsagent a2a serve --host 0.0.0.0 --port 8080        # 对外必须带 token
+# 对外发布示例，TLS 由反向代理终止
+./opsagent a2a serve --host 0.0.0.0 --port 8080 --public-url https://agent.example
 
 # 先看能力声明（公开，无需 token）
 ./opsagent a2a card
@@ -671,6 +673,9 @@ export OPSAGENT_A2A_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsa
 
 AgentCard 位于 `/.well-known/agent-card.json`，`skills` 直接从 `skills/` 目录生成，
 所以对方看到的能力清单，就是这台机器上真正能 `skill` 载入的 playbook。
+使用 Bearer 凭据时，客户端只向调用 URL 的同源接口发送凭据。通配监听时必须用
+`--public-url` 声明客户端实际访问的 URL。反向代理也使用该参数声明外部地址
+（可带路径前缀），并将 AgentCard 和 RPC 路径一起转发到服务端。
 
 ### 写操作怎么确认
 
@@ -696,6 +701,7 @@ A2A 没有终端确认框，但**不会因此放开写操作**。沿用同一条
 | 项 | 行为 |
 |---|---|
 | 监听地址 | 默认 `127.0.0.1`；`--host 0.0.0.0` 等非回环地址**未配 token 直接拒绝启动**（不是警告后继续跑） |
+| 发布地址 | `--public-url` 写入 AgentCard；通配监听必须指定，发布到非回环地址须配 token |
 | 鉴权 | RPC 端点强制 `Authorization: Bearer <token>`，定长比较；AgentCard 公开（仅能力声明，不含主机/凭据） |
 | 凭据 | token 只从 `OPSAGENT_A2A_TOKEN` 或 `--token` 读；写进命令行会留在 `ps` 与 shell 历史，建议用环境变量 |
 | 会话 | `context_id` → `a2a-<context_id>` 会话，同目录可 `/resume`；同一 context 串行，全局并发默认 2；常驻会话上限 200（LRU，正文仍在磁盘，正在执行的不会被淘汰） |

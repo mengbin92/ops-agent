@@ -96,7 +96,7 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"tag={tag}\nrevision={revision}\ntag_object={tag_object}\n")
-              output.write("prerelease=" + ("true" if "-" in tag else "false") + "\n")
+              output.write("prerelease=" + ("true" if "-" in tag.split("+", 1)[0] else "false") + "\n")
           print(f"Validated {tag} at {revision}")
           PY
 

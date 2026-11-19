@@ -2,7 +2,8 @@
 import os
 import tempfile
 
-os.environ["OPSX_STATE_DIR"] = tempfile.mkdtemp(prefix="opsx-test-")
+_state = tempfile.TemporaryDirectory(prefix="opsx-test-")
+os.environ["OPSX_STATE_DIR"] = _state.name
 
 from pathlib import Path  # noqa: E402
 import io  # noqa: E402
