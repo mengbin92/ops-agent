@@ -40,7 +40,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,6 +52,7 @@ TIMEOUT_DEFAULT = 600
 MAX_CONCURRENT_DEFAULT = 2
 MAX_INPUT_CHARS = 20_000     # 入口上限：超长消息直接拒绝，不把整本日志塞进上下文
 SEMAPHORE_WAIT = 30.0        # 等不到执行槽就明确报忙，而不是让调用方无限挂着
+SESSION_LOCK_POLL = 0.1      # 取消已排队的线程时及时交还全局执行槽
 MAX_SESSIONS = 200           # 常驻会话上限：Session 会缓存全部 messages，不设限就是内存泄漏
 MAX_PENDING = 256            # 待确认变更单上限：中断后一直没人续跑的 task 不能无限占内存
 
@@ -89,14 +90,10 @@ def _settle_pending(sess: sess_mod.Session, note: str) -> int:
     tool_calls，但 tool 结果还没写。不补的话，下一轮 run_turn 开头的 pending 逻辑会把它
     标成「可能已执行」，与我们实际没执行的事实相反，模型会去做无谓核实甚至重放。
     """
-    answered = {m.get("tool_call_id") for m in sess.messages if m.get("role") == "tool"}
-    pending = [call
-               for m in sess.messages if m.get("role") == "assistant"
-               for call in (m.get("tool_calls") or [])
-               if call.get("id") not in answered]
-    for call in pending:
-        sess.append({"role": "tool", "tool_call_id": call["id"],
-                     "name": call["function"]["name"], "content": note})
+    pending = loop.pending_tool_calls(sess.messages)
+    for call_id, name in pending.items():
+        sess.append({"role": "tool", "tool_call_id": call_id,
+                     "name": name, "content": note})
     return len(pending)
 
 
@@ -136,9 +133,11 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
             self._sem = asyncio.Semaphore(max_concurrent)
             self._sessions: "OrderedDict[str, sess_mod.Session]" = OrderedDict()
             self._locks: dict[str, threading.Lock] = {}
+            self._borrowed: Counter = Counter()
             # task（或会话）→ 上一轮展示给调用方的变更单身份，用于续跑时精确比对
             self._pending: "OrderedDict[str, tuple]" = OrderedDict()
-            self._guard = threading.Lock()
+            self._guard = threading.RLock()
+            self._active: dict[str, threading.Event] = {}
 
         # ---- 会话 ----------------------------------------------------
         def _session(self, context_id: str) -> sess_mod.Session:
@@ -151,10 +150,10 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                 sess = sess_mod.Session(session_id=sid)
                 self._sessions[sid] = sess
                 self._locks[sid] = threading.Lock()
-                self._evict_locked()
+                self._evict_locked(protected=sid)
                 return sess
 
-        def _evict_locked(self) -> None:
+        def _evict_locked(self, protected: str | None = None) -> None:
             """控制常驻会话数（调用方需已持有 self._guard）。
 
             只淘汰「当前没人持有锁」的会话：会话正文仍在磁盘，下次访问会重新加载，
@@ -163,6 +162,8 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
             """
             while len(self._sessions) > MAX_SESSIONS:
                 for sid in list(self._sessions):
+                    if sid == protected or self._borrowed[sid]:
+                        continue
                     lock = self._locks.get(sid)
                     if lock is None:
                         self._sessions.pop(sid, None)
@@ -195,12 +196,13 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
 
         # ---- 同步执行体（在线程里跑）----------------------------------
         def _run(self, sess, prompt: str, resuming: bool, answer: str,
-                 task_id: str | None = None) -> str:
+                 task_id: str | None = None, cancelled: threading.Event | None = None) -> str:
             answered = [False]
             # task_id 是协议给出的身份；进程内直调（测试/嵌入）时退回会话 id。
             slot = task_id or sess.id
 
             def ask_user(question: str) -> str:
+                loop.require_active(cancelled)
                 # 普通澄清问题一旦展示，之前那张变更单就不再是"当前待确认项"：
                 # 否则人对普通问题回的 yes 会被下一次重提请的旧变更当成批准。
                 self._forget_pending(slot)
@@ -216,12 +218,14 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                 比对的是结构化身份，不是问题文本——模型续跑时重建请求，只要改了
                 命令/目标/快照路径/次数/执行环境，key 就不相等，必须重新确认。
                 """
-                if (resuming and not answered[0]
-                        and self._get_pending(slot) == key):
-                    answered[0] = True
-                    self._forget_pending(slot)
-                    return answer
-                self._remember_pending(slot, key)
+                with self._guard:
+                    loop.require_active(cancelled)
+                    if (resuming and not answered[0]
+                            and self._get_pending(slot) == key):
+                        answered[0] = True
+                        self._forget_pending(slot)
+                        return answer
+                    self._remember_pending(slot, key)
                 raise NeedUserInput(question)
 
             ctx = tools.ToolContext(
@@ -230,7 +234,7 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
                 confirm=None if self.read_only else confirm,
                 allowed=tools.SCHEDULED_TOOLS if self.read_only else None,
                 model=self.model, session_id=sess.id,
-                deadline=time.monotonic() + self.timeout)
+                deadline=time.monotonic() + self.timeout, cancelled=cancelled)
 
             def on_event(kind, payload):
                 if kind == "tool" and isinstance(payload, dict):
@@ -247,33 +251,50 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
             self._forget_pending(slot)
             return out
 
-        def _locked_run(self, sess, prompt, resuming, answer,
-                        task_id: str | None = None) -> str:
+        def _locked_run(self, context_id, prompt, resuming, answer,
+                        task_id: str | None = None, cancelled: threading.Event | None = None) -> str:
             """同一 context 串行：并发 task 共用一个 Session 会把消息交错写坏。
 
             会话修补（settle）必须也在锁内：中断后锁已释放，若在锁外补写，
             同 context 的下一个任务可能同时读到「悬空 tool_call」并重复补写。
             """
-            sid = sess.id
+            loop.require_active(cancelled)
             with self._guard:
+                sess = self._session(context_id)
+                sid = sess.id
                 lock = self._locks[sid]
-            if not lock.acquire(timeout=self.timeout):
-                raise TimeoutError(
-                    f"该会话（{sid}）上一个任务仍在执行，排队超过 {self.timeout}s")
+                self._borrowed[sid] += 1  # 等待会话锁的线程也必须阻止驱逐。
             try:
-                if resuming:
-                    # 第 1 轮中断时已 settle；这里兜一次「进程重启后从磁盘恢复」的情况。
-                    settled = _settle_pending(sess, SETTLE_NOTE)
-                    if settled:
-                        _log(f"session={sid} settled {settled} dangling tool_call(s)")
+                deadline = time.monotonic() + self.timeout
+                while not lock.acquire(timeout=min(SESSION_LOCK_POLL,
+                                                   max(0, deadline - time.monotonic()))):
+                    loop.require_active(cancelled)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"该会话（{sid}）上一个任务仍在执行，排队超过 {self.timeout}s")
                 try:
-                    return self._run(sess, prompt, resuming, answer, task_id)
-                except NeedUserInput:
-                    # 中断点留下的悬空调用在锁内就地标记为「未执行」，再交还控制权。
-                    _settle_pending(sess, SETTLE_NOTE)
-                    raise
+                    loop.require_active(cancelled)
+                    if resuming:
+                        # 第 1 轮中断时已 settle；这里兜一次「进程重启后从磁盘恢复」的情况。
+                        settled = _settle_pending(sess, SETTLE_NOTE)
+                        if settled:
+                            _log(f"session={sid} settled {settled} dangling tool_call(s)")
+                    try:
+                        return self._run(sess, prompt, resuming, answer, task_id, cancelled)
+                    except NeedUserInput:
+                        _settle_pending(sess, SETTLE_NOTE)
+                        raise
+                    except loop.TurnCancelled:
+                        _settle_pending(sess, "[A2A] 任务已取消，该工具调用未执行。")
+                        raise
+                finally:
+                    lock.release()
             finally:
-                lock.release()
+                with self._guard:
+                    self._borrowed[sid] -= 1
+                    if not self._borrowed[sid]:
+                        del self._borrowed[sid]
+                    self._evict_locked()
 
         # ---- 协议入口 -------------------------------------------------
         async def _reject(self, event_queue, task_id, context_id, reason) -> None:
@@ -290,7 +311,7 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
             context_id = context.context_id or ""
             updater = s.TaskUpdater(event_queue, task_id, context_id)
 
-            if not _CONTEXT_RE.match(context_id) or not task_id:
+            if not _CONTEXT_RE.fullmatch(context_id) or not _CONTEXT_RE.fullmatch(task_id):
                 # task_id 缺失时生成一次性 id：固定占位符会让多次非法请求撞同一个 task。
                 await self._reject(event_queue, task_id or f"invalid-{uuid.uuid4().hex[:12]}",
                                    context_id or "invalid-context",
@@ -328,79 +349,107 @@ def build_executor(model: str | None = None, timeout: int = TIMEOUT_DEFAULT,
 
             resuming = (task is not None
                         and task.status.state == pb.TASK_STATE_INPUT_REQUIRED)
+            cancelled = threading.Event()
+            self._active[task_id] = cancelled
+            try:
+                await self._execute_task(context, event_queue, updater, text, resuming, cancelled)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                self._active.pop(task_id, None)
+
+        async def _execute_task(self, context, event_queue, updater, text, resuming, cancelled):
+            task_id, context_id = context.task_id, context.context_id
             _log(f"task={task_id} context={context_id} "
                  f"{'resume' if resuming else 'new'} chars={len(text)}")
 
-            if task is None:
+            if context.current_task is None:
                 # 协议要求：状态/产物事件之前必须已有 Task 入队。
                 await event_queue.enqueue_event(ph.new_task(
                     task_id=task_id, context_id=context_id,
                     state=pb.TASK_STATE_SUBMITTED,
                     history=[context.message] if context.message is not None else None))
+            if cancelled.is_set():
+                return
             await updater.start_work()
             prompt = _resume_prompt(text) if resuming else text
-
-            try:
-                sess = self._session(context_id)
-            except Exception as e:  # noqa: BLE001 —— 会话文件损坏等，落成 FAILED 而非悬挂
-                _log(f"task={task_id} session error: {e}")
-                await updater.failed(ph.new_text_message(
-                    core.redact(f"会话初始化失败：{e}"), task_id=task_id, context_id=context_id))
-                return
 
             try:
                 await asyncio.wait_for(self._sem.acquire(), timeout=SEMAPHORE_WAIT)
             except asyncio.TimeoutError:
                 # 背压：宁可明确报忙，也不让调用方在 WORKING 上无限等待。
-                await updater.failed(ph.new_text_message(
-                    f"服务繁忙：{SEMAPHORE_WAIT:.0f}s 内未获得执行槽，请稍后重试或降低并发。",
-                    task_id=task_id, context_id=context_id))
+                if not cancelled.is_set():
+                    await updater.failed(ph.new_text_message(
+                        f"服务繁忙：{SEMAPHORE_WAIT:.0f}s 内未获得执行槽，请稍后重试或降低并发。",
+                        task_id=task_id, context_id=context_id))
                 return
 
+            if cancelled.is_set():
+                self._sem.release()
+                return
+
+            def release_slot(worker):
+                self._sem.release()
+                if not worker.cancelled():
+                    worker.exception()  # 协议层先退出时，后台线程的异常仍需消化。
+
+            worker = asyncio.create_task(asyncio.to_thread(
+                self._locked_run, context_id, prompt, resuming, text, task_id, cancelled))
+            worker.add_done_callback(release_slot)
             try:
-                out = await asyncio.to_thread(
-                    self._locked_run, sess, prompt, resuming, text, task_id)
+                # 协议栈会取消协程；并发槽保留到线程真正退出。
+                out = await asyncio.shield(worker)
             except NeedUserInput as e:
+                if cancelled.is_set():
+                    return
                 question = core.redact(str(e.question or "需要人工确认"))
                 _log(f"task={task_id} -> INPUT_REQUIRED")
                 await updater.update_status(
                     pb.TASK_STATE_INPUT_REQUIRED,
                     ph.new_text_message(question, task_id=task_id, context_id=context_id))
                 return
+            except loop.TurnCancelled:
+                return
             except Exception as e:  # noqa: BLE001 —— 未预期异常必须落 FAILED，不能挂住
-                _log(f"task={task_id} crashed: {type(e).__name__}: {e}")
+                if cancelled.is_set():
+                    return
+                _log(core.redact(f"task={task_id} crashed: {type(e).__name__}: {e}"))
                 await updater.failed(ph.new_text_message(
                     core.redact(f"执行异常：{type(e).__name__}: {e}"),
                     task_id=task_id, context_id=context_id))
                 return
-            finally:
-                self._sem.release()
-
+            if cancelled.is_set():
+                return
             body = core.redact(out or "")
-            timed_out = loop.DEADLINE_MARK in body
+            incomplete = loop.DEADLINE_MARK in body or loop.MAX_TURNS_MARK in body
             await updater.add_artifact([ph.new_text_part(body)], name="reply")
-            if timed_out:
-                # 超时是「没做完」，不能报 completed——否则调用方会当成功处理。
+            if cancelled.is_set():
+                return
+            if incomplete:
                 await updater.failed(ph.new_text_message(
                     body[:2000], task_id=task_id, context_id=context_id))
             else:
                 await updater.complete(ph.new_text_message(
                     body[:2000], task_id=task_id, context_id=context_id))
-            _log(f"task={task_id} -> {'FAILED(timeout)' if timed_out else 'COMPLETED'}")
+            _log(f"task={task_id} -> {'FAILED(incomplete)' if incomplete else 'COMPLETED'}")
 
         async def cancel(self, context, event_queue) -> None:
             task_id = context.task_id or ""
             context_id = context.context_id or ""
             updater = s.TaskUpdater(event_queue, task_id, context_id)
             # 取消后这张变更单作废：即使调用方随后又带着答复回来，也不能沿用旧确认。
+            cancelled = self._active.get(task_id)
+            if cancelled is not None:
+                cancelled.set()
             if task_id:
                 self._forget_pending(task_id)
             _log(f"task={task_id} cancel requested")
             await updater.update_status(
                 pb.TASK_STATE_CANCELED,
                 ph.new_text_message(
-                    "已标记为取消。注意：已在执行的命令无法从运行中的线程中断，"
-                    "可能仍会在目标机上生效——请用执行记录核实实际状态。",
+                    "任务已取消，已开始的调用可能继续完成；后续调用已停止。"
+                    "如有变更正在执行，请用执行记录核实实际状态。",
                     task_id=task_id, context_id=context_id))
 
     return OpsAgentExecutor(model=model, timeout=timeout,

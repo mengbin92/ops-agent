@@ -53,13 +53,14 @@ class ToolContext:
     session_id：长目标按会话绑定；没有会话 id 时 goal 不可用。
     goal_continuation：只有 REPL 会跨轮续跑，-p/RPC/定时任务为 False。
     deadline：整任务时间预算（time.monotonic 秒），None = 不设限；到点不再启动后续调用。
+    cancelled：A2A 取消事件，已启动的调用退出后停止后续工作。
     evidence_errors：规则采集/摘要保存错误，由调度程序读取，不能由模型的正常结论覆盖。
     """
 
     def __init__(self, ask_user=None, allowed: set[str] | None = None,
                  model: str | None = None, session_id: str | None = None,
                  goal_continuation: bool = False, deadline: float | None = None,
-                 confirm=None):
+                 confirm=None, cancelled: threading.Event | None = None):
         self.ask_user = ask_user
         self.confirm = confirm
         self.allowed = allowed
@@ -67,6 +68,7 @@ class ToolContext:
         self.session_id = session_id
         self.goal_continuation = goal_continuation
         self.deadline = deadline
+        self.cancelled = cancelled
         self.evidence_errors: list[str] = []
 
 
@@ -545,7 +547,8 @@ def _run_isolated(task: str, ctx: ToolContext, system: str | None = None) -> str
     from . import loop  # 延迟导入：loop 依赖本模块
     sub_session = session_mod.Session()
     sub_ctx = ToolContext(ask_user=None, allowed=SUBAGENT_TOOLS, model=ctx.model,
-                          session_id=sub_session.id, deadline=ctx.deadline)
+                          session_id=sub_session.id, deadline=ctx.deadline,
+                          cancelled=ctx.cancelled)
     return loop.run_turn(task, sub_session, sub_ctx,
                          system=system or loop.SUBAGENT_PROMPT,
                          model=ctx.model, max_turns=SUBAGENT_MAX_TURNS)

@@ -25,7 +25,7 @@ class Response:
     """SSE 假响应：逐块产出 data: 行，块为异常实例时在流中抛出。"""
 
     def __init__(self, chunks=None):
-        self.chunks = chunks or []
+        self.chunks = iter(chunks or [])
 
     def __enter__(self):
         return self
@@ -33,11 +33,14 @@ class Response:
     def __exit__(self, *args):
         return False
 
-    def __iter__(self):
-        for chunk in self.chunks:
-            if isinstance(chunk, BaseException):
-                raise chunk
-            yield b"data: " + json.dumps(chunk).encode() + b"\n"
+    def readline(self, size=-1):
+        chunk = next(self.chunks, None)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        if chunk is None:
+            return b""
+        line = b"data: " + json.dumps(chunk).encode() + b"\n"
+        return line if size < 0 else line[:size]
 
 
 class AgentFixTests(unittest.TestCase):
@@ -198,12 +201,12 @@ class AgentFixTests(unittest.TestCase):
                                       "tool_calls": [["bad"]]}) + "\n", encoding="utf-8")
         self.assertEqual(session.list_sessions(), [])
 
-    # ---- fix 11：llm.chat 已流式输出后绝不重试 ----
+    # ---- fix 11：llm.chat 已收到流式正文后绝不重试 ----
 
     def test_chat_never_retries_after_streamed_output(self):
         usage.save_budget({"enabled": True, "daily_calls": 100, "daily_tokens": None})
         pieces = []
-        # 第一次尝试：转发了一个增量后连接被瞬断（可重试类错误）；
+        # 第一次尝试：收到一个增量后连接被瞬断（可重试类错误）；
         # 若护栏被移除，这里会发起第二次请求并成功 → 断言失败。
         chunks = [{"choices": [{"delta": {"content": "partial "}}]},
                   llm.LLMError("LLM API HTTP 429: transient")]
@@ -211,7 +214,7 @@ class AgentFixTests(unittest.TestCase):
                 mock.patch.object(llm.time, "sleep") as sleep:
             with self.assertRaises(llm.LLMError):
                 llm.chat([{"role": "user", "content": "hi"}], on_delta=pieces.append)
-        self.assertEqual(pieces, ["partial "])  # 增量确实已转发（护栏条件成立）
+        self.assertEqual(pieces, [])            # 未校验完成的正文不会转发
         self.assertEqual(post.call_count, 1)    # 只尝试了一次
         sleep.assert_not_called()               # 没有进入退避重试
 

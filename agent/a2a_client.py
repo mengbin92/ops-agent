@@ -71,8 +71,17 @@ async def _send_async(url: str, text: str, task_id: str | None,
                       timeout: int, proxy: str | None) -> dict:
     sym = client_symbols()
     pb = sdk().pb
-    headers = {"Authorization": f"Bearer {token}"} if token else None
-    kwargs = {"timeout": timeout, "headers": headers, "trust_env": False}
+    kwargs = {"timeout": timeout, "trust_env": False}
+    if token:
+        origin = sym.httpx.URL(url)
+
+        async def authorize(request):
+            route = request.url
+            if (route.scheme, route.netloc) != (origin.scheme, origin.netloc):
+                raise RuntimeError("AgentCard 公布了不同源的接口，不能向该接口转发认证凭据")
+            request.headers["Authorization"] = f"Bearer {token}"
+
+        kwargs["event_hooks"] = {"request": [authorize]}
     if proxy:
         kwargs.update(trust_env=True, proxy=proxy)
 
@@ -98,7 +107,7 @@ async def _send_async(url: str, text: str, task_id: str | None,
                               state=_state_name(task.status.state),
                               text=_task_text(task))
             elif resp.HasField("message"):
-                result["text"] = _text_parts(resp.message)
+                result.update(state="TASK_STATE_COMPLETED", text=_text_parts(resp.message))
             elif resp.HasField("status_update"):
                 upd = resp.status_update
                 result.update(task_id=upd.task_id, context_id=upd.context_id,
@@ -119,7 +128,11 @@ def send(url: str, text: str, task_id: str | None = None, context_id: str | None
     循环就改到新线程里起一个独立循环。
     """
     def _run():
-        return asyncio.run(_send_async(url, text, task_id, context_id, token, timeout, proxy))
+        async def run():
+            return await asyncio.wait_for(
+                _send_async(url, text, task_id, context_id, token, timeout, proxy),
+                timeout=timeout)
+        return asyncio.run(run())
 
     try:
         asyncio.get_running_loop()

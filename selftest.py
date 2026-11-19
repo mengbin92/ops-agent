@@ -949,42 +949,31 @@ def test_session_list_sessions():
     assert ids.index("test-list-0002") < ids.index("test-list-0001")
 
 
-def test_stream_printer_repaint(capsys=None):
-    import io
+def test_repl_renders_final_message_once():
+    from unittest.mock import patch
     from agent import repl
-    printer = repl.StreamPrinter()
-    buf = io.StringIO()
-    buf.isatty = lambda: True
-    import sys as _sys
-    orig = _sys.stdout
-    _sys.stdout = buf
-    try:
-        printer.feed("# 标题")
-        printer.feed("\n正文**加粗**")
-        printer.finish()
-    finally:
-        _sys.stdout = orig
-    out = buf.getvalue()
-    assert "\033[" in out  # 第二次重绘发了光标移动序列
-    assert out.count("标题") >= 2  # 增量重绘：旧内容被新内容覆盖打印
+    state = repl.ReplState(None)
+    text = "# 标题\n正文**加粗**"
+    with patch.object(repl, "_USE_COLOR", True), patch("sys.stdout", io.StringIO()) as out:
+        state.reply(text)
+        state.emit("stream_end", text)
+    rendered = out.getvalue()
+    assert "\033[" in rendered and "\033[1m加粗" in rendered
+    assert rendered.count("标题") == 1
+    assert state.last_reply == text
 
 
-def test_repl_plain_stream_and_no_color():
-    import io
+def test_repl_plain_output_respects_no_color():
     from unittest.mock import patch
     from agent import markdown, repl
     text = "# 标题\n正文**加粗**"
     assert "\033[" not in markdown.render(text, color=False)
-    buf = io.StringIO()
-    with patch("sys.stdout", buf):
-        printer = repl.StreamPrinter()
-        printer.feed("# 标题")
-        printer.feed("\n正文**加粗**")
-        assert printer.finish() == text
-    assert buf.getvalue() == text + "\n"
+    state = repl.ReplState(None)
     with patch.object(repl, "_USE_COLOR", False), patch("sys.stdout", io.StringIO()) as out:
-        repl.ReplState(None).emit("text", text)
-        assert "\033[" not in out.getvalue()
+        state.reply(text)
+        state.emit("text", "第二条消息")
+    assert out.getvalue() == "\n" + markdown.render(text, color=False) + "\n\n\n第二条消息\n\n"
+    assert state.last_reply == "第二条消息"
 
 
 def test_repl_resume_runs_goal_and_non_tty_has_no_approval_channel():
@@ -2691,31 +2680,15 @@ def test_echo_is_readonly():
 
 
 
-def test_stream_printer_overflow_appends_without_repaint():
-    """内容超过屏幕可重绘行数后不再整段重绘（否则同一内容被反复打印）。"""
-    import io
-    import os
-    import shutil
+def test_repl_long_message_has_no_repeated_lines():
+    from unittest.mock import patch
     from agent import repl
-    orig_size = shutil.get_terminal_size
-    shutil.get_terminal_size = lambda: os.terminal_size((80, 12))  # 12 行屏，可重绘 10 行
-    buf = io.StringIO()
-    import sys as _sys
-    orig_out = _sys.stdout
-    _sys.stdout = buf
-    try:
-        printer = repl.StreamPrinter()
-        for i in range(1, 31):
-            printer.feed(f"第{i}行内容\n")
-        text = printer.finish()
-    finally:
-        _sys.stdout = orig_out
-        shutil.get_terminal_size = orig_size
-    out = buf.getvalue()
-    # 溢出前最多重绘 ~10 次；若仍在整段重绘（bug）第 1 行会出现 30 次
-    assert out.count("第1行内容") <= 11, out.count("第1行内容")
-    assert out.count("第30行内容") == 1
-    assert "第1行内容" in text and "第30行内容" in text
+    text = "\n".join(f"第{i}行内容" for i in range(1, 31))
+    state = repl.ReplState(None)
+    with patch.object(repl, "_USE_COLOR", False), patch("sys.stdout", io.StringIO()) as out:
+        state.reply(text)
+    assert out.getvalue().strip().split("\n") == text.split("\n")
+    assert state.last_reply == text
 
 
 def test_memory_store_and_recall():
@@ -8524,11 +8497,11 @@ def test_usage_records_and_budget_blocks_llm():
         def __exit__(self, *a):
             return False
 
-        def read(self):
+        def read(self, size=-1):
             return json.dumps({"choices": [{"message": {"role": "assistant",
                                                         "content": "ok"}}],
                                "usage": {"prompt_tokens": 10,
-                                         "completion_tokens": 5}}).encode()
+                                         "completion_tokens": 5}}).encode()[:size if size >= 0 else None]
 
     orig_post = llm._post
     llm._post = lambda body, timeout: (calls.append(1), FakeResp())[1]
@@ -8569,11 +8542,11 @@ def test_llm_transient_backoff_and_permanent_no_retry():
         def __exit__(self, *a):
             return False
 
-        def read(self):
+        def read(self, size=-1):
             return json.dumps({"choices": [{"message": {"role": "assistant",
                                                         "content": "ok"}}],
                                "usage": {"prompt_tokens": 1,
-                                         "completion_tokens": 1}}).encode()
+                                         "completion_tokens": 1}}).encode()[:size if size >= 0 else None]
 
     def flaky(body, timeout):
         attempts["n"] += 1

@@ -11,10 +11,12 @@ AgentCard（`/.well-known/agent-card.json`）不强制鉴权：它只是能力�
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import SplitResult, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import core  # noqa: E402,F401  与 tools.py 同一约定
@@ -53,10 +55,34 @@ def is_loopback(host: str) -> bool:
     if host in ("localhost", "127.0.0.1", "::1"):
         return True
     try:
-        import ipaddress
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _wildcard_host(host: str) -> bool:
+    if host in ("", "*"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
+def _parse_public_url(value: str) -> SplitResult:
+    error = StartupRefused(
+        "--public-url 须为可访问的 HTTP(S) URL，可包含反代路径；"
+        "请填写明确主机，不要包含凭据、查询或片段。")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise error from None
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or _wildcard_host(parsed.hostname) or parsed.username is not None or port == 0
+            or any(ch.isspace() or ord(ch) < 32 or ch in "\\?#\x7f" for ch in value)):
+        raise error
+    return parsed
 
 
 def resolve_token(explicit: str | None = None) -> str:
@@ -91,7 +117,7 @@ def build_agent_card(base_url: str, streaming: bool = False):
         skills.append(pb.AgentSkill(
             id=name[:64],
             name=name[:64],
-            description=(str(item.get("description") or "").strip() or name)[:512],
+            description=core.redact(str(item.get("description") or "").strip() or name)[:512],
             tags=["ops"],
         ))
     modes = ["text/plain"]
@@ -111,14 +137,14 @@ def build_agent_card(base_url: str, streaming: bool = False):
     )
 
 
-def _bearer_from_scope(scope) -> str:
+def _bearer_from_scope(scope) -> bytes:
     for key, value in scope.get("headers") or []:
         if key.lower() == b"authorization":
-            raw = value.decode("latin-1").strip()
-            if raw[:7].lower() == "bearer ":
+            raw = value.strip()
+            if raw[:7].lower() == b"bearer ":
                 return raw[7:].strip()
-            return ""
-    return ""
+            return b""
+    return b""
 
 
 class BearerAuthMiddleware:
@@ -126,12 +152,12 @@ class BearerAuthMiddleware:
 
     def __init__(self, app, token: str):
         self.app = app
-        self.token = token
+        self.token = token.encode("utf-8")
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
-        if (scope.get("path") or "").startswith(CARD_PATH):
+        if scope.get("path") == CARD_PATH:
             return await self.app(scope, receive, send)
         supplied = _bearer_from_scope(scope)
         # 定长比较，避免按字节早退泄露 token 前缀。
@@ -160,7 +186,7 @@ def create_app(executor, card, token: str = ""):
 
 def serve(host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, token: str | None = None,
           model: str | None = None, timeout: int = 600, max_concurrent: int = 2,
-          read_only: bool = False) -> int:
+          read_only: bool = False, public_url: str | None = None) -> int:
     """启动服务。返回进程退出码（0 正常，2 配置不安全/依赖缺失）。
 
     read_only：按无人值守只读工具集运行（tools.SCHEDULED_TOOLS），写操作与状态修改
@@ -171,7 +197,14 @@ def serve(host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, token: str | None 
 
     tok = resolve_token(token)
     try:
+        if public_url is None and _wildcard_host(host):
+            raise StartupRefused(
+                f"通配监听地址 {host!r} 无法作为 AgentCard 接口地址。"
+                "请用 --public-url 指定客户端实际访问的 URL。")
+        published = _parse_public_url(public_url) if public_url is not None else None
         require_token(host, tok)
+        if published is not None and not is_loopback(published.hostname) and not tok:
+            raise StartupRefused(f"--public-url 发布到非回环地址时须设置 {TOKEN_ENV} 或 --token。")
     except StartupRefused as e:
         print(f"[a2a] {e}", file=sys.stderr)
         return 2
@@ -183,7 +216,7 @@ def serve(host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, token: str | None 
         executor = build_executor(model=model, timeout=timeout,
                                   max_concurrent=max_concurrent,
                                   read_only=read_only)
-        url = base_url(host, port)
+        url = published.geturl().rstrip("/") if published is not None else base_url(host, port)
         card = build_agent_card(url)
         app = create_app(executor, card, tok)
         import uvicorn

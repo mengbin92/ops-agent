@@ -41,6 +41,38 @@ class SecurityGateTests(unittest.TestCase):
             self.assertEqual(a2a_server.resolve_token(None), "")
             self.assertEqual(a2a_server.resolve_token("explicit-token"), "explicit-token")
 
+    def test_serve_advertises_public_url_without_changing_bind_address(self):
+        server = SimpleNamespace(run=mock.Mock())
+        with mock.patch.object(a2a_executor, "build_executor"), \
+                mock.patch.object(a2a_server, "build_agent_card") as card, \
+                mock.patch.object(a2a_server, "create_app"), \
+                mock.patch.dict(sys.modules, {"uvicorn": server}), \
+                redirect_stderr(StringIO()):
+            self.assertEqual(a2a_cli.cli([
+                "serve", "--host", "0.0.0.0", "--token", "fixture",
+                "--public-url", "https://agent.example/ops/",
+            ]), 0)
+        card.assert_called_once_with("https://agent.example/ops")
+        self.assertEqual(server.run.call_args.kwargs["host"], "0.0.0.0")
+        self.assertEqual(server.run.call_args.kwargs["port"], 8080)
+
+    def test_serve_rejects_unusable_public_urls_before_starting(self):
+        for url in (None, "https://0.0.0.0:443/", "https://user:fixture@agent.example/",
+                    "https://agent.example/?q=fixture", "https://agent.example:70000/",
+                    "https://agent.example/#fragment", "/ops"):
+            with self.subTest(url=url), redirect_stderr(StringIO()) as error, \
+                    mock.patch.object(a2a_executor, "build_executor") as create:
+                self.assertEqual(a2a_server.serve(host="::", token="fixture", public_url=url), 2)
+                self.assertIn("--public-url", error.getvalue())
+                create.assert_not_called()
+
+    def test_serve_requires_auth_when_local_bind_has_remote_public_url(self):
+        with mock.patch.dict(os.environ, {a2a_server.TOKEN_ENV: ""}), \
+                mock.patch.object(a2a_executor, "build_executor") as create, \
+                redirect_stderr(StringIO()):
+            self.assertEqual(a2a_server.serve(public_url="https://agent.example"), 2)
+        create.assert_not_called()
+
 
 class ContextValidationTests(unittest.TestCase):
     """context_id 会拼进会话文件名，必须在上游就挡住异常输入。"""

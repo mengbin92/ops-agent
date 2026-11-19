@@ -1,12 +1,11 @@
 """REPL 前端：交互式终端。
 
 命令：/new 新会话 · /resume 恢复历史会话 · /copy [all] 复制回复 · /quit 退出
-流式输出：SSE 增量到达时整段重绘（Markdown 实时渲染）。
+SSE 输出：每条助手消息组装、脱敏后以 Markdown 渲染。
 """
 from __future__ import annotations
 
 import datetime
-import math
 import os
 import shutil
 import subprocess
@@ -28,6 +27,7 @@ C_RESET = "\033[0m"
 
 
 def _c(color: str, text: str) -> str:
+    text = markdown.terminal_text(text)
     return f"{color}{text}{C_RESET}" if _USE_COLOR else text
 
 
@@ -115,6 +115,7 @@ def make_prompt(text: str, color: str = C_CYAN + C_BOLD) -> str:
 
 
 def _terminal_ask(question: str) -> str:
+    question = markdown.terminal_text(tools.core.redact(question))
     border, title = _ask_style(question)
     line = "─" * 40
     print()
@@ -141,81 +142,19 @@ def copy_to_clipboard(text: str) -> str:
     return "[复制失败] 未找到 pbcopy / wl-copy / xclip，请手动复制"
 
 
-class StreamPrinter:
-    """流式增量渲染：每次更新清除已打印区域并重绘完整文本。
-
-    内容超出屏幕可重绘行数后，光标最多只能回到屏幕顶（块起点已滚出屏幕），
-    继续整段重绘会把同一内容反复打印——此时停止重绘，只追加增量。
-    """
-
-    def __init__(self):
-        self._buf = ""
-        self._printed_rows = 0
-        self._overflow = False
-
-    @staticmethod
-    def _max_rows() -> int:
-        """可重绘的行数上限：留两行余量，避免顶到屏幕底。"""
-        return max(4, shutil.get_terminal_size().lines - 2)
-
-    @staticmethod
-    def _rows_of(text: str) -> int:
-        """估算终端占用行数（含自动换行；ANSI 不计宽度）。"""
-        width = max(shutil.get_terminal_size().columns, 20)
-        rows = 0
-        for line in text.split("\n"):
-            w = markdown._width(line)
-            rows += max(1, math.ceil(w / width)) if w else 1
-        return rows
-
-    def _repaint(self, rendered: str) -> None:
-        if self._printed_rows:
-            # 光标上移已打印行数并清到屏幕尾，再重绘
-            sys.stdout.write(f"\033[{self._printed_rows}A\033[J")
-        sys.stdout.write(rendered + "\n")
-        sys.stdout.flush()
-        self._printed_rows = self._rows_of(rendered)
-
-    def feed(self, delta: str) -> None:
-        self._buf += delta
-        if self._overflow or not sys.stdout.isatty():
-            sys.stdout.write(delta)
-            sys.stdout.flush()
-            return
-        # 每次增量只渲染一次，行数估算与重绘共用同一份结果
-        rendered = markdown.render(self._buf, color=_USE_COLOR)
-        if self._rows_of(rendered) > self._max_rows():
-            # 超出屏幕：旧块保持不动，之后只追加增量（尾部为未渲染原文）
-            self._overflow = True
-            sys.stdout.write(delta)
-            sys.stdout.flush()
-            return
-        self._repaint(rendered)
-
-    def finish(self) -> str:
-        if self._overflow or not sys.stdout.isatty():
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        else:
-            self._repaint(markdown.render(self._buf, color=_USE_COLOR))
-        text, self._buf, self._printed_rows, self._overflow = self._buf, "", 0, False
-        return text
-
-
 class ReplState:
     def __init__(self, model: str | None):
         self.model = model
         self.session = sess_mod.Session()
         self.last_reply = ""  # 原始 markdown，供 /copy 使用
-        self.printer = StreamPrinter()
+
+    def reply(self, text: str) -> None:
+        self.last_reply = text
+        print(f"\n{markdown.render(text, color=_USE_COLOR)}\n", flush=True)
 
     def emit(self, kind: str, payload) -> None:
         if kind == "text":
-            self.last_reply = payload
-            print(f"\n{markdown.render(payload, color=_USE_COLOR)}\n")
-        elif kind == "stream_end":
-            self.last_reply = payload
-            self.printer.finish()
+            self.reply(payload)
         elif kind == "tool":
             if payload["phase"] == "call":
                 args_preview = str(payload["args"])[:200]
@@ -237,9 +176,8 @@ def _continue_goal(state: "ReplState", ctx: tools.ToolContext) -> None:
         if not msg:
             return
         info("↻ 目标续跑中…")
-        state.printer = StreamPrinter()
         loop.run_turn(msg, state.session, ctx, on_event=state.emit,
-                      model=state.model, on_delta=state.printer.feed)
+                      model=state.model, on_delta=state.reply)
 
 
 def _pick_session() -> sess_mod.Session | None:
@@ -250,7 +188,8 @@ def _pick_session() -> sess_mod.Session | None:
         return None
     for i, s in enumerate(sessions[:20], 1):
         ts = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
-        print(f"  {_c(C_CYAN, str(i).rjust(2) + '.')} [{ts}] {s['id']}（{s['turns']} 轮）{s['preview']}")
+        detail = markdown.terminal_text(f"[{ts}] {s['id']}（{s['turns']} 轮）{s['preview']}")
+        print(f"  {_c(C_CYAN, str(i).rjust(2) + '.')} {detail}")
     try:
         choice = input(make_prompt("恢复哪个会话（编号，回车取消）> ", C_CYAN)).strip()
     except (EOFError, KeyboardInterrupt):
@@ -340,10 +279,9 @@ def main(model: str | None = None) -> int:
             else:
                 info("(暂无可复制的回复)")
             continue
-        state.printer = StreamPrinter()
         try:
             loop.run_turn(line, state.session, ctx, on_event=state.emit,
-                          model=state.model, on_delta=state.printer.feed)
+                          model=state.model, on_delta=state.reply)
             _continue_goal(state, ctx)
         except loop.llm.LLMError as e:
             error(f"[LLM 错误] {e}")

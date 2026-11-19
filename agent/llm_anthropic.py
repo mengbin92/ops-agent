@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 import os
 
-from .llm import (LLMError, _api_key, _request, _response_errors, _usage_tokens,
-                  _validate_message)
+from .llm import (LLMError, _api_key, _request, _response_errors, _response_json,
+                  _stream_lines, _usage_tokens, _validate_message)
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-sonnet-4-5"
@@ -150,7 +150,7 @@ def _chat_stream(body: dict, timeout: int, on_delta, usage_out=None) -> dict:
     finished = False
     raw_usage = {}
     with _request(_endpoint(), body, _headers(), timeout) as resp:
-        for raw in resp:
+        for raw in _stream_lines(resp):
             line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):  # event: / ping 等行跳过
                 continue
@@ -231,7 +231,7 @@ def chat_once(messages: list[dict], tools: list[dict] | None = None,
             msg = _chat_stream(body, timeout, on_delta, used_stream)
             return msg, used_stream.get("tokens")
         with _request(_endpoint(), body, _headers(), timeout) as resp:
-            data = json.loads(resp.read().decode())
+            data = _response_json(resp)
     msg = _message(data)
     raw_usage = data.get("usage") if isinstance(data, dict) else None
     return msg, _usage_tokens(raw_usage, "input_tokens", "output_tokens")

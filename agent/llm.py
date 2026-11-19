@@ -8,8 +8,7 @@
   OPSAGENT_MODEL      模型名，默认随 provider 而定
 
 chat(on_delta=None)  → 非流式，一次返回完整 message。
-chat(on_delta=fn)    → SSE 流式：每个 content 增量回调 fn(text)，
-                       tool_calls 增量在内部组装，返回完整 message。
+chat(on_delta=fn)    → SSE 采集：先组装并校验整条 message，再回调一次已脱敏正文。
 """
 from __future__ import annotations
 
@@ -31,6 +30,7 @@ import usage  # noqa: E402  # 顶层模块：预算与记账（与 agent 包平�
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 # provider 临时错误退避：429/5xx/网络瞬断重试，401/400 这类永久错误绝不重试
 TRANSIENT_RETRIES = 2
@@ -43,11 +43,7 @@ _HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
 class LLMError(Exception):
     def __init__(self, message):
         # 代理的错误正文可能原样回显密钥；已知配置值不依赖正则格式识别。
-        message = str(message)
-        key = os.environ.get("OPSAGENT_API_KEY", "")
-        if len(key) > 4:
-            message = message.replace(key, core.REDACTED)
-        super().__init__(core.redact(message))
+        super().__init__(core.redact(str(message)))
 
 
 class BudgetExhausted(LLMError):
@@ -126,7 +122,8 @@ def _request(url: str, body: dict, headers: dict, timeout: int):
                                      headers=headers, method="POST")
         return _open(req, timeout)
     except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
+        with e:
+            detail = core.redact(e.read(4096).decode(errors="replace"))[:500]
         raise LLMError(f"LLM API HTTP {e.code}: {detail}") from e
     except ValueError as e:
         raise LLMError(f"LLM API 配置无效: {e}") from e
@@ -139,6 +136,31 @@ def _post(body: dict, timeout: int):
     return _request(base + "/chat/completions", body,
                     {"Content-Type": "application/json",
                      "Authorization": f"Bearer {_api_key()}"}, timeout)
+
+
+def _response_json(response):
+    expected = getattr(response, "length", None)
+    if expected is not None and expected > MAX_RESPONSE_BYTES:
+        raise LLMError("LLM 响应超过大小上限")
+    data = response.read(expected if expected is not None else MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise LLMError("LLM 响应超过大小上限")
+    if expected is not None and len(data) < expected:
+        # HTTPResponse.read(n) can return a short body even with a declared Content-Length.
+        raise http.client.IncompleteRead(data, expected - len(data))
+    return json.loads(data.decode())
+
+
+def _stream_lines(response):
+    remaining = MAX_RESPONSE_BYTES
+    while True:
+        raw = response.readline(remaining + 1)
+        if not raw:
+            break
+        if len(raw) > remaining:
+            raise LLMError("LLM 流式响应超过大小上限")
+        remaining -= len(raw)
+        yield raw
 
 
 def _accumulate_tool_call(tools_acc: dict, delta: dict) -> None:
@@ -217,7 +239,7 @@ def _chat_stream(body: dict, timeout: int, on_delta, usage_out=None) -> dict:
     tools_acc: dict[int, dict] = {}
     finished = False
     with _post(body, timeout) as resp:
-        for raw in resp:
+        for raw in _stream_lines(resp):
             line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):
                 continue
@@ -283,7 +305,7 @@ def _chat_once(messages: list[dict], tools: list[dict] | None, model: str | None
             msg = _chat_stream(body, timeout, on_delta, used_stream)
             return msg, used_stream.get("tokens")
         with _post(body, timeout) as resp:
-            data = json.loads(resp.read().decode())
+            data = _response_json(resp)
     try:
         choice = data["choices"][0]
         if choice.get("finish_reason") in {"length", "content_filter"}:
@@ -304,12 +326,12 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
     → 每次尝试记账。deadline（monotonic 秒）是任务级时间预算：单次尝试的超时与
     退避都会裁剪到剩余时间内，累计等待不会突破任务预算。
     """
-    # 流式：第一次尝试可能已把半段内容推给用户，已发过内容后绝不重试（防重复输出）
-    emitted = {"any": False}
+    # 已收到正文的请求即使断线也不重试；正文完整校验脱敏前不发给前端。
+    received_content = False
 
     def tracked_delta(piece):
-        emitted["any"] = True
-        on_delta(piece)
+        nonlocal received_content
+        received_content = True
 
     cb = tracked_delta if on_delta is not None else None
     attempt = 0
@@ -337,7 +359,7 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
             prompt, completion = usage.estimate_tokens(messages, "", tools)
             usage.record(actual_model, prompt, completion, estimated=True,
                          reserved_day=reserved_day, failed=True)
-            if attempt >= TRANSIENT_RETRIES or not is_transient(e) or emitted["any"]:
+            if attempt >= TRANSIENT_RETRIES or not is_transient(e) or received_content:
                 raise
             delay = _backoff(attempt)
             if deadline is not None:
@@ -354,4 +376,6 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
                          reserved_day=reserved_day)
         else:
             usage.record(actual_model, used[0], used[1], reserved_day=reserved_day)
+        if on_delta is not None and msg.get("content"):
+            on_delta(core.redact(msg["content"]))
         return msg

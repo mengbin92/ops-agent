@@ -22,7 +22,7 @@ from agent import llm, llm_anthropic
 class Response:
     def __init__(self, data=None, chunks=None):
         self.data = data
-        self.chunks = chunks or []
+        self.chunks = iter(chunks or [])
         self.status = 200
 
     def __enter__(self):
@@ -31,14 +31,18 @@ class Response:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return json.dumps(self.data).encode()
+    def read(self, size=-1):
+        data = json.dumps(self.data).encode()
+        return data if size < 0 else data[:size]
 
-    def __iter__(self):
-        for chunk in self.chunks:
-            if isinstance(chunk, BaseException):
-                raise chunk
-            yield b'data: ' + json.dumps(chunk).encode() + b'\n'
+    def readline(self, size=-1):
+        chunk = next(self.chunks, None)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        if chunk is None:
+            return b""
+        line = b'data: ' + json.dumps(chunk).encode() + b'\n'
+        return line if size < 0 else line[:size]
 
 
 def message_response(usage_data=None):
@@ -141,7 +145,7 @@ class ReliabilityReviewTests(unittest.TestCase):
                 mock.patch.object(llm.time, "sleep") as sleep:
             with self.assertRaises(llm.LLMError):
                 llm.chat([{"role": "user", "content": "hi"}], on_delta=output.append)
-        self.assertEqual(output, ["first"])
+        self.assertEqual(output, [])
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
 

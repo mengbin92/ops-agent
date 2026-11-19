@@ -10,6 +10,7 @@ import argparse
 import sys
 
 from .a2a_sdk import A2AUnavailable, available
+from .markdown import terminal_text
 
 EXIT_UNAVAILABLE = 2
 EXIT_FAIL = 1  # 本地常量：异常分支不能引用仅在 call 分支里 import 的 a2a_client
@@ -25,6 +26,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--host", default="127.0.0.1",
                    help="监听地址（默认 127.0.0.1；非回环必须配 token）")
     s.add_argument("--port", type=int, default=8080)
+    s.add_argument("--public-url", help="AgentCard 公布的访问 URL（通配监听时必填）")
     s.add_argument("--token", default=None,
                    help=f"Bearer token（建议改用环境变量 OPSAGENT_A2A_TOKEN）")
     s.add_argument("--model", default=None, help="覆盖默认模型")
@@ -98,36 +100,36 @@ def cli(argv: list[str]) -> int:
             return a2a_server.serve(host=args.host, port=args.port, token=args.token,
                                     model=args.model, timeout=args.timeout,
                                     max_concurrent=args.max_concurrent,
-                                    read_only=args.read_only)
+                                    read_only=args.read_only, public_url=args.public_url)
 
         # call
         from . import a2a_client
         result = a2a_client.send(args.url, args.text, task_id=args.task_id,
                                  context_id=args.context_id, token=args.token,
                                  timeout=args.timeout, proxy=args.proxy)
-        print(a2a_client.format_result(result))
-        if not result["needs_input"]:
-            return a2a_client.EXIT_OK if "COMPLETED" in result["state"] else a2a_client.EXIT_FAIL
-        # 需要人工确认：TTY 下就地续跑，非 TTY 交给调用方脚本决定（带 --task-id 重入）
-        if not sys.stdin.isatty():
-            print("\n[需要确认] 非交互环境不会自动批准。"
-                  f"核对上面的变更单后重跑：\n"
-                  f"  opsagent a2a call {args.url} '<答复>' --task-id {result['task_id']}",
-                  file=sys.stderr)
-            return a2a_client.EXIT_NEEDS_INPUT
-        try:
-            answer = input("\n答复（批准请输入「确认执行」或 yes，其它回答均视为拒绝）> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已取消（未发送答复）。", file=sys.stderr)
-            return a2a_client.EXIT_NEEDS_INPUT
-        if not answer:
-            print("空答复，未发送。", file=sys.stderr)
-            return a2a_client.EXIT_NEEDS_INPUT
-        final = a2a_client.send(args.url, answer, task_id=result["task_id"],
-                                context_id=result["context_id"], token=args.token,
-                                timeout=args.timeout, proxy=args.proxy)
-        print(a2a_client.format_result(final))
-        return a2a_client.EXIT_OK if "COMPLETED" in final["state"] else a2a_client.EXIT_FAIL
+        print(terminal_text(a2a_client.format_result(result)))
+        while result["needs_input"]:
+            if not sys.stdin.isatty():
+                print("\n[需要确认] 非交互环境不会自动批准。"
+                      f"核对上面的变更单后重跑：\n"
+                      + terminal_text(
+                          f"  opsagent a2a call {args.url} '<答复>' --task-id {result['task_id']}"),
+                      file=sys.stderr)
+                return a2a_client.EXIT_NEEDS_INPUT
+            try:
+                answer = input("\n答复（批准请输入「确认执行」或 yes，其它回答均视为拒绝）> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n已取消（未发送答复）。", file=sys.stderr)
+                return a2a_client.EXIT_NEEDS_INPUT
+            if not answer:
+                print("空答复，未发送。", file=sys.stderr)
+                return a2a_client.EXIT_NEEDS_INPUT
+            result = a2a_client.send(args.url, answer, task_id=result["task_id"],
+                                     context_id=result["context_id"], token=args.token,
+                                     timeout=args.timeout, proxy=args.proxy)
+            print(terminal_text(a2a_client.format_result(result)))
+        return (a2a_client.EXIT_OK if result["state"] == "TASK_STATE_COMPLETED"
+                else a2a_client.EXIT_FAIL)
     except A2AUnavailable as e:
         print(f"[a2a] {e}", file=sys.stderr)
         return EXIT_UNAVAILABLE

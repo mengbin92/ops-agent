@@ -9,11 +9,33 @@ from __future__ import annotations
 import json
 import time
 
+import core
+
 from . import llm, memory as memory_mod, session as sess_mod, tools
 
 MAX_TURNS = 40
 DEADLINE_MARK = "[任务超时]"        # 时间预算耗尽的标记：调度层据此把运行记为 timeout
 MAX_TURNS_MARK = "[已达最大轮次保护"  # 轮次耗尽的标记：调度层据此把结论降级为"不完整"
+
+
+class TurnCancelled(Exception):
+    """The caller cancelled this turn."""
+
+
+def require_active(cancelled) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise TurnCancelled
+
+
+def pending_tool_calls(messages: list[dict]) -> dict[str, str]:
+    pending = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            pending.update({call["id"]: call["function"]["name"]
+                            for call in message.get("tool_calls") or []})
+        elif message.get("role") == "tool":
+            pending.pop(message.get("tool_call_id"), None)
+    return pending
 
 # basic compaction：发送给 LLM 的消息总字符数超阈值时，把早期 tool result 裁剪为占位符。
 # 只裁剪"发送内容"，session 文件保留完整记录（审计与追溯不受影响）。
@@ -188,20 +210,14 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
     """执行一轮用户输入直到模型给出最终回复。on_event(kind, payload) 用于前端渲染。
 
     kind: "text"（助手完整文本，流式模式下仅在无 on_delta 时发出）| "tool" | "info"
-    on_delta：流式文本增量回调（传入即启用 SSE 流式）。
+    on_delta：启用上游 SSE，每条消息组装并脱敏后回调正文。
     system/max_turns：子代理用独立的只读提示与轮次上限。
     返回最终文本。
     """
     emit = on_event or (lambda kind, payload: None)
+    require_active(ctx.cancelled)
     # 中断后的工具结果未知，补齐协议后让模型核实，不能重放可能已执行的写操作。
-    pending = {}
-    for message in session.messages:
-        if message.get("role") == "assistant":
-            pending.update({call["id"]: call["function"]["name"]
-                            for call in message.get("tool_calls") or []})
-        elif message.get("role") == "tool":
-            pending.pop(message.get("tool_call_id"), None)
-    for call_id, name in pending.items():
+    for call_id, name in pending_tool_calls(session.messages).items():
         session.append({"role": "tool", "tool_call_id": call_id, "name": name,
                         "content": "[中断] 工具调用未记录结果，可能已执行；请先核实状态，勿直接重试写操作。"})
     session.append({"role": "user", "content": user_input})
@@ -209,6 +225,7 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
     deadline_warning = (f"{DEADLINE_MARK} 已终止：任务时间预算耗尽"
                         "（已完成部分仍在会话中，可 /resume 回看）")
     for _ in range(max_turns):
+        require_active(ctx.cancelled)
         if ctx.deadline is not None and time.monotonic() > ctx.deadline:
             warning = deadline_warning
             emit("text", warning)
@@ -221,18 +238,21 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
         msg = llm._validate_message(llm.chat(
             messages, tools=tools.tool_schemas(ctx), model=model, on_delta=on_delta,
             **chat_kwargs))
+        require_active(ctx.cancelled)
         # 规范化为可持久化结构
-        record = {"role": "assistant", "content": msg.get("content") or ""}
+        content = core.redact(msg.get("content") or "")
+        record = {"role": "assistant", "content": content}
         if msg.get("tool_calls"):
             record["tool_calls"] = msg["tool_calls"]
         session.append(record)
-        if msg.get("content"):
-            # 非流式：一次性发完整文本；流式：通知前端收尾该段流
-            emit("text" if on_delta is None else "stream_end", msg["content"])
-            final_text = msg["content"]
+        if content:
+            # SSE 模式的正文由 llm.chat 回调；这里通知前端收尾。
+            emit("text" if on_delta is None else "stream_end", content)
+            final_text = content
         if not msg.get("tool_calls"):
             return final_text
         for call in msg["tool_calls"]:
+            require_active(ctx.cancelled)
             name = call["function"]["name"]
             if ctx.deadline is not None and time.monotonic() > ctx.deadline:
                 result = f"{DEADLINE_MARK} 工具未执行：任务时间预算耗尽"
@@ -244,11 +264,18 @@ def run_turn(user_input: str, session: sess_mod.Session, ctx: tools.ToolContext,
                 except (ValueError, RecursionError) as e:
                     result = f"[错误] 工具参数不是有效 JSON 对象: {e}"
                 else:
-                    emit("tool", {"phase": "call", "name": name, "args": args})
+                    try:
+                        visible_args = core.redact_obj(args)
+                    except RecursionError:
+                        visible_args = {"notice": "参数嵌套过深，省略预览"}
+                    emit("tool", {"phase": "call", "name": core.redact(name),
+                                  "args": visible_args})
+                    require_active(ctx.cancelled)
                     result = tools.dispatch(name, args, ctx)
             session.append({"role": "tool", "tool_call_id": call["id"],
                             "name": name, "content": result})
-            emit("tool", {"phase": "result", "name": name, "result": result[:500]})
+            emit("tool", core.redact_obj({"phase": "result", "name": name,
+                                         "result": core.redact(result)[:500]}))
         if ctx.deadline is not None and time.monotonic() > ctx.deadline:
             emit("text", deadline_warning)
             return (final_text + "\n" if final_text else "") + deadline_warning

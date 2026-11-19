@@ -49,7 +49,7 @@ def _load() -> dict:
                 or type(st.get("rounds_used")) is not int
                 or not 0 <= st["rounds_used"] <= st["max_rounds"]):
             raise GoalError(f"目标文件格式异常: {p}")
-    return data
+    return core.redact_obj(data)
 
 
 def _save(state: dict) -> None:
@@ -57,9 +57,12 @@ def _save(state: dict) -> None:
     sessions = core.STATE_DIR / "sessions"
     live = {k: v for k, v in state.items() if (sessions / f"{k}.jsonl").exists()}
     p = _file()
-    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    core._ensure_state_dir()
     tmp = p.with_name(f".goals-{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(live, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(live, handle, ensure_ascii=False, indent=2)
     os.replace(tmp, p)
 
 
@@ -73,6 +76,7 @@ def create(session_id: str, objective: str, max_rounds: int = DEFAULT_MAX_ROUNDS
         raise GoalError("objective 不能为空")
     if len(objective) > OBJECTIVE_LIMIT:
         raise GoalError(f"objective 太长（上限 {OBJECTIVE_LIMIT} 字符）")
+    objective = core.redact(objective)
     try:
         rounds = int(max_rounds or DEFAULT_MAX_ROUNDS)
     except (TypeError, ValueError) as e:
@@ -99,7 +103,7 @@ def update(session_id: str, action: str, reason: str = "") -> dict:
         st = state.get(session_id)
         if not st:
             raise GoalError("当前没有目标")
-        reason = (reason or "").strip()
+        reason = core.redact((reason or "").strip())
         if action == "complete":
             st["status"], st["reason"] = "completed", reason
         elif action == "blocked":

@@ -22,6 +22,11 @@ MAGENTA = "\033[35m"
 BG_CODE = "\033[48;5;236m"
 
 _HEAD_COLOR = {1: MAGENTA + BOLD, 2: CYAN + BOLD, 3: GREEN + BOLD}
+_TERMINAL_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def terminal_text(text: str) -> str:
+    return _TERMINAL_CONTROL.sub(lambda match: match[0].encode("unicode_escape").decode(), text)
 
 
 def _width(text: str) -> int:
@@ -71,7 +76,7 @@ def _render_table(lines: list[str]) -> list[str]:
 
 def render(text: str, color: bool = True) -> str:
     out: list[str] = []
-    lines = text.split("\n")
+    lines = terminal_text(text).split("\n")
     i = 0
     in_code = False
     while i < len(lines):

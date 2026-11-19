@@ -21,27 +21,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import core  # noqa: E402
-from agent import loop, repl, rpc, session as sess_mod, tools  # noqa: E402
+from agent import loop, markdown, repl, rpc, session as sess_mod, tools  # noqa: E402
 
 
 def _print_mode(prompt: str, model: str | None) -> int:
     """单发：无 TTY 时 ask_user 不可用，写操作安全方向降级为拒绝。"""
     try:
         session = sess_mod.Session()
-        if not sys.stdin.isatty():
-            ctx = tools.ToolContext(ask_user=None, model=model, session_id=session.id)
-        else:
-            ctx = tools.ToolContext(
-                ask_user=lambda q: input(f"\n{q}\n你的回答> ").strip(), model=model,
-                session_id=session.id)
+        ctx = tools.ToolContext(ask_user=repl._terminal_ask if sys.stdin.isatty() else None,
+                                model=model, session_id=session.id)
         text = loop.run_turn(prompt, session, ctx, model=model)
-    except loop.llm.LLMError as e:
-        print(f"[LLM 错误] {tools.core.redact(str(e))}", file=sys.stderr)
+    except (loop.llm.LLMError, OSError, ValueError) as e:
+        prefix = "[LLM 错误]" if isinstance(e, loop.llm.LLMError) else "[opsagent] 错误:"
+        error = f"{prefix} {core.redact(str(e))}"
+        print(markdown.terminal_text(error) if sys.stderr.isatty() else error, file=sys.stderr)
         return 1
-    except (OSError, ValueError) as e:
-        print(f"[opsagent] 错误: {core.redact(str(e))}", file=sys.stderr)
-        return 1
-    print(text)
+    print(markdown.terminal_text(text) if sys.stdout.isatty() else text)
     return 0
 
 

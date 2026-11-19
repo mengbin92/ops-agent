@@ -119,7 +119,7 @@ def serve(model: str | None = None) -> None:
     threading.Thread(target=reader, daemon=True).start()
 
     def ask_user(question: str) -> str:
-        answer = peer.request("ask_user", {"question": question})
+        answer = peer.request("ask_user", {"question": tools.core.redact(question)})
         return answer if answer is not None else "（客户端未回答，视为拒绝）"
 
     try:
