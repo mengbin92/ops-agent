@@ -513,34 +513,20 @@ class DaemonHeartbeatRecoveryTests(_StateMixin, unittest.TestCase):
 
 class LocalLogCollectionTests(unittest.TestCase):
     def test_stderr_only_docker_logs_are_scanned(self):
-        def run(argv, **kwargs):
-            merged = kwargs.get("stderr") == subprocess.STDOUT
-            return subprocess.CompletedProcess(
-                argv, 0, "ERROR worker failed\n" if merged else "",
-                "" if merged else "ERROR worker failed\n")
-
-        with patch.object(logscan.subprocess, "run", side_effect=run):
-            _, lines = logscan.from_docker("review-fixture")
+        lines = logscan._run_local(
+            [sys.executable, "-c", "import sys; print('ERROR worker failed', file=sys.stderr)"])
         result = logscan.scan(lines)
         self.assertEqual(result["group_total"], 1)
 
     def test_both_streams_are_kept(self):
-        def run(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 0,
-                                               "out: started\nERROR boom\n", "")
-
-        with patch.object(logscan.subprocess, "run", side_effect=run):
-            _, lines = logscan.from_journal("app")
+        lines = logscan._run_local([sys.executable, "-c",
+                                    "import sys; print('out: started'); print('ERROR boom', file=sys.stderr)"])
         self.assertEqual(len(lines), 2)
         self.assertEqual(logscan.scan(lines)["group_total"], 1)
 
     def test_nonzero_exit_is_a_collection_error(self):
-        def run(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 1, "some partial output\n", "")
-
-        with patch.object(logscan.subprocess, "run", side_effect=run):
-            with self.assertRaises(logscan.ScanSourceError) as ctx:
-                logscan.from_docker("review-fixture")
+        with self.assertRaises(logscan.ScanSourceError) as ctx:
+            logscan._run_local([sys.executable, "-c", "print('partial'); raise SystemExit(1)"])
         self.assertIn("退出码 1", str(ctx.exception))
 
 

@@ -705,14 +705,24 @@ def _logscan(args: dict, ctx: ToolContext) -> str:
     if type(top) is not int or not 1 <= top <= 50:
         return "[错误] top 须为 1-50 的整数"
     try:
+        timeout = logscan.COLLECTION_TIMEOUT
+        if ctx.deadline is not None:
+            timeout = min(timeout, ctx.deadline - time.monotonic())
+        if timeout <= 0:
+            return "[任务超时] 时间预算耗尽，未采集日志"
         desc, log_lines = logscan.detect_source(
             path=path, unit=(args.get("unit") or "").strip(),
             container=(args.get("container") or "").strip(),
             since=(args.get("since") or "").strip(),
             until=(args.get("until") or "").strip(),
-            lines=lines, target=target)
-        report = logscan.scan(log_lines, top=top,
-                              pattern=(args.get("pattern") or "").strip() or None)
+            lines=lines, target=target, timeout=timeout)
+        timeout = logscan.TIME_BUDGET
+        if ctx.deadline is not None:
+            timeout = min(timeout, ctx.deadline - time.monotonic())
+        if timeout <= 0:
+            return "[任务超时] 时间预算耗尽，未扫描日志"
+        report = logscan.scan_with_timeout(log_lines, top=top, timeout=timeout,
+                                           pattern=(args.get("pattern") or "").strip() or None)
     except logscan.ScanSourceError as e:
         return f"[logscan 错误] {e}"
     except re.error as e:

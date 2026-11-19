@@ -6,10 +6,12 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -18,6 +20,7 @@ DEFAULT_LINES = 200_000     # 默认只扫最近 N 行：故障定位通常有�
 DEFAULT_TOP = 10
 SAMPLE_LEN = 200            # 每条聚类保留的样本行长度上限
 TIME_BUDGET = 30.0          # 单次扫描秒数上限；超时按部分扫描如实标注
+COLLECTION_TIMEOUT = 60.0
 GROUP_LIMIT = 5000          # distinct 聚类上限（镜像 checks.SIGNAL_ANOMALY_LIMIT）：
                             # 全唯一行输入也不能无界增长，超限后如实标注截断
 
@@ -40,9 +43,9 @@ _KEYWORDS = re.compile(
 
 # 行首时间戳：能解析出时间就做时间桶分布，解析不了退化为行号区间
 _TS_PATTERNS = [
-    re.compile(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})"),          # ISO / journalctl / docker
-    re.compile(r"^\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2})"),            # nginx [27/Oct/2026:14:21
-    re.compile(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2})"),      # syslog Oct 27 14:21
+    re.compile(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:)([0-5]\d)"),          # ISO / journalctl / docker
+    re.compile(r"^\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:)([0-5]\d)"),            # nginx [27/Oct/2026:14:21
+    re.compile(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:)([0-5]\d)"),      # syslog Oct 27 14:21
 ]
 _BUCKET_MINUTES = 10
 
@@ -71,7 +74,8 @@ def _timestamp_bucket(line: str) -> str | None:
     for pat in _TS_PATTERNS:
         m = pat.match(line)
         if m:
-            return m.group(1)
+            prefix, minute = m.groups()
+            return f"{prefix}{int(minute) // _BUCKET_MINUTES * _BUCKET_MINUTES:02}"
     return None
 
 
@@ -100,11 +104,12 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
     scanned = 0
     partial = False
     groups_capped = False
+    buckets_capped = False
     ts_hits = 0
     start = time.monotonic()
 
     for raw in lines:
-        if total & 0xFFF == 0 and time.monotonic() - start > time_budget:
+        if time.monotonic() - start > time_budget:
             partial = True
             break
         total += 1
@@ -112,19 +117,22 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
         if not line:
             continue
         scanned += 1
+        bucket = _timestamp_bucket(line)
+        if bucket:
+            ts_hits += 1
         if focus and not focus.search(line):
             continue
         level = _level_of(line)
         if level:
             level_counts[level] += 1
         interesting = level in _INTERESTING_LEVELS or bool(_KEYWORDS.search(line))
-        bucket = _timestamp_bucket(line)
-        if bucket:
-            ts_hits += 1
         if not interesting:
             continue
-        bucket_counts.setdefault(bucket or f"lines~{total // 50000 * 50000}",
-                                 Counter())[level or "kw"] += 1
+        bucket_key = bucket or f"lines~{total // 50000 * 50000}"
+        if bucket_key in bucket_counts or len(bucket_counts) < GROUP_LIMIT:
+            bucket_counts.setdefault(bucket_key, Counter())[level or "kw"] += 1
+        else:
+            buckets_capped = True
         key = (level or "kw", _skeleton(line))
         g = groups.get(key)
         if g is None and len(groups) >= GROUP_LIMIT:
@@ -147,6 +155,7 @@ def scan(lines, *, top: int = DEFAULT_TOP, pattern: str | None = None,
     return {
         "total": total, "scanned": scanned, "partial": partial,
         "groups_truncated": groups_capped,
+        "buckets_truncated": buckets_capped,
         "time_parse_rate": (ts_hits / scanned) if scanned else 0.0,
         "level_counts": dict(level_counts),
         "buckets": {b: dict(c) for b, c in sorted(bucket_counts.items())},
@@ -161,31 +170,37 @@ class ScanSourceError(Exception):
     pass
 
 
-def _run_local(argv: list[str], timeout: int = 60) -> list[str]:
+def _run_local(argv: list[str], timeout: float = COLLECTION_TIMEOUT) -> list[str]:
     """本机采集：两路输出合并。
 
     不能分开捕获只取 stdout：`docker logs` 会把容器内的 stderr（应用错误日志本来
     就写在这里）放到本进程的 stderr，成功退出时那些行会被静默丢弃。远程路径经
     remote.run() 合并输出的，两处行为必须一致。
     """
+    import core
     try:
-        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        r = core.capture_read_output(argv, timeout, core.READ_OUTPUT_LIMIT)
     except FileNotFoundError:
         raise ScanSourceError(f"本机没有 {argv[0]}，无法用该来源扫描")
     except subprocess.TimeoutExpired:
-        raise ScanSourceError(f"{argv[0]} 采集超时（{timeout}s），未产出日志")
+        raise ScanSourceError(f"{argv[0]} 采集超时（{timeout:g}s），未产出日志")
+    except (OSError, core.OpsxError) as e:
+        raise ScanSourceError(str(e)) from e
+    output = r.stdout.decode("utf-8", "replace")
     if r.returncode != 0:
         # 输出已合并：非零退出就是采集失败，不能把错误文本当成"正常的日志内容"扫描。
         raise ScanSourceError(f"{shlex.join(argv)} 退出码 {r.returncode}: "
-                              f"{r.stdout.strip()[:200]}")
-    return r.stdout.splitlines()
+                              f"{core.redact(output.strip())[:200]}")
+    return output.splitlines()
 
 
-def _run_remote(target: str, argv: list[str]) -> list[str]:
+def _run_remote(target: str, argv: list[str], timeout: float) -> list[str]:
     import core
     import remote  # 延迟导入：remote 依赖 core，模块级导入会成环
-    code, out = remote.run(target, shlex.join(argv), timeout=60)
+    try:
+        code, out = remote.run(target, shlex.join(argv), timeout=timeout)
+    except (core.OpsxError, remote.RemoteError) as e:
+        raise ScanSourceError(str(e)) from e
     if code != 0:
         raise ScanSourceError(f"目标 {target} 上 {argv[0]} 采集失败（exit={code}）: "
                               f"{core.redact(out.strip())[:200]}")
@@ -193,45 +208,40 @@ def _run_remote(target: str, argv: list[str]) -> list[str]:
 
 
 def from_journal(unit: str, *, since: str = "", until: str = "",
-                 lines: int = DEFAULT_LINES, target: str = "") -> tuple[str, list]:
+                 lines: int = DEFAULT_LINES, target: str = "",
+                 timeout: float = COLLECTION_TIMEOUT) -> tuple[str, list]:
     argv = ["journalctl", "--quiet", "--no-pager", "-u", unit, "-n", str(lines)]
     if since:
         argv += ["--since", since]
     if until:
         argv += ["--until", until]
     desc = shlex.join(argv) + (f"  （目标 {target}）" if target else "（本机）")
-    return desc, (_run_remote(target, argv) if target else _run_local(argv))
+    return desc, (_run_remote(target, argv, timeout) if target else _run_local(argv, timeout))
 
 
 def from_docker(container: str, *, since: str = "",
-                lines: int = DEFAULT_LINES, target: str = "") -> tuple[str, list]:
+                lines: int = DEFAULT_LINES, target: str = "",
+                timeout: float = COLLECTION_TIMEOUT) -> tuple[str, list]:
     argv = ["docker", "logs", "--timestamps", "--tail", str(lines)]
     if since:
         argv += ["--since", since]
-    argv.append(container)
+    argv += ["--", container]
     desc = shlex.join(argv) + (f"  （目标 {target}）" if target else "（本机）")
-    return desc, (_run_remote(target, argv) if target else _run_local(argv))
+    return desc, (_run_remote(target, argv, timeout) if target else _run_local(argv, timeout))
 
 
-def from_file(path_str: str, *, lines: int = DEFAULT_LINES) -> tuple[str, list]:
-    path = Path(path_str).expanduser()
+def from_file(path_str: str, *, lines: int = DEFAULT_LINES,
+              timeout: float = COLLECTION_TIMEOUT) -> tuple[str, list]:
+    path = Path(path_str).expanduser().absolute()
     if not path.is_file():
         raise ScanSourceError(f"不是常规文件: {path_str}")
-    # 大文件全量流转，只保留最近 lines 行（故障定位通常有时间窗，尾部优先）
-    from collections import deque
-    buf: deque[str] = deque(maxlen=lines)
-    try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                buf.append(line)
-    except OSError as e:
-        raise ScanSourceError(f"读取日志失败 {path_str}: {e}")
-    return f"tail -n {lines} {shlex.quote(str(path))}（本机文件）", list(buf)
+    argv = ["tail", "-n", str(lines), str(path)]
+    return f"{shlex.join(argv)}（本机文件）", _run_local(argv, timeout)
 
 
 def detect_source(path: str = "", unit: str = "", container: str = "",
                   since: str = "", until: str = "", lines: int = DEFAULT_LINES,
-                  target: str = "") -> tuple[str, list]:
+                  target: str = "", timeout: float = COLLECTION_TIMEOUT) -> tuple[str, list]:
     chosen = [s for s in (path, unit, container) if s]
     if len(chosen) != 1:
         raise ScanSourceError("来源三选一：path（本机文件）/ unit（journalctl）/ container（docker logs）")
@@ -240,10 +250,30 @@ def detect_source(path: str = "", unit: str = "", container: str = "",
     if not shutil.which("docker") and container and not target:
         raise ScanSourceError("本机没有 docker，无法用 docker logs 来源")
     if unit:
-        return from_journal(unit, since=since, until=until, lines=lines, target=target)
+        return from_journal(unit, since=since, until=until, lines=lines, target=target, timeout=timeout)
     if container:
-        return from_docker(container, since=since, lines=lines, target=target)
-    return from_file(path, lines=lines)
+        return from_docker(container, since=since, lines=lines, target=target, timeout=timeout)
+    return from_file(path, lines=lines, timeout=timeout)
+
+
+def scan_with_timeout(lines: list[str], *, top: int, pattern: str | None,
+                      timeout: float) -> dict:
+    if not pattern:
+        return scan(lines, top=top, time_budget=timeout)
+    re.compile(pattern, re.I)
+    # stdlib re has no per-match timeout. Keep user patterns outside the agent process.
+    deadline = time.monotonic() + timeout
+    request = json.dumps({"lines": lines, "top": top, "pattern": pattern},
+                         ensure_ascii=False).encode("utf-8", "backslashreplace")
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve())],
+                                input=request, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as e:
+        raise ScanSourceError("日志正则扫描超时；请缩小日志范围或简化 pattern") from e
+    if result.returncode != 0:
+        raise ScanSourceError("日志正则扫描未完成")
+    return json.loads(result.stdout)
 
 
 def format_report(desc: str, report: dict) -> str:
@@ -266,6 +296,8 @@ def format_report(desc: str, report: dict) -> str:
             bar = "■" * max(1, round(n / peak * 20))
             detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             out.append(f"  {bucket:<18} {bar} {detail}")
+        if report.get("buckets_truncated"):
+            out.append(f"  [时间桶达到 {GROUP_LIMIT} 个上限，分布不完整]")
     if report["groups"]:
         cap_note = (f"；已达 {GROUP_LIMIT} 组上限，其后新出现的模式未再收录"
                     if report.get("groups_truncated") else "")
@@ -282,3 +314,7 @@ def format_report(desc: str, report: dict) -> str:
         out.append("未发现错误级别/关键词命中。注意：粗筛只覆盖级别与关键词规则，"
                    "规则外的语义异常仍需针对性复核。")
     return "\n".join(out)
+
+
+if __name__ == "__main__":
+    print(json.dumps(scan(**json.load(sys.stdin.buffer))))
